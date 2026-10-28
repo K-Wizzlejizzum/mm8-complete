@@ -1,0 +1,11 @@
+# Allowlist: only original work is tracked.
+# Disc images, test builds, BIOS files, screenshots and extracted game art
+# are copyrighted and must never be committed, so everything else is ignored.
+*
+!.gitignore
+!README.md
+!mm8tool.py
+!helper_map.txt
+!globals_map.txt
+# patches/ stays out: xdeltas carry game data. The release is a builder that
+# reads everything game-related from the user's own discs.
