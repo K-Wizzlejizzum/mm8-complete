@@ -4,11 +4,14 @@ A fan project that turns **Mega Man 8 (USA, PlayStation, SLUS-00453)** into the 
 
 Roadmap:
 
-1. **Cut bosses** (complete): the Saturn-only Cut Man and Wood Man fights, with their stages, music, voices and bolts.
-2. **Bonus Mode** (complete): the Saturn's Bonus Mode with all its screens (postcards, official illustrations, sound test, voice test and the hidden animation menu).
-3. **Other Saturn / PlayStation differences**: catalogue the remaining differences between the two versions and port the ones chosen.
-4. **English / Japanese option**: a way to choose between the English and the Japanese title and audio.
-5. **More faithful translation** (scope to be decided).
+1. Restore Wood Man and Cut Man fights - 100%
+2. Restore "Bonus Mode" and all functionality within - 100%
+3. Use Saturn enemy count and placements - In Progress
+4. Use Saturn text color for Robot Master intro names
+5. Fix any grammatical issues with the dialogue
+6. Add Battle & Chase and Super Adventure Rockman Adverts that were present in the Japanese PSX version
+7. (Stretch Goal) Assess the need for a full re-translation
+8. (Stretch Goal) Add the ability to choose between Japanese and English audio, effectively creating an "Undub".
 
 This repository holds only original work:
 
