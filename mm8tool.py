@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mm8tool.py - Mega Man 8 Complete toolkit (single file): Saturn->PS1 ports and the PS1 image build.
+mm8tool.py - Mega Man 8 - Complete toolkit (single file): Saturn->PS1 ports and the PS1 image build.
 
 Requires: python3, pycdlib, capstone>=6 (SuperH), numpy
     pip install pycdlib "capstone>=6.0.0a1" --pre --break-system-packages
@@ -15,6 +15,13 @@ helper_map.txt / globals_map.txt are read from this file's directory.
 
 Commands:
     setup --saturn SAT_TRACK1.bin --ps1 PS1_TRACK1.bin   extract both discs (.bin raw or .iso)
+    release [--ps1 P] [--sat P] [--out DIR] [--keep-work] the release builder (v0.2 = Phases 1-2, no debug options): finds the
+                                                         US PS1 / US Saturn disc (.cue or folder; default discs/ps1, discs/sat),
+                                                         checks every track against the Redump md5s (Track 1 must
+                                                         match; audio tracks give a note), extracts them into $MM8_WORK, builds
+                                                         and checks the image, writes a full bin/cue into --out. The
+                                                         Windows bundle runs it with its own GCC 12.4.0 (MM8_CROSS = toolchain
+                                                         prefix, default mipsel-linux-gnu-)
     verify                                               re-check every key finding (PASS/FAIL)
     build --ps1 TRACK1.bin --out OUT.bin [--xdelta P] [--quick-start 8|9 [--checkpoint 5]] [--keep-c DIR]
                                                          current patch: track 1 extended; restored Search Man stage
@@ -44,7 +51,7 @@ Commands:
     dis-sat ADDR [N] / dis-ps1 ADDR [N] [--ovl STAGE09]  disassembly (Saturn SH-2 / PS1 MIPS)
     pac PATH / places STAGE [sat|ps1]                    list PAC chunks / dump a placement list (chunk 0x0A)
     selftest-cc                                          compile a test handler with mipsel GCC + R3000 check
-    pre-release checks (session 12):
+    pre-release checks:
     ending-image --ps1 TRACK1.bin --out OUT.bin          scratch: play_bgm -> ending song (CD track 2 via entry 138);
                                                          run as a full disc (full_disc_cue) and locate the recording in
                                                          Track 2 with cd_track_position
@@ -55,7 +62,7 @@ Commands:
     regress-compare DIR                                  sound + save-state comparison of the regress runs
     setup --jp JP_TRACK1.bin                             also extract the JP PS1 disc (Rockman 8) into jp/ (reference;
                                                          enables the JP checks in verify)
-    region-compare --us US_TRACK1.bin --jp JP_TRACK1.bin  US vs JP PS1 disc, file by file (region-select survey, session 17)
+    region-compare --us US_TRACK1.bin --jp JP_TRACK1.bin  US vs JP PS1 disc, file by file (region-select survey)
     m8-compare                                           US Saturn vs US PS1 (Phase 3 catalogue, M8a): shared PACs chunk by
                                                          chunk, every stage's placements, sound-ID tables
 """
@@ -87,11 +94,13 @@ def raw_to_iso(src, dst):
             off, kind = 24, 'ps1'             # MODE2/2352 form 1
         else:
             raise SystemExit(f'{src}: unrecognised raw track')
+        import numpy as np
         with open(src, 'rb') as f, open(dst, 'wb') as o:
             while True:
-                s = f.read(2352)
-                if len(s) < 2352: break
-                o.write(s[off:off + 2048])
+                s = f.read(2352 * 4096)
+                n = len(s) // 2352
+                if n: o.write(np.frombuffer(s, np.uint8, n * 2352).reshape(n, 2352)[:, off:off + 2048].tobytes())
+                if len(s) < 2352 * 4096: break
         return kind
     # assume cooked ISO
     kind = 'saturn' if head[:16] == b'SEGA SEGASATURN ' else 'ps1'
@@ -140,7 +149,7 @@ def pac_chunks(side, name):
 def placements(side, stage):
     """Chunk 0x0A records: (type, flags, x, y). flags low byte = pool (1 = enemy pool P2)."""
     # Bytes 0-3 are single bytes (0, type, variant, pool) in the same order on both systems;
-    # only x/y are byte-swapped halfwords. flags = variant << 8 | pool. (Fixed session 5.)
+    # only x/y are byte-swapped halfwords. flags = variant << 8 | pool.
     b = pac_chunks(side, stage)[0xA]
     e = '>' if side == 'sat' else '<'
     # The list ends at the first record whose pool byte is 0xFF (`00 00 00 FF`); the game copies the
@@ -200,7 +209,35 @@ def placement_terminator(chunk):
 def md5(path): return hashlib.md5(open(path, 'rb').read()).hexdigest()
 def md5_bytes(b): return hashlib.md5(b).hexdigest()
 
-# ----------------------------------------------------------------- raw PS1 disc patching (session 5)
+# ----------------------------------------------------------------- build cache
+# The release builds the image and then checks it in the same run. check_build rebuilds the music banks, the bonus
+# overlays and the converted Bonus Mode files to compare them with the disc; inside `build_cache()` those builders
+# return the result of their first call (a copy) instead of building twice. The developer `build` command keeps the
+# independent rebuild.
+_MEMO = None
+
+def _memo(fn):
+    import inspect
+    sig = inspect.signature(fn)
+    @functools.wraps(fn)
+    def w(*args, **kw):
+        if _MEMO is None: return fn(*args, **kw)
+        import copy
+        ba = sig.bind(*args, **kw); ba.apply_defaults()
+        key = (fn.__name__,) + tuple(v for k, v in ba.arguments.items() if k != 'workdir')
+        if key not in _MEMO: _MEMO[key] = fn(*args, **kw)
+        return copy.deepcopy(_MEMO[key])
+    return w
+
+class build_cache:
+    def __enter__(self):
+        global _MEMO
+        _MEMO = {}
+    def __exit__(self, *exc):
+        global _MEMO
+        _MEMO = None
+
+# ----------------------------------------------------------------- raw PS1 disc patching
 # Mode 2 Form 1 EDC/ECC (ECMA-130). Reproduces the original disc's sectors byte for byte.
 _EDC = []
 for _i in range(256):
@@ -229,11 +266,42 @@ def _ecc_part(s, major_count, minor_count, major_mult, minor_inc, dest):
 
 def fix_m2f1(s):
     """Recompute EDC + ECC of one raw 2352-byte Mode 2 Form 1 sector (bytearray, in place)."""
-    s[0x818:0x81C] = _edc(s[0x10:0x818]).to_bytes(4, 'little')
-    hdr = bytes(s[0xC:0x10]); s[0xC:0x10] = b'\0\0\0\0'
-    _ecc_part(s, 86, 24, 2, 86, 0x81C); _ecc_part(s, 52, 43, 86, 88, 0x8C8)
-    s[0xC:0x10] = hdr
+    s[:] = fix_m2f1_many([bytes(s)])[0]
     return s
+
+_ECC_TABLES = None
+def _ecc_tables():
+    """numpy tables for fix_m2f1_many: EDC table, GF(2^8) tables and the P / Q byte index matrices."""
+    global _ECC_TABLES
+    if _ECC_TABLES is None:
+        import numpy as np
+        def idx(major_count, minor_count, major_mult, minor_inc):
+            size = major_count * minor_count
+            return np.array([[((m >> 1) * major_mult + (m & 1) + k * minor_inc) % size for k in range(minor_count)]
+                             for m in range(major_count)], np.intp) + 0xC
+        _ECC_TABLES = (np.array(_EDC, np.uint32), np.array(_ECC_F, np.uint8), np.array(_ECC_B, np.uint8),
+                       idx(86, 24, 2, 86), idx(52, 43, 86, 88))
+    return _ECC_TABLES
+
+def fix_m2f1_many(sectors):
+    """EDC + ECC of many raw Mode 2 Form 1 sectors at once (numpy; same bytes as the ECMA-130 loops _edc /
+    _ecc_part). `sectors` = list of 2352-byte strings; returns a list of fixed bytes."""
+    import numpy as np
+    if not sectors: return []
+    T, F, B, IP, IQ = _ecc_tables()
+    a = np.frombuffer(b''.join(sectors), np.uint8).reshape(len(sectors), 2352).copy()
+    d = np.ascontiguousarray(a[:, 0x10:0x818].T); e = np.zeros(len(sectors), np.uint32)
+    for row in d: e = (e >> 8) ^ T[(e ^ row) & 0xFF]
+    a[:, 0x818:0x81C] = e.astype('<u4').view(np.uint8).reshape(-1, 4)
+    hdr = a[:, 0xC:0x10].copy(); a[:, 0xC:0x10] = 0
+    for I, dest in ((IP, 0x81C), (IQ, 0x8C8)):
+        v = a[:, I]; x = np.zeros(v.shape[:2], np.uint8); y = np.zeros(v.shape[:2], np.uint8)
+        for k in range(I.shape[1]):
+            t = v[:, :, k]; x ^= t; y ^= t; x = F[x]
+        x = B[F[x] ^ y]; n = I.shape[0]
+        a[:, dest:dest + n] = x; a[:, dest + n:dest + 2 * n] = x ^ y
+    a[:, 0xC:0x10] = hdr
+    return [r.tobytes() for r in a]
 
 def fix_m1(s):
     """Recompute EDC + ECC of one raw 2352-byte Mode 1 sector (Saturn; bytearray, in place; header included in ECC)."""
@@ -244,7 +312,10 @@ def fix_m1(s):
 class RawDisc:
     """Raw MODE2/2352 track 1 image held in memory (PS1: user data at +24). LBA n = sector n of the file."""
     UD = 24
-    def __init__(self, path): self.d = bytearray(open(path, 'rb').read()); self.touched = set(); self.free = PS1_FREE_LBA
+    def __init__(self, path):
+        self.d = bytearray(os.path.getsize(path))
+        with open(path, 'rb') as f: f.readinto(self.d)
+        self.touched = set(); self.free = PS1_FREE_LBA
     def read(self, lba, n, off=0):
         """n bytes at byte `off` of the file that starts at `lba`."""
         out = bytearray(); lba += off // 2048; off %= 2048
@@ -259,10 +330,10 @@ class RawDisc:
             n = min(2048 - so, len(data) - p); o = sec * 2352 + self.UD + so
             self.d[o:o + n] = data[p:p + n]; self.touched.add(sec); p += n
     def finish(self):
-        for sec in self.touched:
-            s = bytearray(self.d[sec * 2352:(sec + 1) * 2352])
-            assert s[18] & 0x20 == 0, f'sector {sec} is not Form 1'
-            self.d[sec * 2352:(sec + 1) * 2352] = fix_m2f1(s)
+        secs = sorted(self.touched)
+        raw = [bytes(self.d[sec * 2352:(sec + 1) * 2352]) for sec in secs]
+        for sec, r in zip(secs, raw): assert r[18] & 0x20 == 0, f'sector {sec} is not Form 1'
+        for sec, r in zip(secs, fix_m2f1_many(raw)): self.d[sec * 2352:(sec + 1) * 2352] = r
     def save(self, path):
         self.finish(); open(path, 'wb').write(self.d)
     def iso_record(self, path):
@@ -305,7 +376,7 @@ PS1_FILETAB = 0x80136F7C
 PS1_EXE_LBA = 23
 PS1_FREE_LBA = (141946, 142095)      # empty Form-1 sectors at the end of track 1 (142095 has a ripper-quirk ECC: not used)
 PS1_TRACK1_SECTORS = 142096
-PS1_EXTEND_SECTORS = 2048             # sectors added to track 1 by extend_track1 (session 10: 1024 for Cut Man; session 15: +1024 for Bonus Mode)
+PS1_EXTEND_SECTORS = 2048             # sectors added to track 1 by extend_track1 (1024 for Cut Man + 1024 for Bonus Mode)
 PS1_END1_FILE = 138                   # file-table entry of END1.DA (CD audio track 2); played via 0x800FC78C only
 
 def _bcd(v): return (v // 10) << 4 | v % 10
@@ -344,7 +415,7 @@ def extend_track1(disc, n=PS1_EXTEND_SECTORS):
 
 def exe_file_off(addr): return 0x800 + addr - 0x800C0000
 
-# ---- stage PAC loading (session 6). The streamer (0x800FB9C0 start, 0x800FBB18 per-sector callback) reads the
+# ---- stage PAC loading. The streamer (0x800FB9C0 start, 0x800FBB18 per-sector callback) reads the
 # header sector (u32 count, u32 file size, count x (u32 type, u32 size)), then for each entry copies exactly `size`
 # bytes (min(left, 0x800) per sector, 0x800FC068) to RAM dest_table[type & 0x7F]; each chunk starts on a new sector.
 # Types >= 0x100 go to VRAM (handler table 0x80137600 indexed by type >> 8). It stops after the file-table size;
@@ -589,7 +660,7 @@ def _align(a, b, mp):
     return out
 
 SEED = {0x060167D4: 0x80109080, 0x0601454C: 0x8010544C, 0x06014342: 0x80105120, 0x060140C2: 0x80104C34}
-# Hand-verified rows (session 5). They override the vote, and any auto row with the same PS1 target is dropped.
+# Hand-verified rows. They override the vote, and any auto row with the same PS1 target is dropped.
 MANUAL = {
     0x00278ED0: 0x8011C5D4,   # set camera bounds: table[idx*8] -> camera +0x12..+0x18
     0x06012E70: 0x80102E84,   # store arg in mode byte, schedule task slot 2
@@ -620,7 +691,7 @@ def build_helper_map(iters=6):
             if v == filler or not img.b <= v < img.e: continue
             a = sat.calls(*region(satT[28 + k])); b = ps.calls(img, v, min(x for x in hs if x > v))
             if a and b: pairs.append((a, b))
-        for k in range(52):                                   # P3 (session 5): Saturn master[129:]
+        for k in range(52):                                   # P3: Saturn master[129:]
             v = tab[PS1_P2_LEN + k]
             if not img.b <= v < img.e: continue
             a = sat.calls(*region(satT[129 + k])); b = ps.calls(img, v, min(x for x in hs if x > v))
@@ -650,7 +721,7 @@ def build_helper_map(iters=6):
     mp.update(MANUAL)
     return mp, votes, len(pairs)
 
-# ----------------------------------------------------------------- global (RAM variable) map (session 5, M2 prep)
+# ----------------------------------------------------------------- global (RAM variable) map (M2 prep)
 SAT_RAM = (0x06020000, 0x06100000)
 _SZ = {'b': 1, 'w': 2, 'l': 4}
 _PSZ = {'lb': 1, 'lbu': 1, 'sb': 1, 'lh': 2, 'lhu': 2, 'sh': 2, 'lw': 4, 'sw': 4}
@@ -756,7 +827,7 @@ def load_global_map(path=None):
 # Hand-verified globals (override / add to the voted map)
 GLOBALS_MANUAL = {0x0602DAE7: 0x8016D2FB, 0x0602DAE9: 0x8016D2FD, 0x0602DAEB: 0x8016D2FF, 0x0602DAF1: 0x8015D225,
                   0x0602FEF0: 0x801D2914, 0x0602FF98: 0x8015E23C, 0x0602DA86: 0x801C336E, 0x0602DA84: 0x801C336C,
-                  0x06036230: 0x8016DC08}   # current weapon: same place in the shared boss intros (session 11)
+                  0x06036230: 0x8016DC08}   # current weapon: same place in the shared boss intros
 
 def infer_global(v, gm, radius=0x10, need=3):
     """Block inference for an unmapped Saturn global: if >= `need` mapped neighbours within +-radius share one
@@ -791,7 +862,7 @@ def catalog(lo, hi, mp=None, gm=None):
     out['bsr'] = sorted(bsr)
     return out
 
-# ----------------------------------------------------------------- stage map / graphics formats (session 5)
+# ----------------------------------------------------------------- stage map / graphics formats
 # chunk 4 block = 4 bytes. Saturn (BE word): tile*4 (8x8-cell number) in the high halfword, attr byte (bit 6 set), byte 3.
 # PS1: u16 LE tile, attr byte with bit 6 cleared, byte 3 unchanged. Exact for every unedited stage (STAGE03 has 13 blocks
 # with Saturn bit 6 = 0 that convert differently: not studied).
@@ -831,7 +902,7 @@ def stage_block_map(stage):
         for x, y in zip(S3[i], P3[i]): bm[x][y] += 1
     return {x: c.most_common(1)[0][0] for x, c in bm.items()}, S3, P3
 
-# ----------------------------------------------------------------- stage render / palette animation (session 13, M3)
+# ----------------------------------------------------------------- stage render / palette animation (M3)
 # Live palettes: chunk 9 is kept at 0x8015A064 and copied to the working palettes 0x80158F64 (PS1, Mednafen states);
 # palette animation (0x80103540, 4 channels at 0x801B28FC) copies 16-colour frames from chunk 0xB (RAM 0x801AE840) into
 # palette `dest`: script entries (dest, frame, palettes, frames to hold), 0xFF = loop back. Scripts per stage section:
@@ -880,7 +951,7 @@ def ps1_palette_scripts(stage):
         out[sec] = chans
     return out
 
-# ----------------------------------------------------------------- M2a: restore Wood Man's hallway + arena (session 7)
+# ----------------------------------------------------------------- M2a: restore Wood Man's hallway + arena
 # Saturn STAGE08 grid cells cut on PS1 (chunk, row, col) -> screen; screens 0x3E-0x43 deleted; screen 0x16 edited.
 M2A_GRID_CELLS = {(0, 3, 0x12): 0x21, (0, 3, 0x13): 0x43, (0, 4, 0x11): 0x3E, (0, 4, 0x12): 0x3F, (0, 4, 0x13): 0x40,
                   (1, 4, 0x12): 0x41, (1, 4, 0x13): 0x42}
@@ -904,8 +975,8 @@ def restore_stage_map(stage, cells, new_screens, replaced_screens, tile_first, d
     a fresh copy in the blank, unused 0x103 slots from tile_first (the chunk grows by whole tile rows = sectors if the
     slots lie past its end). door_blocks = n: Saturn blocks 1..n are appended consecutively (info['door_blocks'] =
     index of the first) for block patches whose numbers the PS1 renumbered (STAGE08).
-    Session 7 first reused ANY pixel-identical PS1 tile: some of those slots (e.g. 0xB2, 0x1C7, 0x1BD, 0x1BE) are
-    overwritten at run time (animated tiles), which garbled the background at both gates in the M2fix test."""
+    Reusing ANY pixel-identical PS1 tile is wrong: some of those slots (e.g. 0xB2, 0x1C7, 0x1BD, 0x1BE) are
+    overwritten at run time (animated tiles), which garbles the background at both gates."""
     s, p = pac_chunks('sat', stage), pac_chunks('ps1', stage)
     bm_full, S3, P3 = stage_block_map(stage)
     bm = {}
@@ -978,8 +1049,8 @@ def swap32(b):
     return b''.join(b[i:i + 4][::-1] for i in range(0, len(b), 4))
 
 def sprite_base_sat_to_ps1(i, v):
-    """Chunk 7 (u16 per sprite set) Saturn -> PS1. Rule from every stage pair (session 7): 0 -> 0 (entry 2: 0 -> 0x500),
-    0x0B0-0xAD0 -> +0x500, 0xB40-0xD00 -> +0xA00. Session 16: the Saturn sprite tiles from 0xB00 on are the 0x101 chunk
+    """Chunk 7 (u16 per sprite set) Saturn -> PS1. Rule from every stage pair: 0 -> 0 (entry 2: 0 -> 0x500),
+    0x0B0-0xAD0 -> +0x500, 0xB40-0xD00 -> +0xA00. The Saturn sprite tiles from 0xB00 on are the 0x101 chunk
     (LABO / SLABO: 768 tiles, Saturn 0xB00-0xDFF -> PS1 VRAM (0x140, 0x100) = tile 0x1500), so 0xB00 -> +0xA00 too
     (SLABO's text set 0xA9 = 0xB00; LABO 0xC00 -> 0x1600 on the PS1 disc)."""
     if v == 0: return 0x500 if i == 2 else 0
@@ -1069,7 +1140,7 @@ def pac_locate(disc, path):
         t, s = struct.unpack('<II', head[8 + 8 * i:16 + 8 * i]); out.append((t, off, s)); off += (s + 0x7FF) & ~0x7FF
     return ext, sz, out
 
-# Block patches (session 7): write_patch(id, x, y) at EXE 0x80102EF4 takes per-stage patch lists (0x8013C620[stage] ->
+# Block patches: write_patch(id, x, y) at EXE 0x80102EF4 takes per-stage patch lists (0x8013C620[stage] ->
 # [id] -> 8-byte records u16 list, u8 flags, u8 count, s16 dx, s16 dy; end 0xFFFF) and writes the block numbers of EXE
 # list 0x8013C33C[list] into the live screen (vertical, or horizontal if flags & 4). Stage 8 patches 4-7 = Wood Man's
 # doors (closed / open, at (0x10E0, 0x420) and (0x1200, 0x490)), lists 176-183, Saturn block numbers 0x01-0x20.
@@ -1112,8 +1183,9 @@ def patch_m2a(disc):
     info.update(pac_lba=ext, pac_size=sz, pac08b_lba=ext_b)
     return info
 
-# ----------------------------------------------------------------- C toolchain for PS1 code (session 5, M2 prep)
-CC = 'mipsel-linux-gnu-gcc'; LD = 'mipsel-linux-gnu-ld'; OBJCOPY = 'mipsel-linux-gnu-objcopy'
+# ----------------------------------------------------------------- C toolchain for PS1 code (M2 prep)
+_CROSS = os.environ.get('MM8_CROSS', 'mipsel-linux-gnu-')   # toolchain prefix (the Windows bundle ships its own mipsel-linux-gnu GCC)
+CC = _CROSS + 'gcc'; LD = _CROSS + 'ld'; OBJCOPY = _CROSS + 'objcopy'
 CFLAGS = ['-march=r3000', '-mabi=32', '-mfp32', '-msoft-float', '-EL', '-O2', '-G0', '-mno-abicalls', '-fno-pic',
           '-mno-check-zero-division', '-fno-builtin', '-ffreestanding', '-nostdlib', '-ffunction-sections',
           '-fno-asynchronous-unwind-tables']
@@ -1129,18 +1201,38 @@ def compile_c(sources, base, symbols, entry_first=None, workdir=None, include=No
         first = f'*(.text.{entry_first}) ' if entry_first else ''
         f.write('SECTIONS {\n  . = %#x;\n  .text : { %s*(.text*) }\n  .rodata : { *(.rodata*) }\n  .data : { *(.data*) *(.sdata*) }\n'
                 '  .bss : { *(.bss*) *(.sbss*) *(COMMON) }\n  /DISCARD/ : { *(.MIPS.*) *(.reginfo) *(.pdr) *(.comment) *(.gnu.attributes) *(.note*) *(.mdebug*) }\n}\n' % (base, first))
-    objs = []
-    for src in sources:
-        o = os.path.join(wd, os.path.basename(src) + '.o')
-        subprocess.run([CC] + CFLAGS + (['-I', include] if include else []) + ['-c', src, '-o', o], check=True); objs.append(o)
+    objs = [os.path.join(wd, os.path.basename(src) + '.o') for src in sources]
+    def cc(src, o): subprocess.run([CC] + CFLAGS + (['-I', include] if include else []) + ['-c', src, '-o', o], check=True)
+    if len(sources) > 1:                                  # independent compiles run side by side
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(min(len(sources), os.cpu_count() or 2)) as ex: list(ex.map(cc, sources, objs))
+    else:
+        for src, o in zip(sources, objs): cc(src, o)
     elf = os.path.join(wd, 'out.elf'); binf = os.path.join(wd, 'out.bin')
     subprocess.run([LD, '-EL', '-T', ld, '-Map', os.path.join(wd, 'out.map')] + objs + ['-o', elf], check=True)
-    subprocess.run([OBJCOPY, '-O', 'binary', elf, binf], check=True)
+    data, syms = elf_image(elf)
+    with open(binf, 'wb') as f: f.write(data)
+    return data, syms
+
+def elf_image(elf):
+    """(binary, {symbol: address}) of a linked little-endian ELF32, read directly (what `objcopy -O binary` and `nm`
+    give: the allocated sections with contents from the lowest address, gaps zero-filled; every defined symbol except
+    file and section symbols). Saves two process starts per link."""
+    d = open(elf, 'rb').read()
+    shoff, = struct.unpack_from('<I', d, 0x20); shentsize, shnum = struct.unpack_from('<2H', d, 0x2E)
+    sh = [struct.unpack_from('<10I', d, shoff + k * shentsize) for k in range(shnum)]
+    load = [(addr, d[off:off + size]) for _, typ, flags, addr, off, size, *_ in sh if flags & 2 and typ != 8 and size]
+    base = min(a for a, _ in load); out = bytearray(max(a + len(b) for a, b in load) - base)
+    for a, b in load: out[a - base:a - base + len(b)] = b
     syms = {}
-    for ln in subprocess.run([CC.replace('gcc', 'nm'), elf], capture_output=True, text=True).stdout.splitlines():
-        p = ln.split()
-        if len(p) == 3: syms[p[2]] = int(p[0], 16)
-    return open(binf, 'rb').read(), syms
+    for _, typ, _, _, off, size, link, _, _, ent in sh:
+        if typ != 2: continue                                   # SHT_SYMTAB
+        stro = sh[link][4]
+        for q in range(off, off + size, ent):
+            name, value, _, info, _, shndx = struct.unpack_from('<3I2BH', d, q)
+            if not name or shndx == 0 or info & 15 in (3, 4): continue     # unnamed, undefined, section, file
+            syms[d[stro + name:d.index(b'\0', stro + name)].decode()] = value
+    return bytes(out), syms
 
 MIPS1_BAD = {'beql', 'bnel', 'beqzl', 'bnezl', 'blezl', 'bgtzl', 'bltzl', 'bgezl', 'bltzall', 'bgezall', 'll', 'sc', 'sync', 'teq', 'tne',
              'tge', 'tgeu', 'tlt', 'tltu', 'teqi', 'tnei', 'movn', 'movz', 'mul', 'madd', 'maddu', 'msub', 'msubu', 'clz', 'clo',
@@ -1185,7 +1277,7 @@ def helper_symbols(mp=None):
     mp = mp or load_helper_map()
     return {f'h_{k:08x}': v for k, v in mp.items()}
 
-# ----------------------------------------------------------------- SH-2 -> C lifter (session 7, M2)
+# ----------------------------------------------------------------- SH-2 -> C lifter (M2)
 # Wood Man (0x63) and his leaf (0x64) are ported by lifting the Saturn SH-2 code to C (one C function per handler,
 # registers as locals, memory accesses translated at lift time) and compiling it with mipsel GCC; the result is checked
 # against the original Saturn code by a differential test (SH-2 interpreter vs unicorn MIPS, `difftest-m2`).
@@ -1297,7 +1389,7 @@ def successors(i):
 def discover(code, entries, tables, helpers_ok, stops=()):
     """Find all reachable instructions from `entries`. tables: {table_addr: n_entries} of code-pointer tables
     (their entries become entries too). helpers_ok(addr) -> True for engine helpers (not followed). stops = Saturn code
-    addresses that are external functions (bsr / bra to them = call / tail call of a replacement; M7b, session 16).
+    addresses that are external functions (bsr / bra to them = call / tail call of a replacement; M7b).
     Returns (insns {addr: Ins}, entry set, call targets set)."""
     seen, work = {}, list(entries)
     ents = set(entries)
@@ -1929,7 +2021,7 @@ WM_GLOBALS = {0x0602DA73: 0x80170574, 0x0602DA97: 0x801C337F, 0x0602DA98: 0x801B
            0x0602DAA8: 0x801B298C, 0x0602DAAE: 0x801B2992, 0x0602DAAF: 0x801B2993, 0x0602DAB0: 0x801B2994,
            0x0602DAB1: 0x801B2995, 0x0602DABA: 0x801B299E, 0x0602DAC1: 0x801B29A5, 0x0602DAE9: 0x8016D2FD,
            0x0602E1B3: 0x8015A00F, 0x0603622E: 0x80158F5C, 0x0605F088: 0x801C73E8, 0x06073356: 0x801CF53C,
-           0x06036230: 0x8016DC08}   # current weapon (session 11; was dropped until then: the weapon bar stayed on)
+           0x06036230: 0x8016DC08}   # current weapon (without it the weapon bar stays on)
 WM_DROP = set()                       # Saturn globals with no PS1 counterpart (stores dropped); none left
 WM_BITMASK = (0x00296C84, 8, 0x80139548)
 # camera halfword fields, same offsets on both systems (globals_map.txt votes: +6 85/85, +8 65/67, +0x12 6/6, +0x14 123/125,
@@ -2016,7 +2108,7 @@ WOOD_SPEC = dict(name='wood', data=(WM_DATA_LO, WM_DATA_HI), globals=WM_GLOBALS,
                  handlers=[('wood_man', 0x258F00, 0x63, [k for k in WM_CODE_TABLES if k < 0x29344C], OBJ_WORD_FIELDS),
                            ('wood_leaf', 0x259B7C, 0x64, [k for k in WM_CODE_TABLES if k >= 0x29344C], OBJ_WORD_FIELDS)])
 
-# ---- M4: Cut Man (P2 type 0x62, variants 0 boss / 1 / 2) and the Saturn-only P5 type 0x34 of STAGE09 (session 10)
+# ---- M4: Cut Man (P2 type 0x62, variants 0 boss / 1 / 2) and the Saturn-only P5 type 0x34 of STAGE09
 CUT_DATA = (0x29331C, 0x2933B8)                 # Saturn data used by Cut Man (byte data + 7 code-pointer tables)
 CUT_CODE_TABLES = {0x293330: 3, 0x29333C: 4, 0x29334C: 6, 0x293364: 7, 0x293380: 5, 0x293394: 5, 0x2933A8: 4}
 CUT_GLOBALS = {**WM_GLOBALS, 0x0602DAEB: 0x8016D2FF, 0x0602E1B2: 0x8015A00E}
@@ -2325,7 +2417,7 @@ def helper_arity(hm, helpers):
         out[h] = max([0] + [int(r[1]) + 1 for r in read])
     return out
 
-# ----------------------------------------------------------------- M2: Wood Man in the STAGE08 overlay (session 7)
+# ----------------------------------------------------------------- M2: Wood Man in the STAGE08 overlay
 WM_HANDLERS = (('wood_man', 0x258F00, 0x63), ('wood_leaf', 0x259B7C, 0x64))
 M2_MAGIC = b'MM8R-M2\0'
 
@@ -2422,7 +2514,7 @@ def place_moved_file(disc, idx, data, iso_path, lba):
     disc.write(rl, ro + 2, struct.pack('<I', lba) + struct.pack('>I', lba) + struct.pack('<I', len(data)) + struct.pack('>I', len(data)))
     return nsec
 
-# ----------------------------------------------------------------- M4: Cut Man in STAGE09 (session 10)
+# ----------------------------------------------------------------- M4: Cut Man in STAGE09
 # Map (02 §PS1 data compared, STAGE09): grid row 4 cols 5-7 / 0xC-0xE zeroed on PS1; screens 0x18-0x1C deleted; screen
 # 0x15 (row 5 col 6, under the hidden room) edited by the PS1 (ceiling closed); screen 0x10 kept (also at row 5 col 5).
 M4_GRID_CELLS = {(0, 4, 5): 0x10, (0, 4, 6): 0x18, (0, 4, 7): 0x19, (0, 4, 0xC): 0x1A, (0, 4, 0xD): 0x1B, (0, 4, 0xE): 0x1C}
@@ -2472,7 +2564,7 @@ def patch_m4a(disc, lba):
     info.update(pac09_lba=lba, pac09_size=len(pac), pac09_sectors=place_moved_file(disc, PS1_STAGE09_PAC_FILE, pac, 'STDATA/STAGE09.PAC', lba))
     return info
 
-# ----------------------------------------------------------------- M5: floor bolt 19 (session 13)
+# ----------------------------------------------------------------- M5: floor bolt 19
 # The PS1 placed bolt 19 on a floor of Sword Man's stage (STAGE05 and STAGE05B share the same chunk 0x0A); on the
 # Saturn it is Wood Man's drop (0x259B56). Removing the record the same way as bolt 38 (M4a) leaves Wood Man as its
 # only source. Both PACs keep their size and LBA: the chunk is patched in place.
@@ -2582,8 +2674,8 @@ def build_image(src_bin, out_bin, quick_stage=None, workdir=None, checkpoint=Non
     ovl09 = disc.read(e09[0], e09[1])
     assert md5_bytes(ovl09) == KNOWN_MD5[('ps1', 'OVL/STAGE09.BIN')], 'unexpected STAGE09 overlay (already patched?)'
     new9, info9 = build_m4_overlay(ovl09, Ps1.OVL_BASE + info['vf_off'], workdir)
-    pbgm48, i48 = build_boss_intro_bank('CUT1.PAC')       # music 0x48: CUT1 on PBGM29 (session 11)
-    pbgm49, i49 = build_music_bank('CUT2.PAC')            # music 0x49: CUT2 converted whole (session 11)
+    pbgm48, i48 = build_boss_intro_bank('CUT1.PAC')       # music 0x48: CUT1 on PBGM29
+    pbgm49, i49 = build_music_bank('CUT2.PAC')            # music 0x49: CUT2 converted whole
     lba48 = nxt + sectors(len(new9)); lba49 = lba48 + sectors(len(pbgm48))
     vf += [(lba48, len(pbgm48), 4), (lba49, len(pbgm49), 4)]                                 # music 0x48/0x49
     new9[info9['vf_off']:info9['vf_off'] + 48] = struct.pack('<12I', *[x for e in vf for x in e])
@@ -2617,7 +2709,7 @@ def check_build(orig_bin, new_bin, xdelta=None):
     last = len(o) // S - 1; ins = PS1_EXTEND_SECTORS
     assert len(n) == len(o) + ins * S
     bcd = lambda v: (v // 10) << 4 | v % 10
-    changed = 0
+    changed = 0; to_fix = []
     for k in range(len(n) // S):
         sec = n[k * S:(k + 1) * S]; m = k + 150
         src = o[k * S:(k + 1) * S] if k < last else (None if k < last + ins else o[(k - ins) * S:(k - ins + 1) * S])
@@ -2627,7 +2719,10 @@ def check_build(orig_bin, new_bin, xdelta=None):
         if src is not None and k >= last:
             assert sec[16:] == src[16:], k              # track 1's last sector (ripper-quirk ECC): moved unchanged
             continue
-        assert sec[18] & 0x20 == 0 and bytes(fix_m2f1(bytearray(sec))) == sec, f'EDC/ECC sector {k}'
+        assert sec[18] & 0x20 == 0, f'Form 2 sector {k}'
+        to_fix.append((k, sec))
+    for (k, sec), fixed in zip(to_fix, fix_m2f1_many([x for _, x in to_fix])):
+        assert fixed == sec, f'EDC/ECC sector {k}'
     disc = RawDisc(new_bin)
     vf = {}
     for idx in (PS1_STAGE08_FILE, PS1_STAGE09_FILE):
@@ -2644,21 +2739,21 @@ def check_build(orig_bin, new_bin, xdelta=None):
         lba, size, typ = next(iter(es))
         assert typ == 4 and size == len(want[m]) and disc.read(lba, size) == want[m], hex(m)
     out = dict(sectors_checked=changed, music={hex(m): next(iter(e)) for m, e in sorted(vf.items())})
-    # full-disc layout (session 12): with separate track files track 2 (END1.DA) starts after the new track 1 plus its
+    # full-disc layout: with separate track files track 2 (END1.DA) starts after the new track 1 plus its
     # 150-sector pregap; entry 138, both ISO extents and the PVD size moved by the inserted sectors
     od = RawDisc(orig_bin); pv = lambda d: struct.unpack('<I', d.read(16, 84)[80:84])[0]
     lba138 = disc.file_entry(PS1_END1_FILE)[0]
     assert lba138 == len(n) // S + 150 == disc.iso_record('END1.DA')[2] == od.file_entry(PS1_END1_FILE)[0] + ins, 'END1.DA position'
     assert disc.iso_record('ZNULL.DAT')[2] == od.iso_record('ZNULL.DAT')[2] + ins and pv(disc) == pv(od) + ins, 'track 3 / PVD size'
     out['end1_lba'] = lba138
-    for st in M5_STAGES:                                 # M5: only chunk 0x0A changed, bolt 19 gone (session 13)
+    for st in M5_STAGES:                                 # M5: only chunk 0x0A changed, bolt 19 gone
         ext, sz, chunks = pac_locate(disc, f'STDATA/{st}.PAC'); oe, osz, _ = pac_locate(od, f'STDATA/{st}.PAC')
         t, off, cn = next(c for c in chunks if c[0] == 0xA)
         new_pac, old_pac = disc.read(ext, sz), od.read(oe, osz)
         assert (ext, sz) == (oe + 0, osz) and new_pac[:off] == old_pac[:off] and new_pac[off + cn:] == old_pac[off + cn:], st
         assert new_pac[off:off + cn] == m5_placements(old_pac[off:off + cn]) and m5_bolt19() not in new_pac[off:off + cn], st
     out['m5_bolt19_removed'] = True
-    # M7a (session 15): DEMO.BIN rebuilt in its own slot; its virtual entry points at the bonus overlay
+    # M7a: DEMO.BIN rebuilt in its own slot; its virtual entry points at the bonus overlay
     e8, o8 = disc.file_entry(PS1_DEMO_FILE), od.file_entry(PS1_DEMO_FILE)
     assert e8[0] == o8[0] and e8[2] == o8[2] and e8[1] <= PS1_DEMO_SLOT * 2048, 'DEMO.BIN entry'
     assert disc.iso_record('OVL/DEMO.BIN')[2:] == (e8[0], e8[1]), 'DEMO.BIN ISO record'
@@ -2699,7 +2794,7 @@ def check_build(orig_bin, new_bin, xdelta=None):
 def difftest_boss(spec, n=300, kinds=None, frames=10, workdir=None, uninit=False):
     """Differential test of a lifted port spec (see BossHarness). Returns {kind: Counter}, first failures, coverage
     (+ with uninit=True a 4th value from _uninit_hooks: MIPS reads of stack words not written during the same handler
-    call, and reads outside the EXE image / compiled code / stack; session 12, check 3)."""
+    call, and reads outside the EXE image / compiled code / stack, check 3)."""
     if uninit:
         rep, restore = _uninit_hooks(0x801E1400, 0x801E1400 + len(boss_compile(spec, 0x801E1400, workdir)[0]))
         try: return difftest_boss(spec, n, kinds, frames, workdir) + (rep,)
@@ -2763,7 +2858,7 @@ def difftest_m2(n=300, kinds=('wood', 'leaf'), frames=10, workdir=None):
     """Differential test of the lifted Wood Man / leaf code. Returns {kind: Counter}, coverage."""
     return difftest_boss(WOOD_SPEC, n, kinds, frames, workdir)
 
-# ----------------------------------------------------------------- sound banks (session 7, audio survey)
+# ----------------------------------------------------------------- sound banks (audio survey)
 # Saturn "sound bank" PACs (STxx, BSxxB/C, WOOD1/2, CUT1/2, ...): chunk 0x201 = sound-ID table (8 bytes per ID; byte 0 =
 # bank number, byte 3 = sequence number in the bank) and chunk 0x203 = Sega TON (tones; sample addresses relative to
 # the chunk) + a Sega SEQ bank at offset 0x26000 (u16 song count, u32 song offsets). COMMON.PAC: 0x200 table + 0x202.
@@ -2811,7 +2906,7 @@ def sat_bank_song(name, k):
     end = songs[k + 1] if k + 1 < len(songs) else len(t) - SAT_SEQ_OFFSET
     return t[SAT_SEQ_OFFSET + songs[k]:SAT_SEQ_OFFSET + end]
 
-# ----------------------------------------------------------------- PS1 sound banks (session 7: PBGM46 / music hook)
+# ----------------------------------------------------------------- PS1 sound banks (PBGM46 / music hook)
 # PS1 PBGMnn.PAC (file-table entry 23 + n, loaded by play_bgm 0x800FCB80 / 0x800FCA4C into dest table 0x801378BC):
 #   chunk 5 -> 0x8016FB34 sound-ID table, 4 bytes per ID (index = sound ID; Saturn bank ID i -> index i + 0x50):
 #             [bank | 0x80, 0x10 + note // 15 (VAB program; bit 7 = take pan from the tone), (note % 15) << 4 | priority,
@@ -2904,6 +2999,7 @@ def sat_bank_sounds(name):
         out.append((i, e, s[0x15], s[0x18]))
     return out
 
+@_memo
 def build_boss_intro_bank(sat_name, tpl_n=0x29, tpl_sat='BS08B.PAC'):
     """New PS1 boss-intro bank (PBGM46 from WOOD1, later PBGM48 from CUT1) built on Capcom's own conversion of a
     robot master's boss-intro bank (PBGM29 = BS08B): its jingle SEQ and music programs 0-15 stay as they are (identical
@@ -2974,7 +3070,7 @@ def sat_layer_raw(name, voice, note):
         if L[0] <= note <= L[1]: return L
     raise KeyError((name, voice, note))
 
-# ----------------------------------------------------------------- Sega SEQ -> Sony SEQ (session 8)
+# ----------------------------------------------------------------- Sega SEQ -> Sony SEQ
 # Sega SEQ song (big-endian): u16 resolution, u16 tempo-event count, u16 data offset, u16 tempo loop offset (byte offset of
 # the tempo event the loop returns to), then tempo events (u32 steps, u32 microseconds per beat), then the event stream.
 # Every event ends with a step byte = the time SINCE THE PREVIOUS EVENT (it is added before the event takes effect):
@@ -3113,7 +3209,7 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
                 channels=sorted({e[2] for e in A['ev'] if e[1] == 'note'}), size=len(body))
     return bytes(body), info
 
-# ----------------------------------------------------------------- Saturn TON -> PS1 VAB (session 8)
+# ----------------------------------------------------------------- Saturn TON -> PS1 VAB
 # TON layer (0x20 bytes, BE; SCSP slot registers from byte 2): 0 lo key, 1 hi key, 2-3 [SSCTL 7-8 | LPCTL 5-6 | PCM8B 4 |
 # SA 19:16], 4-5 SA, 6-7 LSA, 8-9 LEA (samples), 0x0A-0B [D2R 15-11 | D1R 10-6 | EGHOLD 5 | AR 4-0], 0x0C-0D
 # [LPSLNK 14 | KRS 13-10 | DL 9-5 | RR 4-0], 0x0E-0F [STWINH | SDIR | TL 7-0], 0x10-0x17 modulation/LFO/DSP input (all 0 in
@@ -3171,7 +3267,7 @@ def _best(cands, want):
 SPU_DR = [(d, spu_rate_db_per_sample(d, 8)) for d in range(16)]
 SPU_SR = [(r, spu_rate_db_per_sample(r >> 2, 8 - (r & 3))) for r in range(127)]
 SPU_RR = [(r, spu_rate_db_per_sample(r, 8)) for r in range(32)]
-# Sustain-decrease rates measured in Mednafen (session 8: a 112-sample sine tone held 2.1 s per rate), dB per second.
+# Sustain-decrease rates measured in Mednafen (a 112-sample sine tone held 2.1 s per rate), dB per second.
 # The model above is 7-24 % off (and the steps between shift groups are uneven), so these replace it where measured.
 SPU_SR_MEASURED_DBPS = {52: -41.6, 53: -32.4, 54: -31.5, 55: -27.0, 56: -14.46, 57: -12.60, 58: -10.84, 59: -9.05,
                         60: -6.51, 61: -5.73, 62: -4.94, 63: -4.16, 64: -3.16, 65: -2.78, 66: -2.43, 67: -2.04,
@@ -3311,7 +3407,7 @@ def vag_encode_loop(pcm, loop_start):
     len(pcm) and loop_start must be multiples of 28."""
     assert len(pcm) % 28 == 0 and loop_start % 28 == 0 and loop_start < len(pcm)
     nblk = len(pcm) // 28; lb = loop_start // 28
-    # Session 8 (calibration): forcing filter 0 on the loop-start block put audible noise into short loops (a 112-sample
+    # Calibration: forcing filter 0 on the loop-start block put audible noise into short loops (a 112-sample
     # sine loop measured 40 dB more energy above 4 kHz than the Saturn). Now the loop body is encoded with the predictor
     # history it really has on every repeat (the end of the loop; iterated until stable); only the first pass into the
     # loop (history = the pre-loop samples) can differ slightly.
@@ -3344,21 +3440,21 @@ def _center_shift(key_at_44k):
     return c, sh
 
 def scsp_pan_db(dipan):
-    """SCSP DIPAN -> (left dB, right dB). Measured in Mednafen (session 8 calibration): bits 0-3 = n x 3 dB on one side
+    """SCSP DIPAN -> (left dB, right dB). Measured in Mednafen (calibration): bits 0-3 = n x 3 dB on one side
     (15 = off); bit 4 = 0 attenuates the LEFT side (0xA2 = right louder by 6 dB), bit 4 = 1 the right side."""
     n = dipan & 15
     a = -200.0 if n == 15 else -3.0 * n
     return (a, 0.0) if not dipan & 0x10 else (0.0, a)
 
 def scsp_pan(dipan):
-    """SCSP DIPAN -> libsnd pan 0-127. libsnd (measured, session 8): pan p < 64 scales the right side by (p/64)^2,
-    p > 64 the left side by ((127-p)/63)^2. (Session 7's mapping followed Capcom and had the sides swapped.)"""
+    """SCSP DIPAN -> libsnd pan 0-127. libsnd (measured): pan p < 64 scales the right side by (p/64)^2,
+    p > 64 the left side by ((127-p)/63)^2."""
     l, r = scsp_pan_db(dipan)
     if l == r == 0: return 64
     if l < 0: return min(127, 127 - round(63 * 10 ** (l / 40)))       # left quieter -> towards the right
     return max(0, round(64 * 10 ** (r / 40)))
 
-# Saturn driver laws measured with the emulator calibration (session 8, Mednafen; general, not per bank): velocity -> dB
+# Saturn driver laws measured with the emulator calibration (Mednafen; general, not per bank): velocity -> dB
 # (all voices, drums included; the curve has a step near 93) and CC 7 = -0.735 dB per step below 127. libsnd (PS1)
 # scales velocity, CC 7, tone and program volume as amplitude^2 (40 log10, _libsnd_level).
 SAT_VEL_DB = [(0, -90.0), (40, -48.6), (50, -41.2), (64, -24.1), (72, -18.0), (80, -12.0), (86, -7.2),
@@ -3372,8 +3468,8 @@ MUSIC_TUNE = {
                  (8, 45): -1.3, (8, 67): 1.7, (8, 51): -0.3, (8, 75): 0.3, (8, 78): 0.2, (8, 77): 1.4},
         decay_dbps={3: -10.84, 4: -2.93, 5: -2.93, 6: -8.19, 7: -8.19},  # envelope slope to set (sample's own change removed)
         upsample={0: 2, 1: 4, 2: 4, 3: 2, 4: 0.5, 5: 0.5, 6: 2, 7: 2, 8: 2}),   # voice 0 = the one-shot sounds;
-        # 4/5 at half rate since session 11: keys 80-88 asked the SPU for 4.2-6.7x and were capped at 4x (up to 9 semitones flat)
-    'CUT2.PAC': dict(       # session 11, calibration rounds in Mednafen (02 §Sound "PBGM49")
+        # 4/5 at half rate: keys 80-88 asked the SPU for 4.2-6.7x and were capped at 4x (up to 9 semitones flat)
+    'CUT2.PAC': dict(       # calibration rounds in Mednafen (02 §Sound "PBGM49")
         gain_db={0: -0.4, 1: 1.1, 2: -0.7, 3: 3.8, 4: 1.0, 5: -1.5, 6: -1.3, 7: 4.0, 8: 4.7, 9: 1.5, 10: 1.5,
                  (11, 47): 0.3, (11, 51): 1.7, (11, 77): 4.4, (11, 78): 6.5},
         decay_dbps={2: -12.2, 3: -16.2, 4: -16.2, 5: -24.25, 6: -24.25, 7: -8.1, 8: -8.1, 9: -64.8, 10: -64.8},
@@ -3393,12 +3489,19 @@ def _interp_db(curve, v):
 def _upsample_linear(pcm, up):
     """x up with linear interpolation (keeps the images the SCSP's linear interpolation makes; see build_music_bank)."""
     n = len(pcm)
-    return [round(pcm[i // up] + (pcm[min(i // up + 1, n - 1)] - pcm[i // up]) * (i % up) / up) for i in range(n * up)]
+    if not isinstance(up, int) or n == 0:
+        return [round(pcm[i // up] + (pcm[min(i // up + 1, n - 1)] - pcm[i // up]) * (i % up) / up) for i in range(n * up)]
+    import numpy as np                  # same float64 operations in the same order, round half to even like round()
+    a = np.asarray(pcm, np.int64); b = np.append(a[1:], a[-1])
+    r = np.arange(up, dtype=np.int64)
+    v = a[:, None] + ((b - a)[:, None] * r[None, :]) / up
+    return np.rint(v).astype(np.int64).ravel().tolist()
 
 def _libsnd_level(db):
     """dB (<= 0) -> libsnd 0-127 value with that attenuation (libsnd: amplitude ~ (value/127)^2)."""
     return max(1, min(127, round(127 * 10 ** (db / 40))))
 
+@_memo
 def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=None, cal_keys=False):
     """New PS1 music bank (PBGM47 from WOOD2, later PBGM49 from CUT2) converted from a whole Saturn sound bank:
       - SEQ: song 0 -> Sony SEQ (sega_to_sony_seq; channels and program numbers unchanged).
@@ -3590,7 +3693,7 @@ def music_bank_report(pac, sat_name):
     return dict(layers=layers, max_cents=max(abs(c) for c in cents), seq_notes_equal=sorted(got) == sorted(exp), max_pitch=max_ratio,
                 notes=len(got), loops=loops, end_t=A['end_t'], ids=ids, progs=v['progs'][:17], size=len(pac))
 
-# ----------------------------------------------------------------- recording comparison (session 8)
+# ----------------------------------------------------------------- recording comparison
 # Recordings of the same music on both systems are compared through a render of the decoded Saturn song (Saturn
 # rules: base note, loops, TL/DISDL, D1R/DL, pan, gates; velocity/CC 7 left out so that the fit measures them):
 # per (channel, velocity) group the rendered power spectrogram in semitone bins is fitted to each recording (NNLS;
@@ -3688,7 +3791,7 @@ def audio_compare(name, sat_path, ps1_path, q=0.5):
     return dict(tempo=(res['sat']['tempo_factor'], res['ps1']['tempo_factor']), match=(res['sat']['match'], res['ps1']['match']),
                 ref='median of %d groups' % len(ok), groups=[(gr, cnt[gr], ds[i], dp[i] - off) for i, gr in enumerate(groups)])
 
-# ----------------------------------------------------------------- emulator calibration (session 8)
+# ----------------------------------------------------------------- emulator calibration
 # The user's BIOS files let Mednafen (1.29, headless: Xvfb + SDL dummy audio, -soundrecord) run both discs here. Saturn: the
 # calibration song replaces a stage's music bank (the Saturn title plays CD audio, missing from a track-1 image); PS1:
 # every PBGM file entry points at the test bank, so the title screen plays it.
@@ -3820,14 +3923,14 @@ def calibration_song(name='WOOD2.PAC'):
     note(v, k, 127, 0x140, 127, 'bit40'); note(v, k + 7, 127, CAL_GATE, 127, 'after40')
     return sega_seq_encode(ev, A['res'], A['tempos'][0][1]), sched
 
-# ----------------------------------------------------------------- emulator sessions + calibration analysis (session 8)
+# ----------------------------------------------------------------- emulator sessions + calibration analysis
 SAT_KEYS_TO_STAGE = (20, 40, 60, 75, 88)   # Return presses: skip intro movie, open menu, Game Start, skip story movie
 PS1_KEYS_TO_TITLE = (20, 40, 60)           # Return presses: skip logos/intro movie, open the title menu (music keeps playing)
 
 def mednafen_session(bin_path, wav_path, seconds, mode, keys=(), snaps_every=0, display=77, home=None):
     """Run a one-track image in Mednafen on a private Xvfb display, press Return at the given seconds (xdotool),
     optionally take screenshots (F9) every `snaps_every` s, and record the sound to `wav_path` (RIFF sizes fixed).
-    bin_path ending in .cue = a full multi-track disc, used as is (mode ignored; session 12).
+    bin_path ending in .cue = a full multi-track disc, used as is (mode ignored).
     Needs Xvfb, xdotool and the BIOS files in ~/.mednafen/firmware. Returns (seconds recorded, home dir)."""
     import subprocess, tempfile, time, shutil
     d = home or tempfile.mkdtemp()
@@ -3873,7 +3976,7 @@ def mednafen_session(bin_path, wav_path, seconds, mode, keys=(), snaps_every=0, 
     return n // 4 / 44100, d
 
 class MednafenLive:
-    """Interactive headless Mednafen session for menus (session 15; 03 §6): one key at a time, screenshots (F9, native
+    """Interactive headless Mednafen session for menus: one key at a time, screenshots (F9, native
     resolution, into home/snaps) and save states (F5 into slot 0 -> home/mcs) on request. Same keys as mednafen_session.
     with MednafenLive(bin_or_cue, home, display=81) as m: m.wait(30); m.key('Return'); m.snap('title')"""
     def __init__(self, bin_path, home, display=81, mode='MODE2/2352', record=None, video=None, vcodec='png', state=None):
@@ -4133,7 +4236,7 @@ def patch_music_hook(disc, vf0):
                m_i(0x0B, V0, A2, 1),                           # sltiu a2, v0, 1   (loop count: 0 = forever)
                m_i(0x0D, 0, A1, 1), 0, 0, 0])                  # ori a1, zero, 1; nops; (jal 0x800C6474 kept)
 
-# ----------------------------------------------------------------- DuckStation save states (session 7)
+# ----------------------------------------------------------------- DuckStation save states
 def ducc_state(path, ovl_bytes=None):
     """DuckStation .sav ('DUCC' header + zstd frames: 256x192 RGBA screenshot, then the state). Returns dict(shot, state,
     ram). RAM (2 MB) is located through the M2 overlay marker (pass the build's STAGE08 overlay bytes); for VRAM use
@@ -4159,7 +4262,7 @@ def ducc_vram(state, tiles103):
     base = i - 5 * 2048 - (0x100 * 2048 + 0x200 * 2)
     return state[base:base + 0x100000]
 
-# ----------------------------------------------------------------- Saturn Bonus Mode survey (session 14)
+# ----------------------------------------------------------------- Saturn Bonus Mode survey
 # Title menu entry 4 on the Saturn (always available). Main loop 0x27B440 (state block 0x002C2E00, state table 0x29B490:
 # 0 init 0x27B4F4, 1 menu 0x27B60A, 2 0x27B71E, 3 0x27B86A, 4 exit 0x27B946); file table 0x29B300 = SLABO.PAC, LETTER.PAC,
 # then the BONUS/ILLnn.PAC names (13 bytes apart, 0x29B308).
@@ -4189,7 +4292,7 @@ def bgr555_rgb(pal):
     import numpy as np
     return np.array([[(v & 31) * 255 // 31, (v >> 5 & 31) * 255 // 31, (v >> 10 & 31) * 255 // 31] for v in pal], np.uint8)
 
-# ----------------------------------------------------------------- M7: Bonus Mode (session 15)
+# ----------------------------------------------------------------- M7: Bonus Mode
 # PS1 title (02 §PS1 title menu): front-end loop 0x800FEA40, mode 1 = title with sub-states 0x80137930[0x801CF844]:
 # 0 setup 0x800FEBEC (DEMO overlay n = 0, LABO.PAC, music 0x10), 2 menu 0x800FEF94 (cursor 0x801D284C), 4 = fade out ->
 # continue 0x8011F0A8(1) / options 0x8011DC78 -> menu again. Menu items are P4 type 0x0B title objects (handler
@@ -4215,7 +4318,7 @@ M7_TITLE_CODE = [                    # (address, fingerprint of the original wor
     (0x800FF0B8, '3f66bfbb7b6b', 3),       # Up from item 0 goes to item 3 (ori v0, zero, 2 -> immediate 3)
     (0x80134CF4, 'e1c66a0f7c87', 0x13),    # the menu box spawns items 14..18 (slti v0, s0, 0x12 -> immediate 0x13)
     (0x800FF1B0, 'a74c827d0100', None),    # jal 0x8011F0A8 (continue screen) -> j title_hook (DEMO overlay)
-    (0x800FEFD4, 'f2cd1272b0f6', 'title_confirm'),  # jal 0x800FD100 (confirm sound 0x15A) -> jal title_confirm (M7g, session 16)
+    (0x800FEFD4, 'f2cd1272b0f6', 'title_confirm'),  # jal 0x800FD100 (confirm sound 0x15A) -> jal title_confirm (M7g)
 ]
 M7_TITLE_HOOK_S = r'''
     .set noreorder
@@ -4244,7 +4347,7 @@ title_hook:
     jr    $ra
     addiu $sp, $sp, 0x38
 
-# M7g (session 16): the Saturn title (0x20989A) shows the bonus menu's hidden ANIMATION item when BONUS MODE is confirmed
+# M7g: the Saturn title (0x20989A) shows the bonus menu's hidden ANIMATION item when BONUS MODE is confirmed
 # while Start + L + R are held (held pad & 0x888; Start may be the confirming press), by setting 0x0602DABC (= PS1
 # 0x801B29A0) to 1, else 0. Here: called instead of the confirm sound (a0 = 0x15A), cursor 3 = BONUS MODE, held pad
 # 0x801B2954 & (Start 0x800 | L1 4 | R1 8) (L1 + R1 + Start), then the sound as before.
@@ -4264,7 +4367,7 @@ title_confirm:
 2:  j     confirm_sound
     nop
 
-# Bonus exit timing (session 16: chase the PS1's 9 extra black frames): coming back from Bonus Mode, sub-state 0
+# Bonus exit timing (chase the PS1's 9 extra black frames): coming back from Bonus Mode, sub-state 0
 # would reload DEMO.BIN, which is still resident and byte-identical to the disc copy (Mednafen states at the bonus
 # menu; the bonus code never writes 0x801D8000-0x801DFFFF). bonus_enter points sub-state 0's `jal 0x800FC648` (overlay
 # loader, 0x800FEC18) here for that one call; this does the loader's bookkeeping without the read (0x801C738C = n,
@@ -4344,11 +4447,12 @@ def m7_compile(src_text, name, base, symbols, entry, workdir=None):
     data, sy = compile_c(srcs, base, symbols, entry_first=entry, workdir=wd)
     bad = check_r3000(data, base)
     assert not bad, bad
-    # nothing may live past the file (.bss is not loaded: the overlay loader reads the file size only; session 16)
+    # nothing may live past the file (.bss is not loaded: the overlay loader reads the file size only)
     past = [k for k, v in sy.items() if base + len(data) <= v < base + 0x100000 and k not in symbols]
     assert not past, f'symbols outside the loaded image (.bss?): {past}'
     return data, sy
 
+@_memo
 def build_m7_overlays(demo, workdir=None):
     """M7a: (new DEMO.BIN, BONUS overlay, info). DEMO.BIN (the title overlay, resident while the title runs) gets
     marker + one virtual file entry (the bonus overlay; the caller fills in its LBA/size) + the title hook and
@@ -4370,7 +4474,7 @@ def build_m7_overlays(demo, workdir=None):
     assert sy['title_hook'] == code_base
     out += data
     assert len(out) <= PS1_DEMO_SLOT * 2048, f'DEMO.BIN grows to {len(out):#x}'
-    bonus, binfo = build_m7b_bonus(workdir)            # M7b (session 16): the Saturn bonus menu, lifted
+    bonus, binfo = build_m7b_bonus(workdir)            # M7b: the Saturn bonus menu, lifted
     return out, bonus, dict(demo_size=len(out), vf=vf, vf_off=vf_off, title_hook=sy['title_hook'], title_confirm=sy['title_confirm'],
                             title_skip_load=sy['title_skip_load'], bonus_enter=sy['bonus_enter'], **binfo)
 
@@ -4445,7 +4549,7 @@ def patch_m7a(disc, lba, workdir=None, vf0=None):
     info.update(patch_title_menu(disc, info['title_hook'], info['title_confirm']))
     return info
 
-# ----------------------------------------------------------------- M7b: Bonus Mode menu (session 16)
+# ----------------------------------------------------------------- M7b: Bonus Mode menu
 # The Saturn bonus menu (02 §Saturn Bonus Mode, "M7b") is lifted from 2NDREAD with the SH-2 lifter: the menu loop
 # 0x27AAD0 (state block 0x2C2DF4, states 0x29B2D0: 0 init 0x27AB98, 1 input 0x27AC50, 2 sub-screen 0x27AD5E, 3 exit
 # 0x27AE6A, 4 enter sub-screen 0x27AE9A), the object spawner 0x2761DC (lists 0x296694) and the P4 handlers 0x40/0x41
@@ -4453,7 +4557,7 @@ def patch_m7a(disc, lba, workdir=None, vf0=None):
 # (Saturn 0x279978 <-> PS1 0x8011F0A8 call for call), so its engine calls map to the PS1 functions below. Sub-screens
 # (postcards 0x27B1C0, illustrations 0x27B440, sound/voice test 0x27B0F8, animation 0x27AFFA) are external functions,
 # replaced by stubs until M7c-M7e.
-# Saturn engine function -> PS1, verified by aligned code (session 16): continue loop 0x279978 / 0x8011F0A8 (state fn,
+# Saturn engine function -> PS1, verified by aligned code: continue loop 0x279978 / 0x8011F0A8 (state fn,
 # 0x060140AA, 0x00210DA4, 0x00210E4C, 0x06010CA8, 0x06011BC8, sound, 0x06008160(1)); continue init 0x2799D0 /
 # 0x8011F184 (0x060147D8, 0x00210DFA x2 on the layer structs +0x30/+0x60, 0x06012E70(2)); title setup 0x2095xx /
 # 0x800FEBEC (stream LABO.PAC, 0x0600C0A8(0x10) / 0x800FCA4C(0x10), 0x06014D64 = 0x801061DC(dst, src, n) for the
@@ -4488,7 +4592,7 @@ M7B_WAIT = (0x06008160, 0x800F7ECC)          # wait n frames; the replacement al
 # Saturn pad words (verified, Mednafen: key held, save state): 0x0602DA40 held, +2 previous, +4 pressed this frame (pad 2:
 # +6..+0xA; 0x0602DA4A <-> 0x801B2960 in globals_map). Bits: Up 0x1000, Down 0x2000, Left 0x4000, Right 0x8000, Start 0x800,
 # A 0x400, C 0x200, B 0x100, X 0x40, Y 0x20, Z 0x10, L 8, R 0x80. PS1 0x801B2954 held / 56 previous / 58 pressed: Up 0x1000,
-# Right 0x2000, Down 0x4000, Left 0x8000, Start 0x800, x 0x40, circle 0x20, triangle 0x10, L1 4, R1 8. Decision (session 14/15):
+# Right 0x2000, Down 0x4000, Left 0x8000, Start 0x800, x 0x40, circle 0x20, triangle 0x10, L1 4, R1 8. Decision:
 # x = confirm (Saturn A), triangle = cancel (Saturn B); circle and square do nothing on the bonus screens.
 M7B_PAD_MAP = [(0x1000, 0x1000), (0x4000, 0x2000), (0x8000, 0x4000), (0x2000, 0x8000), (0x0800, 0x0800),
                (0x0040, 0x0400), (0x0010, 0x0100), (0x0004, 0x0008), (0x0008, 0x0080)]   # (PS1 bit, Saturn bit)
@@ -4526,7 +4630,7 @@ M7B_CODE_TABLES = {0x0029B2D0: 5, 0x002966AC: 9, 0x0029B490: 5}
 M7B_WORD_DATA = [(0x0029B2F8, 2), (0x0029B2E4, 5)]   # u32 auto-repeat counters; movie-name pointers (ROCK8_0-4.CPK)
 M7B_HALF_DATA = [(a + 4, 2) for k in range(6) for a in []]   # filled by m7b_spawn_lists() (x, y of every record)
 M7B_STUB_SUBSCREENS = {}   # all lifted: ANIMATION 0x27AFFA (M7g), illustrations 0x27B440 (M7c), postcards 0x27B1C0 (M7d), sound/voice test 0x27B0F8 (M7e)
-# M7g (session 16): the ANIMATION screen 0x27AFFA plays ROCK8_n.CPK through the Saturn movie player 0x06017FFC(name);
+# M7g: the ANIMATION screen 0x27AFFA plays ROCK8_n.CPK through the Saturn movie player 0x06017FFC(name);
 # the PS1 has the same five movies as MOVIE/ROCK8_n.STR (file-table entries 3 + n; frames compared, same lengths) and
 # plays them with 0x800FD444(entry) (boot: 3 = opening; the game: 4-7), its own skip rule (table 0x801378F4).
 M7B_MOVIE_NAMES, M7B_MOVIE_FIRST, M7B_PS1_MOVIE = 0x0029B2E4, 3, 0x800FD444
@@ -5072,7 +5176,7 @@ def front_pac_sat_to_ps1(t, b):
     if t == 0x103: return gfx_sat_to_ps1(b, True)
     raise ValueError(f'chunk {t:#x}')
 
-# PS1 button labels on the bonus screens (session 14/15): the menu prompt (set 0xA9 frame 0x11, "PRESS START, A OR C
+# PS1 button labels on the bonus screens: the menu prompt (set 0xA9 frame 0x11, "PRESS START, A OR C
 # BUTTON") becomes "PRESS START OR (x) BUTTON", the PS1 title's own wording, set from SLABO's small font (0x101 tiles:
 # letters 212-240, relative to the set base 0xB00). The font's small circled-x glyph (tile 301, drawn for another palette:
 # in the text palette 3 its ring colours 8-15 are 0x0000 = transparent on the PS1) is recoloured into the blank last tile
@@ -5106,6 +5210,7 @@ M7C_LABELS = {0x36: _m7c_label(199, 'CHOOSE'), 0x37: _m7c_label(M7C_TRI_TILE, 'E
 def unpac_dict_sat_slabo():
     return {t: b for t, o, b in unpac(os.path.join(SAT_FILES, 'SLABO.PAC'))}
 
+@_memo
 def m7b_slabo_pac():
     """SLABO.PAC (Saturn only: bonus backgrounds, fonts, cursors) converted to a PS1 PAC, loaded like LABO.PAC; prompt
     line with the PS1 button (above)."""
@@ -5172,7 +5277,7 @@ def build_m7b_bonus(workdir=None):
                             csrc=os.path.join(wd, 'm7b_bonus.c'), bonus_menu=sy['bonus_menu'], bonus_ill=sy['bonus_ill'],
                             sat_data=sy['sat_data'], bonus_ram=sy['bonus_ram'])
 
-# ---- M7c (session 16): OFFICIAL ILLUSTRATIONS. Saturn BONUS/ILLnn.PAC = chunk 9 (1024 colours, the picture in CRAM bank 2 =
+# ---- M7c: OFFICIAL ILLUSTRATIONS. Saturn BONUS/ILLnn.PAC = chunk 9 (1024 colours, the picture in CRAM bank 2 =
 # entries 512-767) + chunk 0x102 (256 16 x 16 8-bpp characters, 16 bytes per row, in a 16 x 16 grid; set 0xA3 draws 13 x 13
 # of them). PS1 file: chunk 9 as LE BGR555 (entry 512 = 0 = transparent; the other picture colours get STP so the
 # viewer's semi-transparent swap applies to them; the zero entries stay zero like the Saturn's), then the 256 x 256 texture
@@ -5188,6 +5293,7 @@ def m7c_card(n):
     assert v[y0:y1 + 1, x0:x1 + 1].all() and v.sum() == (y1 - y0 + 1) * (x1 - x0 + 1) and x1 < 208 and y1 < 208, n
     return x0, y0, x1, y1
 
+@_memo
 def m7c_ill_file(n):
     ch = {t: b for t, o, b in unpac(os.path.join(SAT_FILES, 'BONUS', f'ILL{n:02d}.PAC'))}
     assert sorted(ch) == [9, 0x102] and len(ch[9]) == 2048 and len(ch[0x102]) == 65536
@@ -5199,7 +5305,7 @@ def m7c_ill_file(n):
         for y in range(16): tex[(v0 + y) * 256 + u0:(v0 + y) * 256 + u0 + 16] = g[256 * t + 16 * y:256 * t + 16 * y + 16]
     return struct.pack('<1024H', *out) + bytes(tex)
 
-# ---- M7d (session 22): BOSS CHARACTER POSTCARD. Saturn screen 0x27B1C0 (lifted: bonus_pc; state block +6 = number in the
+# ---- M7d: BOSS CHARACTER POSTCARD. Saturn screen 0x27B1C0 (lifted: bonus_pc; state block +6 = number in the
 # box, +7 = leave, +8 = sound; 0x0602DABD = box cursor NO./EXIT, DABE = card shown, DABF = number shown): Right/Left change
 # the number (Up/Down move the box cursor), L/R change number and card at once, A/C on NO. show that card with sound
 # 0x189 or 0x18A (RNG), B or A/C on EXIT leave (sound 0x38). The card is a P4 0x41 object (variant 5, state 6 = 0x276140):
@@ -5247,6 +5353,7 @@ def m7d_char_vram(c):
     """PS1 VRAM position (halfword x, line y) of Saturn 8-bpp character c."""
     return 64 * (M7D_PAGE0 + 2 * (c >> 8)) + 8 * (c & 15), 16 * ((c >> 4) & 15)
 
+@_memo
 def m7d_letter():
     """LETTER.PAC for the PS1: (files, spans). File 0 starts with the 30 card palettes (256 colours each, LE; entry 0 = 0
     transparent, the rest with STP so black stays opaque, like the illustrations), then the character data; each span =
@@ -5269,7 +5376,7 @@ def m7d_letter():
     return files, spans
 
 
-# ---- M7b differential test (session 16): the lifted bonus code against the Saturn code, like the boss difftests
+# ---- M7b differential test: the lifted bonus code against the Saturn code, like the boss difftests
 class _BonusSatMem(SatMem):
     """SatMem that also lets the bonus code write its 2NDREAD variables (state blocks, auto-repeat counters)."""
     W_OK = ((0x002C2DF4, 0x002C2E20), (0x0029B2F8, 0x0029B300))
@@ -5521,7 +5628,7 @@ def verify():
     check('STAGE08 chunk5: PS1 == byteswapped Saturn prefix (+0x1138 Saturn-only tail)', sw32[:len(p5)] == p5 and len(s5) - len(p5) == 0x1138)
     check('PS1 0x80105864 = delete object (sb zero 0..3($a0))', fp([ps.exe.u32(0x80105864 + 4 * i) for i in range(4)]) == '80e9b7777f92')
     check('PS1 0x8010910C = face player (reads player X @0x8015E248)', fp(ps.exe.u32(0x8010910C)) == '961606b366f0' and fp(ps.exe.u32(0x80109110) & 0xFFFF) == '438664df057c')
-    # ---- session 5
+    # ---- Saturn / PS1 basics
     p9 = placements('ps1', 'STAGE09')
     check('PS1 placement parser: STAGE09 bolt 39 record == Saturn record', any(fp(r) == '79653df28bb9' for r in p9) and any(fp(r) == '79653df28bb9' for r in placements('sat', 'STAGE09')))
     check('Saturn 0x060196A4 / 0x06019800 = compiler divide / modulo (tst r0,r0 + div1 loop)',
@@ -5549,13 +5656,13 @@ def verify():
     bolts = lambda side, st: {f >> 8: (x, y) for t, f, x, y in placements(side, st) if t == 0x25 and f & 0xFF == 2 and f >> 8}
     check('Bolt 38: not placed on Saturn STAGE09; on PS1 STAGE09 floor @(0x620,0x578)', 38 not in bolts('sat', 'STAGE09') and fp(bolts('ps1', 'STAGE09').get(38)) == 'b01053d8ccf6')
     check('Bolt 19: not placed on Saturn STAGE05; on PS1 STAGE05 floor @(0xDC0,0xAD8)', 19 not in bolts('sat', 'STAGE05') and fp(bolts('ps1', 'STAGE05').get(19)) == '8ea28ee6c92a')
-    # ---- session 5 follow-up: free RAM after the STAGE08 overlay
+    # ---- free RAM after the STAGE08 overlay
     s8 = ps.ovl('STAGE08'); s8_end = s8.b + len(s8.d)
     used = {n: sorted(set(t for a, t, m in ps1_absrefs(ps, img) if s8_end <= t < PS1_TASK_BASE and not (n != 'EXE' and img.b <= t < img.b + len(img.d))))
             for n, img in ps1_images(ps, 'EXE,STAGE08')}
     check('No fixed EXE/STAGE08 refs in 0x801E1394-0x801FBFFF (free RAM after STAGE08)', s8_end == 0x801E1394 and not any(used.values()), str({k: [hex(x) for x in v] for k, v in used.items() if v} or ''))
     check('Task scheduler init at 0x800F82CC uses 0x801FC000 slots / 0x801FEC00 stacks', fp(w(0x800F82E0)) == '942999a63c6b' and fp(w(0x800F82E4) & 0xFFFF) == '24826c5b7156' and fp(w(0x800F82DC) & 0xFFFF) == '8d42b9fe493d')
-    # ---- session 5, M1: file table, overlay loader, placement terminator, M1 overlay builder
+    # ---- M1: file table, overlay loader, placement terminator, M1 overlay builder
     fte = lambda i: tuple(w(PS1_FILETAB + 12 * i + 4 * k) for k in range(3))
     check('PS1 file table 0x80136F7C: #17 = STAGE08 (LBA 126370, 0x9394, type 0xE), #18 = STAGE09', fte(17) == (126370, 0x9394, 0xE) and fte(18) == (126389, 0x3B44, 0xF))
     check('Overlay loader 0x800FC648: dest 0x801D8000 (lui @0x800FC650, ori @0x800FC688), file = 0x8013761C[n], STAGE08 n=9 -> #17',
@@ -5575,7 +5682,7 @@ def verify():
     check('Stage start clears checkpoint 0x801C3371 at 0x80100B14; stage 8 checkpoint 5 = player (0x1180, 0x400), camera locked (0x10E0, 0x400), same record on the Saturn',
           fp([w(QS_CP_ADDR), w(QS_CP_ADDR + 4)]) == QS_CP_ORIG_FP and fp(w(0x8010183C)) == '5b79bd07d930' and
           bytes(ps.exe.d[r5 - ps.exe.b:r5 - ps.exe.b + 0x18]) == bytes(sat.p2[0x27D4C0 + 5 * 0x18 - sat.BASE2:0x27D4C0 + 6 * 0x18 - sat.BASE2])[:8] + struct.pack('<8H', 0x1180, 0x400, 0x10E0, 0x400, 0x10E0, 0x10E0, 0x400, 0x400))
-    # ---- session 5, M2 prep: Wood Man structure, pools, PS1 stand-in object, global map
+    # ---- M2 prep: Wood Man structure, pools, PS1 stand-in object, global map
     check('Wood Man jump tables: phase 0x2933DC (4), intro 0x2933EC (5), fight 0x293400 (8), defeat 0x293440',
           [sat.u32(0x2933DC + 4 * i) for i in range(4)] == [0x258F14, 0x258F70, 0x2592D6, 0x2598A2]
           and sat.u32(0x2933EC) == 0x258F84 and sat.u32(0x293400) == 0x2593A6 and sat.u32(0x293420) == 0x259476
@@ -5597,7 +5704,7 @@ def verify():
           set(['58d0808c2137', '69cf2d37a32c', '7a8f278b6614', 'b12134bbecc8']) <= {fp(r) for r in p8}
           and not any(t == 0x22 and x in (0x10F0, 0x1210) for t, f, x, y in q8)
           and fp([r for r in q8 if r[0] == 0x30 and r[1] & 0xFF == 4]) == 'a593f28148f2')
-    # ---- session 5: Search Man's stage map (PS1 loads past the first gate)
+    # ---- Search Man's stage map (PS1 loads past the first gate)
     g_s, g_p = pac_chunks('sat', 'STAGE08')[0], pac_chunks('ps1', 'STAGE08')[0]
     cells = {(4, 0x11): 0x3E, (4, 0x12): 0x3F, (4, 0x13): 0x40, (3, 0x12): 0x21, (3, 0x13): 0x43}
     check('STAGE08 chunk 0 (32x32 screen grid): Wood Man hallway/arena cells present on Saturn, zero on PS1, rest identical',
@@ -5615,7 +5722,7 @@ def verify():
     check('STAGE08 screens (chunk 3, 512 B each): Saturn 68, PS1 62 (0x3E-0x43 cut); blocks (chunk 4, 4 B each) 1921 vs 1818; '
           'PS1 = Saturn with blocks renumbered, except edited screens 0x16 (first-gate screen) and 0x1A',
           len(S3) == 68 and len(P3) == 62 and len(c4s) == 1921 * 4 and len(c4p) == 1818 * 4 and badscr == [0x16, 0x1A])
-    # ---- session 5: block / graphics formats
+    # ---- block / graphics formats
     s8b = {c: pac_chunks('sat', 'STAGE08B')[c] for c in (4, 0x102, 0x103)}; p8b = {c: pac_chunks('ps1', 'STAGE08B')[c] for c in (4, 0x102, 0x103)}
     check('Block defs (chunk 4) Saturn->PS1 rule exact on STAGE08B and STAGE01 (tile = hi>>2, attr & ~0x40)',
           blocks_sat_to_ps1(s8b[4]) == p8b[4] and blocks_sat_to_ps1(pac_chunks('sat', 'STAGE01')[4]) == pac_chunks('ps1', 'STAGE01')[4])
@@ -5636,7 +5743,7 @@ def verify():
           all(g9s[r * 32 + c] == v and g9p[r * 32 + c] == 0 for (r, c), v in cut9.items()) and sum(1 for i in range(1024) if g9s[i] != g9p[i]) == 6
           and len(pac_chunks('sat', 'STAGE09')[3]) == 29 * 512 and len(pac_chunks('ps1', 'STAGE09')[3]) == 24 * 512
           and len(pac_chunks('sat', 'STAGE09')[4]) == 1392 * 4 and len(pac_chunks('ps1', 'STAGE09')[4]) == 1244 * 4)
-    # ---- session 6: stage PAC loading
+    # ---- stage PAC loading
     ex = ps.exe
     pdest = lambda t: ex.u32(PS1_PAC_DEST + 4 * t)
     check('Stage PAC load: 0x8016D294 = dest table 0x80137850, then streamer 0x800FB9C0(file 0x8013794C[stage])',
@@ -5654,7 +5761,7 @@ def verify():
     check('pac_build rebuilds PS1 STAGE08.PAC byte-exact; merging grid chunks 0-2 gives the same RAM and frees one sector',
           pac_build(e08) == open(os.path.join(PS1_FILES, 'STDATA', 'STAGE08.PAC'), 'rb').read()
           and pac_ram(m08, pdest) == pac_ram(e08, pdest) and len(pac_build(m08)) == len(pac_build(e08)) - 0x800)
-    # ---- session 7: M2a map restoration
+    # ---- M2a map restoration
     rnew, rinfo = restore_stage08_map()
     s08 = pac_chunks('sat', 'STAGE08')
     def _cell(ch, scr, sat_side):
@@ -5691,7 +5798,7 @@ def verify():
           rec_tuple(m2a_standin()) not in [tuple(struct.unpack('>2H', r0a[i:i + 4]) + struct.unpack('<2H', r0a[i + 4:i + 8])) for i in range(0, placement_terminator(r0a), 8)]
           and all(struct.unpack('>2H', r[:4]) + struct.unpack('<2H', r[4:]) in placements('sat', 'STAGE08') for r in m2a_records())
           and placement_terminator(r0a) == placement_terminator(c0a) + 4 * 8)
-    # ---- session 7b: gate sprite / Wood Man sprite data cut with the arena
+    # ---- gate sprite / Wood Man sprite data cut with the arena
     sp, si = restore_stage08_sprites()
     vv = [ex.u32(0x801292C4 + 8 * k) & 0xFFFF for k in range(7)]
     check('Shared gate code: variants 5/0x86/0x91/0x17/0x98/0x19/0x9B (incl. Wood Man\'s 0x19/0x9B) use sprite set 0xA8 (chunk-7 RAM 0x80170498); PS1 STAGE08 chunk 7 stops at 0x9E entries',
@@ -5703,7 +5810,7 @@ def verify():
     check('STAGE08 palettes 0x30-0x33 are all zero on PS1 (Saturn: Wood Man/leaf colours; chunk 8 gives set 0xAB palette 0x30); restored from the Saturn',
           si['palettes'] == [0x30, 0x31, 0x32, 0x33] and pac_chunks('sat', 'STAGE08')[8][0xAB] == 0x30
           and [k for k in range(128) if struct.unpack('>16H', pac_chunks('sat', 'STAGE08')[9][32 * k:32 * k + 32]) != tuple(v & 0x7FFF for v in struct.unpack('<16H', pac_chunks('ps1', 'STAGE08')[9][32 * k:32 * k + 32]))] == [0x30, 0x31, 0x32, 0x33])
-    # ---- session 7c: M2 Wood Man port
+    # ---- M2 Wood Man port
     ib = 0x801393B4
     check('PS1 object-init table 0x801393B4 (EXE 0x80109080, indexed by type +6) keeps the Saturn records for 0x62-0x64 (sprite sets 0xAA/0xAB/0xAB)',
           fp(ex.u32(0x80109084)) == 'a13abf3fe2dc' and fp(ex.u32(0x80109088)) == '8ccac2a18190'
@@ -5756,7 +5863,7 @@ def verify():
           all(sat_bank_song(n, 0) == j for n in ('CUT1.PAC', 'BS08B.PAC', 'BS01B.PAC', 'DUO00.PAC')) and len(j) == 3048
           and all(lay[0][5] in raw8 for lay in sat_ton_voices('WOOD1.PAC')[1:])
           and all(sat_ton_voices('WOOD1.PAC')[0][k][5] not in raw8 for k in (0, 1)))
-    # ---- session 7: PS1 sound banks, PBGM46, music hook
+    # ---- PS1 sound banks, PBGM46, music hook
     rt_ok = True
     for n in range(0x46):
         pth = os.path.join(PS1_FILES, 'SOUND', f'PBGM{n:02X}.PAC'); ch = unpac(pth); cc = {t: b for t, o, b in ch}
@@ -5789,7 +5896,7 @@ def verify():
           and v46['vags'][:2] == v29['vags'][:2] and i46['reused'] == [(3, 17791)] and i46['muted'] == [(0, 10239)] and c46[4][0x20 + 16 * 16] == 3
           and all(abs(rate(v46['tones'][16][t], up) - 44100 * 2 ** ((k - b) / 12)) < 1 for t, k, b, up in ((0, 1, 24, 1), (1, 2, 27, 1), (2, 3, 27, 2))))
     gmv = load_global_map()
-    # ---- session 8: Sega SEQ -> Sony SEQ, TON -> VAB (WOOD2 -> PBGM47)
+    # ---- Sega SEQ -> Sony SEQ, TON -> VAB (WOOD2 -> PBGM47)
     ok_len = bad_len = 0
     for nm in sorted(os.listdir(SAT_FILES)):
         if not nm.endswith('.PAC'): continue
@@ -5812,7 +5919,7 @@ def verify():
           and r47['max_cents'] < 1 and sorted(i47['muted']) == [(0, 8), (0, 9), (0, 12)]
           and sorted(r47['ids']) == [0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5C, 0x5D, 0x5F, 0x141]
           and all(e[0] == 0xC8 and e[1] == 0x10 for e in r47['ids'].values()), f"{r47['size']} bytes, max {r47['max_cents']:.2f} cents")
-    # ---- session 11: Cut Man's banks (PBGM48 / PBGM49), SPU pitch cap
+    # ---- Cut Man's banks (PBGM48 / PBGM49), SPU pitch cap
     pac48, i48 = build_boss_intro_bank('CUT1.PAC')
     c48 = {t: b for t, o, b in unpac_bytes(pac48)}; v48 = vab_split(c48[4], c48[0x201])
     rate48 = lambda t, up: 44100 * 2 ** ((t[6] - t[4] + t[5] / 128) / 12) / up
@@ -5830,7 +5937,7 @@ def verify():
           and all(e[0] == 0xCA and e[1] == 0x10 for e in r49['ids'].values()), f"{r49['size']} bytes, max {r49['max_cents']:.2f} cents")
     check('SPU pitch cap (4x 44.1 kHz; measured in Mednafen: CUT2 voices 3/4 at 4.5x sounded -200 cents): no song note of PBGM47/PBGM49 asks for more (voices stored at half rate where needed)',
           r47['max_pitch'] < 4 and r49['max_pitch'] < 4, f"max {r47['max_pitch']:.2f}x / {r49['max_pitch']:.2f}x")
-    # ---- session 8: emulator calibration tooling (the measurements themselves need Mednafen + BIOS: `calibrate`)
+    # ---- emulator calibration tooling (the measurements themselves need Mednafen + BIOS: `calibrate`)
     cs, csch = calibration_song('WOOD2.PAC'); cd = sega_seq_decode(cs)
     ch47 = {t: b for t, o, b in unpac_bytes(p47)}; sq = sony_seq_parse(ch47[1])
     v47 = vab_split(ch47[4], ch47[0x201])
@@ -5843,14 +5950,14 @@ def verify():
     check('Global map (globals_map.txt) reproduces independently verified variables',
           bool(gmv) and gmv.get(0x0602DA86) == 0x801C336E and gmv.get(0x0602DAC1) == 0x801B29A5 and gmv.get(0x0602FF06) == 0x801D292A
           and gmv.get(0x0602DAB1) == 0x801B2995, '' if gmv else 'globals_map.txt missing next to mm8tool.py')
-    # ---- session 10: track-1 extension (extend_track1)
+    # ---- track-1 extension (extend_track1)
     exe_w = [ps.exe.u32(a) for a in range(ps.exe.b, ps.exe.e - 3, 4)]
     e138 = struct.unpack('<3I', ps.exe.d[PS1_FILETAB + 12 * PS1_END1_FILE - ps.exe.b:][:12])
     check('END1.DA (CD audio) is found only through file-table entry 138: two `ori a0,zero,0x8A` + jal 0x800FC238 at 0x800FC78C/0x800FC7A8, LBA -> CdIntToPos 0x800CF31C; entry 138 = (142246, size, 0)',
           sum(fp(x) == '7cd58bac9f26' for x in exe_w) == 2 and fp(w(0x800FC78C)) == '7cd58bac9f26' and fp(w(0x800FC790)) == '54b3922b605c' and fp(w(0x800FC7A8)) == '7cd58bac9f26'
           and fp(w(0x800FC7D0)) == '54b3922b605c' and fp(w(0x800FC7DC)) == 'c6fdc10ad3ba' and e138[0] == 142246 and e138[2] == 0
           and not any(PS1_FILETAB + 12 * PS1_END1_FILE <= t < PS1_FILETAB + 12 * 139 for n_, img_ in ps1_images(ps) for _, t, _ in ps1_absrefs(ps, img_)))
-    # ---- session 10: M4 Cut Man (STAGE09)
+    # ---- M4 Cut Man (STAGE09)
     s09, p09 = pac_chunks('sat', 'STAGE09'), pac_chunks('ps1', 'STAGE09')
     r09, i09 = restore_stage_map('STAGE09', M4_GRID_CELLS, M4_NEW_SCREENS, M4_REPLACED_SCREENS, M4_TILE_FIRST)
     def _cell9(ch, scr, sat_side):
@@ -5936,7 +6043,7 @@ def verify():
     n9 = [len(discover(sc9, [e], {k: CUT_CODE_TABLES[k] for k in tk}, None)[0]) for _, e, _, tk, _ in CUT_SPEC['handlers']]
     check('SH-2 lifter: Cut Man (1825 instructions, variants 0-2, 7 jump tables) and P5 0x34 (126) lift to C; all 36 engine calls mapped (+ the masked-brightness helper)',
           n9 == [1825, 126] and len(cport.used_helpers) == 36 and cport.used_custom == {0x06010B50} and 'UNTRANSLATED' not in csrc9)
-    # ---- session 12: pre-release checks
+    # ---- pre-release checks
     exe = open(os.path.join(PS1_FILES, 'SLUS_004.53'), 'rb').read()
     ew = lambda a: struct.unpack_from('<I', exe, exe_file_off(a))[0]
     jal_to = lambda t: [0x800C0000 + i - 0x800 for i in range(0x800, len(exe) - 3, 4) if struct.unpack_from('<I', exe, i)[0] == 0x0C000000 | ((t >> 2) & 0x3FFFFFF)]
@@ -5948,7 +6055,7 @@ def verify():
     check('Lifted code stack: C frames <= 272 bytes; SH-2 stack (sum of every entry\'s deepest r15 offset) fits u32 stk[48] (192 bytes); thread 0 has 10,944 bytes below 0x801FEC00',
           max(fr.values()) <= 272 and all(v['sum_bound'] <= 192 and v['unknown_r15'] == 0 for v in sh.values()),
           ', '.join(f'{k} {v}' for k, v in fr.items()) + '; SH-2 ' + ', '.join(f'{k} {v["sum_bound"]}' for k, v in sh.items()))
-    # ---- session 14: Saturn Bonus Mode survey
+    # ---- Saturn Bonus Mode survey
     st, vt = sat_bonus_tables()
     pbgm = set(os.listdir(os.path.join(PS1_FILES, 'SOUND')))
     check('Bonus sound test (Saturn 0x27CDAC): 32 music numbers, Title = 0x10 ... Cutman 0x49, Woodman 0x47; every n < 0x46 has a PS1 PBGM file, 0x47/0x49 = our PBGM47/49',
@@ -5967,7 +6074,7 @@ def verify():
     let = unpac(os.path.join(SAT_FILES, 'LETTER.PAC'))
     check('Bonus postcards: LETTER.PAC = chunk 0x11 (30 palettes x 256 colours) + chunk 0x100 (0x50000 bytes of 16x16 8-bpp characters)',
           [(t, len(b)) for t, o, b in let] == [(0x11, 30 * 0x200), (0x100, 0x50000)])
-    # ---- session 15: M7a title menu (BONUS MODE as the 4th item)
+    # ---- M7a title menu (BONUS MODE as the 4th item)
     E = ps.exe
     t_sub = [E.u32(0x80137930 + 4 * i) for i in range(7)]
     t_code = all(fp(E.u32(a)) == ofp for a, ofp, new in M7_TITLE_CODE)
@@ -5995,7 +6102,7 @@ def verify():
     check('M7a: DEMO.BIN + title hook fits its 9-sector slot, bonus overlay at M7_BONUS_BASE, both R3000-clean; virtual entry inside DEMO.BIN',
           len(d7) <= PS1_DEMO_SLOT * 2048 and i7['title_hook'] > Ps1.OVL_BASE + 0x41C8 and M7B_BONUS_MAGIC in b7
           and Ps1.OVL_BASE <= PS1_FILETAB + 12 * i7['vf'] < Ps1.OVL_BASE + len(d7), f"DEMO {len(d7):#x}, bonus {len(b7):#x}")
-    # ---- M7b (session 16): bonus menu lifted from the Saturn
+    # ---- M7b: bonus menu lifted from the Saturn
     fm = dict(load_helper_map()); fm.update(M7B_FRONTEND_HELPERS); fm[M7B_P4_LOOP[0]] = M7B_P4_LOOP[1]; fm[M7B_WAIT[0]] = M7B_WAIT[1]
     sc = [t for k, a, t in sat_events(sat, 0x279978, 0x2799C6) if k == 'call' and t]
     pc = ps.calls(ps.exe, 0x8011F0A8, 0x8011F184)
@@ -6041,12 +6148,12 @@ def verify():
     check('M7g: Saturn title (0x20989A) sets 0x0602DABC when BONUS MODE (cursor 3) is confirmed with Start + L + R held (& 0x888); PS1 confirm-sound call 0x800FEFD4 is the hook site',
           fp(sat.u16(0x209920)) == '8e4e975f9024' and sat.u32(0x209948) == 0x0602DA98 and fp(E.u32(0x800FEFD4)) == 'f2cd1272b0f6' and fp(E.u32(0x800FEFD8)) == 'f1bff64ab7c7')
     tsl = i7['title_skip_load'] - Ps1.OVL_BASE
-    check('Bonus exit (session 16): the Saturn reruns its title setup after the bonus loop (0x2099CC: sub-state 0x0602DA5B = 0); PS1 sub-state 0 loads DEMO.BIN with jal 0x800FC648 (a0 = 0) at 0x800FEC18, which title_skip_load restores; loader bookkeeping 0x801C738C / 0x801C73D0',
+    check('Bonus exit: the Saturn reruns its title setup after the bonus loop (0x2099CC: sub-state 0x0602DA5B = 0); PS1 sub-state 0 loads DEMO.BIN with jal 0x800FC648 (a0 = 0) at 0x800FEC18, which title_skip_load restores; loader bookkeeping 0x801C738C / 0x801C73D0',
           sat.u32(0x209A20) == 0x0602DA5B and fp(sat.u16(0x2099D0)) == 'e095c84c6e05' and fp(sat.u16(0x2099D2)) == 'de3daca6a937'
           and fp(E.u32(0x800FEC18)) == '846a2d156d02' and fp(E.u32(0x800FEC1C)) == '5041936c9c92'
           and fp(E.u32(0x800FC674)) == '9ef0af4c7f3f' and fp(E.u32(0x800FC678)) == 'f9c7aba2bdec' and fp(E.u32(0x800FC680)) == 'b20ac1d63674'
           and fp(struct.unpack('<2I', d7[tsl + 36:tsl + 44])) == 'cc7223e14825', f"title_skip_load {i7['title_skip_load']:#x}")
-    # M7c (session 16): OFFICIAL ILLUSTRATIONS
+    # M7c: OFFICIAL ILLUSTRATIONS
     sl = {t: b for t, o, b in unpac(os.path.join(SAT_FILES, 'SLABO.PAC'))}
     fo = struct.unpack_from('>I', sl[6], 4 * 0xA3)[0]; off, cnt = struct.unpack_from('>HH', sl[5], fo)
     pcs = [struct.unpack_from('>I', sl[5], fo + off + 4 * k)[0] for k in range(cnt)]
@@ -6078,7 +6185,7 @@ def verify():
     check('M7c read stall: the loader ends a read with CdControlB(CdlPause) at 0x800FC1A4 (jal 0x800CF14C, in the ready callback); CdControl 0x800CEEE8 takes the same arguments (both libcd prologues: com in s4, param s1, result s2)',
           fp(E.u32(0x800FC1A4)) == '1292dd32ff74' and fp(E.u32(0x800FC19C)) == 'b5899e18e756' and fp(E.u32(0x800FC1AC)) == 'dd325f5c9d40'
           and all(fp([E.u32(f + o) for o in (4, 8, 0x10, 0x18)]) == 'f6b4aa2a3020' for f in (0x800CEEE8, 0x800CF14C)))
-    # ---- M7d (session 22): BOSS CHARACTER POSTCARD
+    # ---- M7d: BOSS CHARACTER POSTCARD
     check('M7d: Saturn postcard screen 0x27B1C0: A/C on NO. shows the number with sound 0x189 / 0x18A (RNG 0x06014166), B or EXIT leaves (sound 0x38, +7 = 1), L/R (0x88) change number and card; box cursor 0x0602DABD, card 0x0602DABE, number 0x0602DABF',
           fp(sat.u16(0x27B27C)) == '99a0b871c904' and fp(sat.u16(0x27B27E)) == '04d19fde0a08' and sat.u32(0x27B29C) == 0x06014166 and sat.u16(0x27B280) == 0x88
           and sat.u32(0x27B298) == 0x0602DA98 and fp(sat.u16(0x27B1F4)) == '205e5aea5fb2' and fp(sat.u16(0x27B226)) == 'cee8a6a9686f')
@@ -6113,7 +6220,7 @@ def verify():
     pb30 = {t: b for t, o, b in unpac(os.path.join(PS1_FILES, 'SOUND', 'PBGM30.PAC'))}[5]
     check('M7d: postcard sounds 0x188 (entry), 0x189 / 0x18A (A/C) have entries in PS1 PBGM30 (music 0x30, bank 0xB1)',
           all(pb30[4 * i] == 0xB1 for i in (0x188, 0x189, 0x18A)))
-    # ---- M7e (session 23): SOUND TEST / VOICE TEST (02 §M7b "M7e")
+    # ---- M7e: SOUND TEST / VOICE TEST (02 §M7b "M7e")
     check('M7e: Saturn test screen 0x27B0F8 tail-jumps to the player 0x209088 (bounds 31 / 99); the player reads music numbers 0x27CDAC and voice entries 0x27CDCC (bound 0xA6) and calls play_bgm 0x0600C610 / bank sound 0x0600C85E',
           sat.u32(0x27B284) == 0x209088 and fp(sat.u16(0x27B1AC)) == '3ae480feceb0' and fp(sat.u16(0x27B1AE)) == 'b19576ae39d8' and sat.u32(0x209134) == 0x27CDAC
           and sat.u32(0x20913C) == 0x27CDCC and sat.u16(0x20911A) == 0xA6 and sat.u32(0x209138) == 0x0600C610 and sat.u32(0x209140) == 0x0600C85E)
@@ -6129,7 +6236,7 @@ def verify():
     check('M7e: the bonus overlay starts above the music virtual entries 0x801E4658-0x801E4687 (play_bgm hook, one vf0 for every overlay) and carries their copy in its file',
           (M7E_MUSIC_VF - PS1_FILETAB) % 12 == 0 and M7_BONUS_BASE >= M7E_MUSIC_VF + 48 and 0 < i7['music_vf_off'] <= len(b7) - 48,
           f'base {M7_BONUS_BASE:#x}, entries at file offset {i7["music_vf_off"]:#x}')
-    # ---- M7f (session 23): stack bounds of the bonus code (02 §Stacks)
+    # ---- M7f: stack bounds of the bonus code (02 §Stacks)
     bfr, bsh = bonus_stack_usage()
     check('M7f: bonus code SH-2 stacks fit stk[96] (sum of the deepest offsets per handler <= 384 bytes, every r15 known); C frames all static',
           all(v['sum_bound'] <= 384 and v['unknown_r15'] == 0 for v in bsh.values()) and all(k == 'static' for n, k in bfr.values()),
@@ -6145,7 +6252,7 @@ def verify():
           _d < 4096, f'{_d} bytes; {len(_unres)} library jalr sites not followed')
     check('M7b: bonus overlay fits below 0x801F4000 with its SLABO virtual entry', M7_BONUS_BASE + len(b7) <= M7B_BONUS_LIMIT
           and (M7_BONUS_BASE + i7['slabo_vf_off'] - PS1_FILETAB) % 12 == 0, f"{len(b7):#x} bytes")
-    # ---- session 25: M8a catalogue (Saturn vs PS1; 02 §Saturn vs PS1 compared)
+    # ---- M8a catalogue (Saturn vs PS1; 02 §Saturn vs PS1 compared)
     dead = m8_inactive_types(); r5s = place_records(pac_chunks('sat', 'STAGE05')[0xA], 'sat'); r5p = place_records(pac_chunks('ps1', 'STAGE05')[0xA], 'ps1')
     check('M8a: STAGE05 P2 type 0x22 (sprite set 0x27): Saturn places 17, the PS1 keeps 5 records but its STAGE05 overlay entry is the stub (deletes the object at spawn)',
           sum(r[0] == 0x22 and r[2] < 2 for r in r5s) == 17 and sum(r[0] == 0x22 and r[2] < 2 for r in r5p) == 5 and 0x22 in dead[5]
@@ -6166,7 +6273,7 @@ def verify():
     check('M8a part 2: Saturn sequencer quick-start points 0x209FC2 / 0x209FE6 = mov r13,r0 (stage / checkpoint 0); stage-0 start records = the PS1\'s (cp0 at 0x27CF9C)',
           fp(sp2.p2[SAT_QS_STAGE - 0x200000:SAT_QS_STAGE - 0x1FFFFE]) == '91f63d952d62' and fp(sp2.p2[SAT_QS_CP - 0x200000:SAT_QS_CP - 0x1FFFFE]) == '91f63d952d62'
           and sat_start_record(0, 0) == 0x27CF9C and sat_start_record(5, 4) == 0x27D30C)
-    # ---- session 17: JP PS1 disc (only with a JP workspace: setup --jp; reference 02 §JP PS1 disc compared)
+    # ---- JP PS1 disc (only with a JP workspace: setup --jp; reference 02 §JP PS1 disc compared)
     if os.path.isdir(JP_FILES):
         jx = open(os.path.join(JP_FILES, 'SLPS_006.30'), 'rb').read()
         ju = lambda a: struct.unpack('<I', jx[0x800 + a - 0x800C0000:0x804 + a - 0x800C0000])[0]
@@ -6203,13 +6310,15 @@ def verify():
               chunk_diff('LABO.PAC') is not None and 0x102 in chunk_diff('LABO.PAC'))
     else:
         print('SKIP JP checks (no JP workspace: setup --jp)')
+    check('Release: audio tracks of both discs checked against their Redump md5s (per-track and whole-disc .bin; a different track gives a note, a missing track stops)',
+          _selftest_audio_check())
     hits = tool_game_words()
     check('Copyright guard: no word-sized literal in mm8tool.py equals a code/data word of either game (PS1 EXE + overlays, Saturn PRG/BIN; 03 §7)',
           not hits, ', '.join(f'line {ln}: {v:#x}' for ln, v in hits[:10]))
     print(f'\n{sum(res)}/{len(res)} checks passed')
     return all(res)
 
-# ----------------------------------------------------------------- pre-release checks (session 12)
+# ----------------------------------------------------------------- pre-release checks
 # Full disc. The Redump layout (the MM8 PS1/ folder): Track 1 MODE2/2352, Tracks 2-3 audio files that each start
 # with a 150-sector pregap (INDEX 00 00:00:00, INDEX 01 00:02:00). A patched (longer) track 1 next to the original
 # Track 2/3 files and the original .cue puts track 2's INDEX 01 at track-1 sectors + 150 = entry 138 (check_build).
@@ -6258,7 +6367,7 @@ def cd_track_position(wav_path, track_bin, windows=(2, 10, 20, 30), search_s=110
 
 def mdfn_ram(state_path):
     """PS1 main RAM (2 MB) from a Mednafen 1.29 save state (.mcN = gzip; record 'MainRAM.data8' + u32 size).
-    Mednafen powers on with zeroed RAM (session 12: untouched areas read 0)."""
+    Mednafen powers on with zeroed RAM (untouched areas read 0)."""
     import gzip
     r = gzip.decompress(open(state_path, 'rb').read())
     i = r.index(b'MainRAM.data8') + 13; assert struct.unpack_from('<I', r, i)[0] == 0x200000
@@ -6266,7 +6375,7 @@ def mdfn_ram(state_path):
 
 def mdfn_sat_ram(state_path):
     """Saturn work RAM from a Mednafen 1.29 save state: {0x00200000: Low WRAM, 0x06000000: High WRAM}, 1 MB each,
-    big-endian bytes (the state stores 16-bit words little-endian: records 'WorkRAML' / 'WorkRAMH' + u32 size; session 16)."""
+    big-endian bytes (the state stores 16-bit words little-endian: records 'WorkRAML' / 'WorkRAMH' + u32 size)."""
     import gzip
     r = gzip.decompress(open(state_path, 'rb').read()); out = {}
     for name, base in ((b'WorkRAML', 0x00200000), (b'WorkRAMH', 0x06000000)):
@@ -6347,9 +6456,18 @@ def bonus_stack_usage():
 
 def subprocess_run_nm(elf):
     """{function symbol: address} (types T/t) of a linked ELF (mipsel nm)."""
-    import subprocess
-    out = subprocess.run([CC.replace('gcc', 'nm'), elf], capture_output=True, text=True).stdout.split('\n')
-    return {p[2]: int(p[0], 16) for p in (l.split() for l in out) if len(p) == 3 and p[1] in 'Tt'}
+    d = open(elf, 'rb').read()
+    shoff, = struct.unpack_from('<I', d, 0x20); shentsize, shnum = struct.unpack_from('<2H', d, 0x2E)
+    sh = [struct.unpack_from('<10I', d, shoff + k * shentsize) for k in range(shnum)]
+    out = {}
+    for _, typ, _, _, off, size, link, _, _, ent in sh:
+        if typ != 2: continue
+        stro = sh[link][4]
+        for q in range(off, off + size, ent):
+            name, value, _, info, _, shndx = struct.unpack_from('<3I2BH', d, q)
+            if name and 0 < shndx < 0xFF00 and sh[shndx][2] & 4:        # defined in an executable section (nm T / t)
+                out[d[stro + name:d.index(b'\0', stro + name)].decode()] = value
+    return out
 
 def static_stack_depth(images, entry, indirect=None, max_ins=8000):
     """M7f: static worst-case stack below `entry` (bytes): each function's frame (its first `addiu sp, sp, -N` in the first
@@ -6459,7 +6577,7 @@ def regression_compare(outdir):
     return rows
 
 
-# ---- session 17: US vs JP PS1 disc (region-select survey; reference 02 §JP PS1 disc compared)
+# ---- US vs JP PS1 disc (region-select survey; reference 02 §JP PS1 disc compared)
 JP_FILETAB = 0x80136F84          # JP EXE SLPS_006.30 file table: 141 x (LBA, size, type); US #k = JP #k (k <= 7), US #k = JP #k+1 after
 JP_FT_N = 141
 JP_FT = {'ROCKBC.STR': 8, 'DEMO.BIN': 9, 'BNW.DA': 139, 'STAFROLL.DA': 140}
@@ -6549,7 +6667,7 @@ def region_report(rep):
         tot += b['jp_sectors']; print(f"{n}: VAGs {b['vags']}, differing {b['diff_vags']} (programs {b['programs']}), JP {b['jp_bytes']} bytes")
     print(f"differing sound files: {len(rep['banks'])}, {tot} sectors as JP files")
 
-# ----------------------------------------------------------------- M8a: US Saturn vs US PS1 catalogue (Phase 3, session 25)
+# ----------------------------------------------------------------- M8a: US Saturn vs US PS1 catalogue (Phase 3)
 # Every shared PAC compared chunk by chunk after the format converters, placement lists record by record, sound banks by
 # their sound-ID tables. Graphics chunks with no known PS1 layout (0x10, 0x11, 0x15, PLAYER 1/3) are compared as the
 # multiset of 8-pixel rows (4 bytes; PS1 nibble-swapped): equal multisets = the same pixels re-laid out.
@@ -6665,7 +6783,7 @@ def m8_report():
         if n is None: print(f'{f} (bank {bank:#x}): no PS1 bank'); continue
         if so or po: print(f'{f} (bank {bank:#x}, PBGM{n:02X}): Saturn-only IDs {[hex(x) for x in so]}, PS1-only {[hex(x) for x in po]}')
 
-# ---- M8a part 2 (session 25): side-by-side test starts on both systems (scratch images and states only, never a release)
+# ---- M8a part 2: side-by-side test starts on both systems (scratch images and states only, never a release)
 # Saturn sequencer 0x209FA4 (phase byte 0x0602DA84; = PS1 0x80100A34): phase 0 stores stage 0 through `mov r13,r0`
 # (r13 = 0) at 0x209FC2 and, with the stage-load mode, checkpoint 0 through the same instruction at 0x209FE6 -> a
 # one-instruction quick start each (`mov #n,r0`). Saturn top mode 0x0602DA5A (table 0x27DD0C: 0 title/new game 0x209F28,
@@ -6704,7 +6822,7 @@ def mdfn_state_poke(src, dst, pokes):
     """Copy a Mednafen 1.29 save state with RAM bytes changed ({addr: bytes}): PS1 0x80000000-0x801FFFFF (MainRAM),
     Saturn 0x06000000-0x060FFFFF (WorkRAMH) / 0x00200000-0x002FFFFF (WorkRAML), big-endian addresses (stored as LE
     words). Used for the Saturn stage select: a state during the stage load after Game Start with 0x0602DA84 = 1 (phase),
-    0x0602DA5A = 2 (sequencer), 0x0602DA5B = 0 opens the stage select (session 25)."""
+    0x0602DA5A = 2 (sequencer), 0x0602DA5B = 0 opens the stage select."""
     import gzip
     r = bytearray(gzip.decompress(open(src, 'rb').read()))
     for a, v in pokes.items():
@@ -6715,7 +6833,255 @@ def mdfn_state_poke(src, dst, pokes):
     open(dst, 'wb').write(gzip.compress(bytes(r)))
 
 # ----------------------------------------------------------------- CLI
+
+# ----------------------------------------------------------------- release builder (M6, v0.2: Phases 1 and 2)
+# The user's discs are checked against the Redump dumps, every track of both discs: each Track 1 (RELEASE_IN_MD5) and
+# the audio tracks (RELEASE_AUDIO_MD5; each counted from its INDEX 00, as Redump's per-track files). Users give the
+# complete disc: a missing track stops the builder. A Track 1 that differs stops it; an audio track that differs only
+# gives a note, because most rippers don't correct the drive's read offset (the audio is shifted by a few samples,
+# inaudible, but the md5 differs); the PS1 audio tracks are copied into the output as the user gave them. The md5
+# of the image the tested toolchain produces is RELEASE_OUT_MD5; another compiler build may give a different (still valid) image.
+RELEASE_VERSION = '0.2'
+RELEASE_IN_MD5 = {'ps1': '4e9e6dcf27ea0e15c5f4d1f93c800378', 'sat': 'a4d575cd681b7d7c88b45d639ed7ffb7'}
+RELEASE_AUDIO_MD5 = {'ps1': {2: 'a75dcbb5c831a966c47563e7ea4150c9', 3: '2d7b5e8e94a91bf5423b2356f6a34863'},
+                     'sat': {2: 'a2201327867523e4e31de62c445e2996'}}
+RELEASE_OUT_MD5 = 'b3b27b25a65dd1d746fbd5cb02db01aa'
+RELEASE_NAME = 'Mega Man 8 - Complete'
+_RAW_SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
+
+def cue_tracks(cue):
+    """Tracks of a .cue sheet as [{'no', 'mode', 'file', 'start', 'end', 'pregap'}] with byte offsets in their
+    file: a track's data starts at its INDEX 00 (Redump keeps a pregap with the track that follows it) and ends where
+    the next track in the same file starts. One file per track and one file for the whole disc both work."""
+    import shlex
+    base = os.path.dirname(os.path.abspath(cue)); S = 2352
+    msf = lambda t: (lambda m, s, f: (m * 60 + s) * 75 + f)(*map(int, t.split(':')))
+    tracks, cur_file = [], None
+    for ln in open(cue, encoding='utf-8', errors='replace').read().splitlines():
+        w = ln.strip()
+        if not w: continue
+        key = w.split()[0].upper()
+        if key == 'FILE':
+            name = shlex.split(w[4:].strip(), posix=True)[0] if '"' in w else w.split()[1]
+            cur_file = os.path.join(base, name)
+        elif key == 'TRACK':
+            p = w.split(); tracks.append({'no': int(p[1]), 'mode': p[2].upper(), 'file': cur_file, 'idx': {}})
+        elif key == 'INDEX' and tracks:
+            p = w.split(); tracks[-1]['idx'][int(p[1])] = msf(p[2]) * S
+    if not tracks: raise SystemExit(f'{cue}: no tracks found')
+    for k, t in enumerate(tracks):
+        t['start'] = t['idx'].get(0, t['idx'].get(1, 0))
+        t['pregap'] = t['idx'].get(1, t['start']) - t['start']
+        nxt = tracks[k + 1] if k + 1 < len(tracks) and tracks[k + 1]['file'] == t['file'] else None
+        t['end'] = nxt['idx'].get(0, nxt['idx'].get(1)) if nxt else (os.path.getsize(t['file']) if os.path.exists(t['file']) else None)
+    return tracks
+
+def _copy_range(src, start, end, dst, h=None):
+    with open(src, 'rb') as f, open(dst, 'wb') as o:
+        f.seek(start); left = end - start
+        while left > 0:
+            b = f.read(min(left, 1 << 22))
+            if not b: break
+            o.write(b); left -= len(b)
+            if h: h.update(b)
+
+def _md5_range(path, start, end):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        f.seek(start); left = end - start
+        while left > 0:
+            b = f.read(min(left, 1 << 22))
+            if not b: break
+            h.update(b); left -= len(b)
+    return h.hexdigest()
+
+def disc_kind(track):
+    """'ps1' / 'sat' / None from the first sectors of a raw track 1."""
+    with open(track['file'], 'rb') as f:
+        f.seek(track['start']); head = f.read(2352 * 17)
+    if head[:12] != _RAW_SYNC: return None
+    if head[16:32] == b'SEGA SEGASATURN ': return 'sat'
+    if head[16 * 2352 + 25:16 * 2352 + 30] == b'CD001' and b'PLAYSTATION' in head[16 * 2352 + 24:16 * 2352 + 64]: return 'ps1'
+    return None
+
+RELEASE_NOTES = []                     # audio tracks that differ from the Redump dump (find_disc), repeated at the end
+
+RELEASE_DISC_NAMES = {'ps1': 'Mega Man 8 (USA) for PlayStation (SLUS-00453)', 'sat': 'Mega Man 8 (USA) for Sega Saturn (T-1216H)'}
+
+def find_disc(kind, path):
+    """The US disc of `kind` ('ps1' / 'sat') in `path`: a .cue file, or a folder holding its .cue and .bin files
+    (searched with subfolders). Returns (cue, tracks); every problem ends with a message for the user."""
+    other = {'ps1': 'sat', 'sat': 'ps1'}[kind]; label = {'ps1': 'PlayStation', 'sat': 'Saturn'}
+    if not os.path.exists(path):
+        raise SystemExit(f'Folder not found: {path}\n  Copy the folder holding the {label[kind]} disc (its .cue and .bin files) into '
+                         f'"{os.path.dirname(path) or "."}" and rename it to "{os.path.basename(path)}".')
+    if os.path.isdir(path):
+        cues = [os.path.join(r, f) for r, _, fs in sorted(os.walk(path)) for f in sorted(fs) if f.lower().endswith('.cue')]
+    elif path.lower().endswith('.cue'): cues = [path]
+    else: raise SystemExit(f"{path}: give the disc's .cue file (or a folder holding it), not the .bin")
+    if not cues:
+        raise SystemExit(f'No .cue file in {path}\n  Put the {label[kind]} disc there as BIN/CUE (the .cue together with its .bin files).')
+    notes = []
+    for c in cues:
+        try: tr = cue_tracks(c)
+        except SystemExit as e: notes.append(f'  {c}: {e}'); continue
+        if not os.path.exists(tr[0]['file']):
+            notes.append(f'  {c}: its Track 1 file "{os.path.basename(tr[0]["file"])}" is not next to it'); continue
+        k = disc_kind(tr[0])
+        if k is None: notes.append(f'  {c}: not a PlayStation or Saturn disc image (raw BIN/CUE needed)'); continue
+        if k == other:
+            notes.append(f'  {c}: this is a {label[other]} disc; it belongs in the "{other}" folder'); continue
+        print(f'  checking {os.path.basename(c)} ...', flush=True)
+        m = _md5_range(tr[0]['file'], tr[0]['start'], tr[0]['end'])
+        if m == RELEASE_IN_MD5[kind]:
+            notes = check_audio_tracks(c, tr, RELEASE_AUDIO_MD5[kind])
+            print(f'  found {RELEASE_DISC_NAMES[kind]} (Track 1 md5 OK' + (', audio tracks OK)' if not notes else ')'))
+            for n in notes:
+                print(f'  note: {n}'); RELEASE_NOTES.append(f'{RELEASE_DISC_NAMES[kind]}: {n}')
+            return c, tr
+        notes.append(f'  {c}: Track 1 md5 is {m}, expected {RELEASE_IN_MD5[kind]}: a different version or region, '
+                     'or a modified/bad dump')
+    raise SystemExit('\n'.join([f'\nCould not find {RELEASE_DISC_NAMES[kind]} in {path}:'] + notes +
+                                ['  The builder needs a Redump-style BIN/CUE of the US disc (see the instructions).']))
+
+def check_audio_tracks(cue, tr, expect):
+    """Check a disc's audio tracks against the Redump tracks (`expect` = {track number: md5}, from RELEASE_AUDIO_MD5).
+    A missing or extra track stops the builder (it needs the complete disc); a track whose md5 differs returns a note
+    (usually a rip without read-offset correction: the same audio a few samples shifted). Returns the notes."""
+    nos = [t['no'] for t in tr[1:]]; stop, notes = [], []
+    if sorted(nos) != sorted(expect): stop.append(f'  the disc has tracks {[1] + nos}, expected {[1] + sorted(expect)}')
+    for t in tr[1:]:
+        if t['no'] not in expect: continue
+        if not os.path.exists(t['file']):
+            stop.append(f'  Track {t["no"]} ("{os.path.basename(t["file"])}") is missing'); continue
+        m = _md5_range(t['file'], t['start'], t['end'])
+        if m != expect[t['no']]: notes.append(f'Track {t["no"]} md5 is {m}, the Redump dump has {expect[t["no"]]}')
+    if stop:
+        raise SystemExit('\n'.join([f'\n{cue}: Track 1 is right, but the disc is not complete:'] + stop +
+                                    ['  The builder needs the complete disc: the .cue together with every track\'s .bin '
+                                     '(one .bin per track, or one .bin for the whole disc).']))
+    return notes
+
+def _selftest_audio_check():
+    """check_audio_tracks on small made-up discs: one .bin per track and one whole-disc .bin pass with no note; a
+    changed audio byte gives a note (no stop); a missing file and a missing track stop."""
+    import tempfile, shutil
+    d = tempfile.mkdtemp(prefix='mm8aud_'); S = 2352
+    try:
+        data = {n: bytes([n]) * (S * (150 + 4 * n)) for n in (1, 2, 3)}
+        exp = {n: hashlib.md5(data[n]).hexdigest() for n in (2, 3)}
+        for n in data: open(os.path.join(d, f't{n}.bin'), 'wb').write(data[n])
+        open(os.path.join(d, 'all.bin'), 'wb').write(data[1] + data[2] + data[3])
+        tf = lambda b: '%02d:%02d:%02d' % (b // S // 75 // 60, b // S // 75 % 60, b // S % 75)
+        per = 'FILE "t1.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n' + ''.join(
+            f'FILE "t{n}.bin" BINARY\n  TRACK 0{n} AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\n' for n in (2, 3))
+        o2, o3 = len(data[1]), len(data[1]) + len(data[2])
+        whole = ('FILE "all.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n'
+                 f'  TRACK 02 AUDIO\n    INDEX 00 {tf(o2)}\n    INDEX 01 {tf(o2 + 150 * S)}\n'
+                 f'  TRACK 03 AUDIO\n    INDEX 00 {tf(o3)}\n    INDEX 01 {tf(o3 + 150 * S)}\n')
+        short = per.split('FILE "t3.bin"')[0]
+        def run(text, name):
+            c = os.path.join(d, name); open(c, 'w').write(text)
+            try: return 'note' if check_audio_tracks(c, cue_tracks(c), exp) else 'ok'
+            except SystemExit: return 'stop'
+        ok = run(per, 'per.cue') == 'ok' and run(whole, 'whole.cue') == 'ok' and run(short, 'short.cue') == 'stop'
+        b = bytearray(data[3]); b[-1] ^= 1; open(os.path.join(d, 't3.bin'), 'wb').write(b)
+        ok = ok and run(per, 'bad.cue') == 'note'
+        os.remove(os.path.join(d, 't3.bin'))
+        return ok and run(per, 'miss.cue') == 'stop'
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+def release_build(discs, out_dir, keep_work=False):
+    """The release build (no debug options): extracts the user's discs into $MM8_WORK, builds the patched PS1
+    Track 1, checks it (check_build) and writes a complete bin/cue (Track 1 new, Tracks 2-3 copied) into out_dir."""
+    import shutil, tempfile
+    pcue, ptr = discs['ps1']; scue, st = discs['sat']
+    for t in ptr[1:]:
+        if not os.path.exists(t['file']):
+            raise SystemExit(f'{pcue}: Track {t["no"]} ("{os.path.basename(t["file"])}") is missing; the PlayStation disc needs every track')
+    os.makedirs(out_dir, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix='mm8rel_', dir=WORK if os.path.isdir(WORK) else None)
+    try:
+        def track1(tr, name):              # Track 1 as its own file (a whole-disc .bin is cut at Track 2)
+            t = tr[0]
+            if t['start'] == 0 and t['end'] == os.path.getsize(t['file']): return t['file']
+            p = os.path.join(tmp, name); _copy_range(t['file'], t['start'], t['end'], p); return p
+        ps1_t1, sat_t1 = track1(ptr, 'ps1_track1.bin'), track1(st, 'sat_track1.bin')
+        print('[1/4] Reading the discs ...', flush=True)
+        for side, src in (('sat', sat_t1), ('ps1', ps1_t1)):
+            d = os.path.join(WORK, side); os.makedirs(d, exist_ok=True)
+            iso = os.path.join(d, 'track1.iso')
+            raw_to_iso(src, iso)
+            extract_iso(iso, os.path.join(d, 'files'))
+            pacroot = os.path.join(d, 'pac')
+            for root, _, fs in os.walk(os.path.join(d, 'files')):
+                for fn in fs:
+                    if fn.upper().endswith('.PAC'):
+                        od = os.path.join(pacroot, fn.split('.')[0]); os.makedirs(od, exist_ok=True)
+                        for t, o, b in unpac(os.path.join(root, fn)):
+                            with open(os.path.join(od, f'{t:03x}.bin'), 'wb') as fo: fo.write(b)
+            os.remove(iso)
+        _file.cache_clear()
+        print('[2/4] Porting the Saturn content and building the PlayStation image ...', flush=True)
+        t1_name = f'{RELEASE_NAME} (Track 1).bin'
+        out_t1 = os.path.join(out_dir, t1_name)
+        tempfile.tempdir = tmp             # the compiler's scratch folders go into tmp and are removed with it
+        with build_cache():
+            build_image(ps1_t1, out_t1)
+            print('[3/4] Checking the new image ...', flush=True)
+            check_build(ps1_t1, out_t1)
+        print('[4/4] Writing the other tracks and the .cue ...', flush=True)
+        lines = [f'FILE "{t1_name}" BINARY', f'  TRACK 01 {ptr[0]["mode"]}', '    INDEX 01 00:00:00']
+        tf = lambda b: '%02d:%02d:%02d' % (b // 2352 // 75 // 60, b // 2352 // 75 % 60, b // 2352 % 75)
+        for t in ptr[1:]:
+            name = f'{RELEASE_NAME} (Track {t["no"]}).bin'
+            _copy_range(t['file'], t['start'], t['end'], os.path.join(out_dir, name))
+            lines += [f'FILE "{name}" BINARY', f'  TRACK {t["no"]:02d} {t["mode"]}']
+            for i, b in sorted(t['idx'].items()): lines.append(f'    INDEX {i:02d} {tf(b - t["start"])}')
+        with open(os.path.join(out_dir, f'{RELEASE_NAME}.cue'), 'w', newline='\r\n') as f: f.write('\n'.join(lines) + '\n')
+        with open(out_t1, 'rb') as f:
+            h = hashlib.md5()
+            for b in iter(lambda: f.read(1 << 22), b''): h.update(b)
+        return h.hexdigest()
+    finally:
+        tempfile.tempdir = None
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not keep_work:
+            for side in ('sat', 'ps1'): shutil.rmtree(os.path.join(WORK, side), ignore_errors=True)
+
+def release_main(argv=None):
+    """Entry point of the release builder (also `mm8tool.py release`)."""
+    ap = argparse.ArgumentParser(prog='mm8tool.py release', description=f'{RELEASE_NAME} v{RELEASE_VERSION} builder')
+    dd = os.environ.get('MM8_DISCS', 'discs')
+    ap.add_argument('--ps1', default=os.path.join(dd, 'ps1'), help='US PlayStation disc: its .cue or a folder holding it (default: discs/ps1)')
+    ap.add_argument('--sat', default=os.path.join(dd, 'sat'), help='US Saturn disc: its .cue or a folder holding it (default: discs/sat)')
+    ap.add_argument('--out', default=os.environ.get('MM8_OUTPUT', 'output'), help='folder for the finished bin/cue (default: ./output)')
+    ap.add_argument('--keep-work', action='store_true', help='keep the extracted disc files in $MM8_WORK')
+    a = ap.parse_args(argv)
+    print(f'{RELEASE_NAME} v{RELEASE_VERSION} builder\n')
+    print('Looking for the discs ...', flush=True)
+    discs = {'ps1': find_disc('ps1', a.ps1), 'sat': find_disc('sat', a.sat)}
+    if os.path.isdir(os.path.join(WORK, 'sat')) or os.path.isdir(os.path.join(WORK, 'ps1')):
+        raise SystemExit(f'{WORK} already holds extracted discs; give MM8_WORK an empty folder')
+    os.makedirs(WORK, exist_ok=True)
+    md5 = release_build(discs, a.out, a.keep_work)
+    print(f'\nDone. Your image is in: {os.path.abspath(a.out)}')
+    print(f'  Open "{RELEASE_NAME}.cue" in your emulator (or burn the .cue).')
+    print(f'  Track 1 md5: {md5}' + ('  (matches the tested build)' if md5 == RELEASE_OUT_MD5 else
+          '\n  Note: this differs from the tested build (another compiler/library version made slightly different code). '
+          'The image passed its checks, but please mention this md5 if you report a problem.'))
+    if RELEASE_NOTES:
+        print('\n  Note: these audio tracks are not byte-identical to the Redump dump:')
+        for n in RELEASE_NOTES: print(f'    {n}')
+        print('  This usually means the ripping program did not correct the drive\'s read offset: the music is the same, '
+              'shifted by a fraction of a millisecond, and the build is fine. The PlayStation audio tracks were copied as '
+              'you gave them. For an exact match, dump the discs with redumper, DiscImageCreator or MPF.')
+
+
 def main():
+    if sys.argv[1:2] == ['release']:            # the release builder has its own options
+        release_main(sys.argv[2:]); return
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest='cmd', required=True)
     s = sp.add_parser('setup'); s.add_argument('--saturn'); s.add_argument('--ps1'); s.add_argument('--jp')
@@ -6745,9 +7111,12 @@ def main():
     s = sp.add_parser('regress'); s.add_argument('--orig', required=True); s.add_argument('--rel', required=True); s.add_argument('--out', required=True)
     s.add_argument('--configs', default=REGRESS_CONFIGS_TXT, help='stage[:checkpoint],... (hex or decimal)'); s.add_argument('--workers', type=int, default=2)
     sp.add_parser('m8-compare')
+    s = sp.add_parser('release'); s.add_argument('rest', nargs=argparse.REMAINDER)
     s = sp.add_parser('region-compare'); s.add_argument('--us', required=True); s.add_argument('--jp', required=True)
     s = sp.add_parser('regress-compare'); s.add_argument('dir')
     a = ap.parse_args()
+    if a.cmd == 'release':
+        release_main(a.rest); return
     if a.cmd == 'setup':
         for side, src in (('sat', a.saturn), ('ps1', a.ps1), ('jp', a.jp)):
             if not src: continue
