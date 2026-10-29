@@ -4,14 +4,17 @@ A fan project that turns **Mega Man 8 (USA, PlayStation, SLUS-00453)** into the 
 
 Roadmap:
 
-1. Restore Wood Man and Cut Man fights - 100%
-2. Restore "Bonus Mode" and all functionality within - 100%
-3. Use Saturn enemy count and placements - In Progress
-4. Use Saturn text color for Robot Master intro names
-5. Fix any grammatical issues with the dialogue
-6. Add Battle & Chase and Super Adventure Rockman Adverts that were present in the Japanese PSX version
-7. (Stretch Goal) Assess the need for a full re-translation
-8. (Stretch Goal) Add the ability to choose between Japanese and English audio, effectively creating an "Undub".
+1. Restore Wood Man and Cut Man fights - 100% Complete
+2. Restore "Bonus Mode" and all functionality within - 100% Complete
+3. Use Saturn enemy count and placements - ~10%
+4. Use Saturn text color for Robot Master intro names - Not Started
+5. Use Saturn's lives counter placement (under life bar) - Not Started
+6. Assess feasibility of porting Saturn's water effects - Not Started
+7. Assess how to bring over Saturn's Tengu Man stage music without removing the PS1's version - Not Started
+8. Fix any grammatical issues with the dialogue - Not Started
+9. Add the Battle & Chase and Super Adventure Rockman adverts that were present in the Japanese PSX version - Not Started
+10. (Stretch Goal) Assess the need for a full re-translation - Not Started
+11. (Stretch Goal) Add the ability to choose between Japanese and English audio, effectively creating an "Undub" - Not Started
 
 This repository holds only original work:
 
