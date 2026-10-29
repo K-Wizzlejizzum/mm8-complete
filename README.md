@@ -1,4 +1,4 @@
-# Mega Man 8 Complete
+# Mega Man 8 - Complete
 
 A fan project that turns **Mega Man 8 (USA, PlayStation, SLUS-00453)** into the most complete edition of the game.
 
