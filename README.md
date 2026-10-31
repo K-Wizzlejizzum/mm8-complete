@@ -6,8 +6,8 @@ Roadmap:
 
 1. Restore Wood Man and Cut Man fights - 100% Complete
 2. Restore "Bonus Mode" and all functionality within - 100% Complete
-3. Use Saturn enemy count and placements - ~10%
-4. Use Saturn text color for Robot Master intro names - Not Started
+3. Use Saturn enemy count and placements - 100% Complete
+4. Use Saturn text color for Robot Master intro names - 0%
 5. Use Saturn's lives counter placement (under life bar) - Not Started
 6. Assess feasibility of porting Saturn's water effects - Not Started
 7. Assess how to bring over Saturn's Tengu Man stage music without removing the PS1's version - Not Started

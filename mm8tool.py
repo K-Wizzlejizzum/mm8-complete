@@ -3895,18 +3895,18 @@ def place_records(chunk, side):
 
 # ----------------------------------------------------------------- CLI
 
-# ----------------------------------------------------------------- release builder (M6, v0.2.0: Phases 1 and 2)
+# ----------------------------------------------------------------- release builder (M6; v0.3.0: Phases 1 and 2 + Saturn placements, bats, credits hint)
 # The user's discs are checked against the Redump dumps, every track of both discs: each Track 1 (RELEASE_IN_MD5) and
 # the audio tracks (RELEASE_AUDIO_MD5; each counted from its INDEX 00, as Redump's per-track files). Users give the
 # complete disc: a missing track stops the builder. A Track 1 that differs stops it; an audio track that differs only
 # gives a note, because most rippers don't correct the drive's read offset (the audio is shifted by a few samples,
 # inaudible, but the md5 differs); the PS1 audio tracks are copied into the output as the user gave them. The md5
 # of the image the tested toolchain produces is RELEASE_OUT_MD5; another compiler build may give a different (still valid) image.
-RELEASE_VERSION = '0.2.0'
+RELEASE_VERSION = '0.3.0'
 RELEASE_IN_MD5 = {'ps1': '4e9e6dcf27ea0e15c5f4d1f93c800378', 'sat': 'a4d575cd681b7d7c88b45d639ed7ffb7'}
 RELEASE_AUDIO_MD5 = {'ps1': {2: 'a75dcbb5c831a966c47563e7ea4150c9', 3: '2d7b5e8e94a91bf5423b2356f6a34863'},
                      'sat': {2: 'a2201327867523e4e31de62c445e2996'}}
-RELEASE_OUT_MD5 = 'b3b27b25a65dd1d746fbd5cb02db01aa'
+RELEASE_OUT_MD5 = '395dbfd997c4a321f08f4ad0e21c3bfc'
 RELEASE_NAME = 'Mega Man 8 - Complete'
 _RAW_SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
 
