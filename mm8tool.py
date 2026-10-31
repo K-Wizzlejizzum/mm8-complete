@@ -23,7 +23,7 @@ Commands:
                                                          Windows bundle runs it with its own GCC 12.4.0 (MM8_CROSS = toolchain
                                                          prefix, default mipsel-linux-gnu-)
     verify                                               re-check every key finding (PASS/FAIL)
-    build --ps1 TRACK1.bin --out OUT.bin [--xdelta P] [--quick-start 8|9 [--checkpoint 5]] [--keep-c DIR]
+    build --ps1 TRACK1.bin --out OUT.bin [--xdelta P] [--quick-start 8|9 [--checkpoint 5]] [--ending] [--keep-c DIR]
                                                          current patch: track 1 extended; restored Search Man stage
                                                          (map, sprites, text, doors, placements) + Wood Man/leaf lifted
                                                          to C in the STAGE08 overlay + PBGM46/PBGM47; restored Duo
@@ -435,6 +435,8 @@ def pac_build(entries):
 
 def pac_entries(path): return [(t, b) for t, o, b in unpac(path)]
 
+def pac_entries_bytes(pac): return [(t, b) for t, o, b in unpac_bytes(pac)]
+
 def pac_merge_grids(entries):
     """Merge chunks 0, 1, 2 (dests 0x8016EF34/F334/F734, contiguous, 0x400 each) into one type-0 chunk:
     same RAM contents, one sector less. Frees the sector chunk 3 needs to grow from 64 to 68 screens."""
@@ -481,6 +483,21 @@ def quick_start_words(stage):
 # Man's two gates (same record on the Saturn, 0x0027D4C0 + 5 * 0x18).
 QS_CP_ADDR = 0x80100B14
 QS_CP_ORIG_FP = '244a6352c275'             # fingerprint of: lui at, 0x801C; sb zero, 0x3371(at)
+
+# Debug ending start (test builds only, never in a release): GAME START goes straight to the ending (top mode 5 =
+# 0x80101460: the epilogue movie, then the credits 0x80121CD4) instead of a stage. Same patch site as the quick start:
+# phase 0 stores mode 5 in the mode byte 0x801CF840 and leaves through the sequencer's exit. The credits music is CD
+# Track 2, so test with the full disc.
+def ending_start_words():
+    return [m_i(0x0D, 0, 8, 5),                # ori  t0, zero, 5
+            m_i(0x0F, 0, 1, 0x801D),           # lui  at, 0x801D
+            2 << 26 | (0x80100AE8 >> 2) & 0x3FFFFFF,   # j 0x80100AE8
+            m_i(0x28, 1, 8, -0x7C0),           # sb   t0, -0x7C0(at)   (delay slot) -> mode byte
+            0, 0]
+
+def patch_ending_start(disc):
+    assert fp(disc.exe_words(QS_ADDR, 6)) == QS_ORIG_FP, 'unexpected code at 0x80100A8C'
+    disc.exe_write_words(QS_ADDR, ending_start_words())
 
 def patch_quick_start(disc, stage, checkpoint=None):
     assert fp(disc.exe_words(QS_ADDR, 6)) == QS_ORIG_FP, 'unexpected code at 0x80100A8C'
@@ -2596,6 +2613,67 @@ def patch_m5(disc):
         info[st.lower() + '_lba'] = ext
     return info
 
+# ---- Credits hint (Phase 3 item 11): the Saturn's last credits page adds "BONUS MODE (L+R+START BUTTON)" under "AND
+# CAPCOM ALL STAFF". ENDING.PAC (same chunk 5 on both discs) holds the line as frame 0xC7 of the credits text sets
+# 0xA3-0xA6 (one frame table; 26 pieces of the 16 x 16 credits font, 4 bytes each: glyph, palette bits, x, y); the Saturn's
+# page builder 0x2750F0 spawns it as a second P4 0x3A text object at (0xC0, 0x88) when the page's text frame is 0x91,
+# the PS1's builder doesn't. The PS1 port changes data only: frame 0x91 (only used by that page; its object stands at
+# (0xBC, 0x60)) gets the 0xC7 pieces appended, moved by (+4, +0x28), with "1" (glyph 40) after L and R (the port's
+# L1 + R1 + Start) and the rest of the line moved right to make room. The new piece list goes to the end of chunk 5
+# (still inside the chunk's sectors, so ENDING.PAC keeps its size and LBA; the chunk-5 buffer 0x80078000 takes
+# STAGE0D's 135,884 bytes).
+M8C_SET, M8C_PAGE_FRAME, M8C_HINT_FRAME = 0xA6, 0x91, 0xC7
+M8C_PAGE_FP, M8C_HINT_FP = '60f8d90e831a', '11fd30bbff8a'
+M8C_HINT_DX, M8C_HINT_DY = 0xC0 - 0xBC, 0x88 - 0x60
+M8C_GLYPH_ONE, M8C_GLYPH_L, M8C_GLYPH_R = 40, 11, 18
+
+def m8c_hint_pieces(pcs):
+    """The hint frame's pieces [(glyph, pal, x, y)] -> the PS1 wording: "1" after the first L and the first R of the
+    second line (L+R -> L1+R1; START keeps its R). The second line grows by two glyphs, so it starts 16 px further left
+    and ends where the Saturn's ends (any further right runs into the page's frame)."""
+    line2 = [p for p in pcs if p[3]]
+    x0 = -8 * 2
+    out, shift, todo = [], x0, [M8C_GLYPH_L, M8C_GLYPH_R]
+    for g, pal, x, y in pcs:
+        if not y: out.append((g, pal, x, y)); continue
+        out.append((g, pal, x + shift, y))
+        if todo and g == todo[0]:
+            todo.pop(0); shift += 8; out.append((M8C_GLYPH_ONE, pal, x + shift, y))
+    assert not todo and len(out) == len(pcs) + 2 and max(p[2] for p in out if p[3]) == max(p[2] for p in line2)
+    return out
+
+def m8c_ending_pac(pac):
+    """ENDING.PAC bytes (PS1) -> the same file with the credits hint on the last page (above)."""
+    ent = [(t, b) for t, o, b in unpac_bytes(pac)]
+    d = dict(ent)
+    c5 = bytearray(d[5]); fo = struct.unpack_from('<I', d[6], 4 * M8C_SET)[0]
+    s8 = lambda v: v - 256 if v > 127 else v
+    def frame(f):
+        cnt, po = struct.unpack_from('<HH', c5, fo + 4 * f)
+        raw = bytes(c5[fo + po:fo + po + 4 * cnt])
+        return raw, [(raw[k], raw[k + 1], s8(raw[k + 2]), s8(raw[k + 3])) for k in range(0, len(raw), 4)]
+    page_raw, page = frame(M8C_PAGE_FRAME); hint_raw, hint = frame(M8C_HINT_FRAME)
+    assert fp(page_raw) == M8C_PAGE_FP and fp(hint_raw) == M8C_HINT_FP, 'unexpected ENDING.PAC credits frames'
+    new = page + [(g, p, x + M8C_HINT_DX, y + M8C_HINT_DY) for g, p, x, y in m8c_hint_pieces(hint)]
+    assert all(-128 <= x < 128 and -128 <= y < 128 for g, p, x, y in new)
+    while len(c5) % 4: c5.append(0)
+    at = len(c5)
+    c5 += b''.join(bytes([g, p, x & 0xFF, y & 0xFF]) for g, p, x, y in new)
+    assert at - fo < 0x10000
+    struct.pack_into('<HH', c5, fo + 4 * M8C_PAGE_FRAME, len(new), at - fo)
+    out = pac_build([(t, bytes(c5) if t == 5 else b) for t, b in ent])
+    assert len(out) == len(pac), 'ENDING.PAC would grow'
+    return out
+
+def patch_m8_credits(disc):
+    """Credits hint on the PS1's last credits page: ENDING.PAC rewritten in place. Returns info."""
+    ext, sz, chunks = pac_locate(disc, 'STDATA/ENDING.PAC')
+    old = disc.read(ext, sz)
+    assert old == _file(os.path.join(PS1_FILES, 'STDATA', 'ENDING.PAC')), 'ENDING.PAC already patched?'
+    new = m8c_ending_pac(old)
+    disc.write(ext, 0, new)
+    return dict(ending_lba=ext, ending_size=sz)
+
 def relocate_p5_table(out, stage, extra, at):
     """Append a copy of the EXE P5 table (52 entries) + `extra` handlers (types 0x34...) at overlay offset `at` (out is
     extended as needed) and repoint the overlay's P5 loop (lui/addiu)."""
@@ -2633,7 +2711,7 @@ def build_m4_overlay(ovl, vf_addr, workdir=None):
 PS1_STAGE08_FILE, PS1_STAGE08_ENTRY = 17, (126370, 0x9394, 0xE)   # file-table index and original (LBA, size, type)
 sectors = lambda n: (n + 2047) // 2048
 
-def build_image(src_bin, out_bin, quick_stage=None, workdir=None, checkpoint=None, test_start=None):
+def build_image(src_bin, out_bin, quick_stage=None, workdir=None, checkpoint=None, test_start=None, ending=False):
     """The current patch on a raw PS1 track 1 (all in place, sector EDC/ECC fixed):
       - track 1 extended by PS1_EXTEND_SECTORS empty sectors (extend_track1);
       - STAGE08 overlay with the relocated enemy table + lifted Wood Man / leaf code (build_m2_overlay) in the free
@@ -2645,12 +2723,17 @@ def build_image(src_bin, out_bin, quick_stage=None, workdir=None, checkpoint=Non
       - play_bgm hook (patch_music_hook), sound bank-mismatch guard (patch_sound_guard);
       - STAGE08.PAC rebuilt in place + STAGE08B placements + Wood Man's door lists (patch_m2a);
       - bolt 19's floor record removed from STAGE05/STAGE05B.PAC in place (patch_m5; Wood Man drops it);
+      - the last credits page gets "BONUS MODE (L1+R1+START BUTTON)" (ENDING.PAC in place, patch_m8_credits);
       - quick_stage / checkpoint: debug quick start (test builds only, never in a release);
+      - ending: debug start straight into the ending and credits (test builds only, never in a release);
       - test_start = (px, py, cx, cy, bounds_entry): debug start record for quick_stage/checkpoint (patch_test_start;
         test builds only, never in a release)."""
     disc = RawDisc(src_bin)
     extend_track1(disc)
     if quick_stage is not None: patch_quick_start(disc, quick_stage, checkpoint)
+    if ending:
+        assert quick_stage is None, '--ending and --quick-start exclude each other'
+        patch_ending_start(disc)
     if test_start is not None:
         assert quick_stage is not None and checkpoint is not None, 'test_start needs quick_stage and checkpoint'
         px, py, cx, cy, be = test_start
@@ -2694,6 +2777,7 @@ def build_image(src_bin, out_bin, quick_stage=None, workdir=None, checkpoint=Non
     patch_sound_guard(disc)
     info.update(patch_m2a(disc))
     info.update(patch_m5(disc))
+    info.update(patch_m8_credits(disc))
     disc.save(out_bin)
     info.update(sectors_changed=len(disc.touched), free_lba=nxt, free_sectors_left=disc.free[1] - nxt)
     return info
@@ -6310,6 +6394,17 @@ def verify():
               chunk_diff('LABO.PAC') is not None and 0x102 in chunk_diff('LABO.PAC'))
     else:
         print('SKIP JP checks (no JP workspace: setup --jp)')
+    def _m8c():
+        pac = _file(os.path.join(PS1_FILES, 'STDATA', 'ENDING.PAC'))
+        new = m8c_ending_pac(pac); d0 = dict(pac_entries_bytes(pac)); d1 = dict(pac_entries_bytes(new))
+        fo = struct.unpack_from('<I', d1[6], 4 * M8C_SET)[0]
+        cnt, po = struct.unpack_from('<HH', d1[5], fo + 4 * M8C_PAGE_FRAME)
+        g = [d1[5][fo + po + 4 * k] for k in range(cnt)]
+        sat5 = swap32(pac_chunks('sat', 'ENDING')[5])
+        return (len(new) == len(pac) and all(d0[t] == d1[t] for t in d0 if t != 5) and d1[5][:len(d0[5])].startswith(d0[5][:fo + 4 * M8C_PAGE_FRAME])
+                and cnt == 17 + 28 and g.count(M8C_GLYPH_ONE) == 2 and sat5 == d0[5])
+    check('Credits hint: the Saturn and PS1 ENDING.PAC share chunk 5 (frame 0xC7 = "BONUS MODE (L+R+START BUTTON)"); the PS1 page frame 0x91 gets those 26 pieces + two "1" glyphs (45 pieces), file size unchanged, other chunks untouched',
+          _m8c())
     check('Release: audio tracks of both discs checked against their Redump md5s (per-track and whole-disc .bin; a different track gives a note, a missing track stops)',
           _selftest_audio_check())
     hits = tool_game_words()
@@ -7098,6 +7193,7 @@ def main():
     s = sp.add_parser('build'); s.add_argument('--ps1', required=True); s.add_argument('--out', required=True); s.add_argument('--xdelta')
     s.add_argument('--quick-start', type=lambda x: int(x, 0), help='debug: new game starts in this stage (8 = Search Man)')
     s.add_argument('--checkpoint', type=lambda x: int(x, 0), help="debug: with --quick-start, start at this checkpoint (stage 8: 5 = corridor before Wood Man's second gate)")
+    s.add_argument('--ending', action='store_true', help='debug: GAME START plays the ending and the credits (full disc needed for the credits music)')
     s.add_argument('--test-start', help='debug: px,py,cx,cy,bounds_entry = start record for --quick-start/--checkpoint (stage 5 cp 2: 0xD40,0xA40,0xD00,0xA00,0x21 = bolt 19 floor room)')
     s.add_argument('--keep-c', help='directory for the generated C / build files')
     s = sp.add_parser('audio-compare'); s.add_argument('--bank', default='WOOD2.PAC'); s.add_argument('--saturn', required=True); s.add_argument('--ps1', required=True)
@@ -7183,7 +7279,7 @@ def main():
     elif a.cmd == 'build':
         if a.keep_c: os.makedirs(a.keep_c, exist_ok=True)
         ts = tuple(int(v, 0) for v in a.test_start.split(',')) if a.test_start else None
-        info = build_image(a.ps1, a.out, a.quick_start, a.keep_c, a.checkpoint, ts)
+        info = build_image(a.ps1, a.out, a.quick_start, a.keep_c, a.checkpoint, ts, a.ending)
         for k, v in info.items():
             if k not in ('bmap', 'tmap'): print(f'{k}: {v:#x}' if isinstance(v, int) else f'{k}: {v}')
         if a.xdelta:
