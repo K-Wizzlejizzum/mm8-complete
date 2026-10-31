@@ -19,7 +19,7 @@ Roadmap:
 This repository holds only original work:
 
 - `mm8tool.py`: the builder that ports the Saturn content and builds the PlayStation image from your discs (usage in its docstring)
-- `helper_map.txt`, `globals_map.txt`: Saturn → PS1 function and RAM maps (the builder reads `helper_map.txt`)
+- `helper_map.txt`: the Saturn → PS1 function map the builder reads
 
 This repository contains no copyrighted material: no game data, no game code and no patches. The finished release will be a builder: you supply your own discs (US PlayStation and US Saturn; the Japanese option will need the Japanese discs), and it builds the PlayStation image on your machine.
 
