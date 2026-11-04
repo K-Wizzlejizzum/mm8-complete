@@ -7,14 +7,16 @@ Roadmap:
 1. Restore Wood Man and Cut Man fights - 100% Complete
 2. Restore "Bonus Mode" and all functionality within - 100% Complete
 3. Use Saturn enemy count and placements - 100% Complete
-4. Use Saturn text color for Robot Master intro names - 0%
+4. Use Saturn text color for Robot Master intro names - 25%
 5. Use Saturn's lives counter placement (under life bar) - Not Started
 6. Assess feasibility of porting Saturn's water effects - Not Started
 7. Assess how to bring over Saturn's Tengu Man stage music without removing the PS1's version - Not Started
 8. Fix any grammatical issues with the dialogue - Not Started
 9. Add the Battle & Chase and Super Adventure Rockman adverts that were present in the Japanese PSX version - Not Started
 10. (Stretch Goal) Assess the need for a full re-translation - Not Started
-11. (Stretch Goal) Add the ability to choose between Japanese and English audio, effectively creating an "Undub" - Not Started
+11. (Stretch Goal) Add the ability to choose between Japanese and English audio (and subtitles where appropriate), effectively creating an "Undub" - Not Started
+12. (Stretch Goal) Assess feasibility to include a choice between standard subtitles and SDH for the undub - Not Started
+13. (Stretch Goal) Overhaul the bolt/shop system to allow for all items to be purchased in one playthrough - Not Started
 
 This repository holds only original work:
 
