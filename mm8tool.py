@@ -18,7 +18,8 @@ placements) + Wood Man/leaf lifted to C in the STAGE08 overlay + PBGM46/PBGM47; 
 arena, placements) + Cut Man and the P5 0x34 alarm lifted to C in the STAGE09 overlay + PBGM48/PBGM49; play_bgm hook +
 sound guard; the title menu with BONUS MODE as its 4th item and the Saturn bonus menu lifted to C with every
 sub-screen; the Saturn placement list in every stage PAC + the Saturn bat (P2 0x22) lifted to C in the STAGE05
-overlay; the credits hint. check_build then re-checks the image (sectors, EDC/ECC, music entries, DEMO/bonus/SLABO).
+overlay; the credits hint; the boss-intro name in the Saturn's colors and letters. check_build then re-checks the image (sectors,
+EDC/ECC, music entries, DEMO/bonus/SLABO, SELECT.PAC).
 """
 import os, sys, re, struct, hashlib, argparse, collections, random, functools
 
@@ -1751,6 +1752,55 @@ def patch_m8_credits(disc):
     disc.write(ext, 0, new)
     return dict(ending_lba=ext, ending_size=sz)
 
+# ---- README item 4 (Phase 3): the boss-intro name ("FROST MAN") as on the Saturn. The name is drawn with the big italic
+# font of SELECT.PAC on both systems: glyph tiles 0x1A0-0x1BE of chunk 0x102, one sprite frame per letter A-Z (chunk 5,
+# from offset M8N_FRAMES_AT), palette 15 of chunk 9. Two differences, both ported:
+#  - colors: entries 1-8 of palette 15 (the font's light-to-dark ramp, outline and shadow) are orange-gold on the
+#    Saturn and pink-white on the PS1; entries 0 and 9-15 are 0 on both, and the other 127 palettes are the same.
+#    The Saturn's 15-bit colors are written into palette 15, keeping each PS1 entry's bit 15 (STP; 0 in every entry).
+#  - letters: the Saturn's glyphs are bolder, with a heavy outline and two-tile M, Q and W; it has only the letters the
+#    eight names use (the other slots hold a crossed filler, the only pixels in color 9) where the PS1 has a redrawn
+#    thin A-Z. The Saturn's 31 tiles (the only tiles of the chunk that differ after gfx_sat_to_ps1) and its letter
+#    frames (chunk 5 after front_pac_sat_to_ps1 differs only from M8N_FRAMES_AT on, 8 bytes longer: the 2-piece
+#    M, Q, W) replace the PS1's. Chunks 6-8 stay the PS1's (chunk 7's one differing word is not one of the font's sets).
+# Every chunk keeps its sector count, so SELECT.PAC keeps its size and LBA.
+M8N_PAL, M8N_TILES, M8N_FRAMES_AT = 15, range(0x1A0, 0x1BF), 0x53E0
+M8N_SAT_FP, M8N_PS1_FP, M8N_FRAME_DIFF_FP = 'ccbd688d2917', 'ee28ea1158e3', '25307111fb0d'
+
+def m8n_palette():
+    """(Saturn, PS1) palette M8N_PAL of SELECT.PAC chunk 9, 16 entries each, read from the discs."""
+    s = pac_chunks('sat', 'SELECT')[9][32 * M8N_PAL:32 * M8N_PAL + 32]
+    p = pac_chunks('ps1', 'SELECT')[9][32 * M8N_PAL:32 * M8N_PAL + 32]
+    return list(struct.unpack('>16H', s)), list(struct.unpack('<16H', p))
+
+def m8n_select_pac(pac):
+    """SELECT.PAC bytes (PS1) -> the same file with the Saturn's boss-name colors, glyphs and letter frames (above)."""
+    sp, pp = m8n_palette()
+    assert fp(sp) == M8N_SAT_FP and fp(pp) == M8N_PS1_FP, 'unexpected SELECT.PAC palette 15'
+    ent = [(t, b) for t, o, b in unpac_bytes(pac)]
+    d = dict(ent); sat = pac_chunks('sat', 'SELECT')
+    c9 = bytearray(d[9])
+    assert c9[32 * M8N_PAL:32 * M8N_PAL + 32] == struct.pack('<16H', *pp)
+    struct.pack_into('<16H', c9, 32 * M8N_PAL, *[(s & 0x7FFF) | (p & 0x8000) for s, p in zip(sp, pp)])
+    c102 = gfx_sat_to_ps1(sat[0x102], False)
+    assert len(c102) == len(d[0x102]) and [t for t in range(len(c102) // 128) if ps1_tile(c102, t) != ps1_tile(d[0x102], t)] == list(M8N_TILES), 'SELECT.PAC font tiles'
+    c5 = front_pac_sat_to_ps1(5, sat[5])
+    diff = [i for i in range(0, len(d[5]), 4) if c5[i:i + 4] != d[5][i:i + 4]]
+    assert fp(diff) == M8N_FRAME_DIFF_FP and diff[0] == M8N_FRAMES_AT and len(c5) == len(d[5]) + 8, 'SELECT.PAC letter frames'
+    assert (len(c5) + 0x7FF) // 0x800 == (len(d[5]) + 0x7FF) // 0x800
+    rep = {9: bytes(c9), 0x102: c102, 5: c5}
+    out = pac_build([(t, rep.get(t, b)) for t, b in ent])
+    assert len(out) == len(pac), 'SELECT.PAC would change size'
+    return out
+
+def patch_m8_name_color(disc):
+    """Boss-intro name as on the Saturn (colors, glyphs, letter frames): SELECT.PAC rewritten in place. Returns info."""
+    ext, sz, chunks = pac_locate(disc, 'STDATA/SELECT.PAC')
+    old = disc.read(ext, sz)
+    assert old == _file(os.path.join(PS1_FILES, 'STDATA', 'SELECT.PAC')), 'SELECT.PAC already patched?'
+    disc.write(ext, 0, m8n_select_pac(old))
+    return dict(select_lba=ext, select_size=sz)
+
 # ---- Phase 3 items 1 + 2: the Saturn's enemy and item placements in every stage, with Sword Man's bats.
 # Every STAGExx(B).PAC gets the Saturn's chunk 0x0A (records in the PS1 byte layout, Saturn order; same 0x800-byte chunk,
 # so every PAC keeps its size and LBA). This supersedes the Phase-1 placement edits (the Saturn lists hold Wood Man,
@@ -1875,6 +1925,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
       - every stage's placement list = the Saturn's (patch_m8_placements; also drops floor bolts 19 and 38) and the
         STAGE05 overlay with the lifted Saturn bat (P2 0x22), moved to the free sectors;
       - the last credits page gets "BONUS MODE (L1+R1+START BUTTON)" (ENDING.PAC in place, patch_m8_credits);
+      - the boss-intro name as on the Saturn: orange-gold, the Saturn's letters (SELECT.PAC in place, patch_m8_name_color);
       - extra_patches: callables f(disc, next_free_lba, workdir) -> (sectors used, info dict), applied last, after
         every port (none in the release build)."""
     disc = RawDisc(src_bin)
@@ -1920,6 +1971,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     m8p = patch_m8_placements(disc, nxt, workdir); nxt += m8p['ovl05_sectors']    # supersedes patch_m5 (bolt 19)
     info.update({'m8p_' + k: v for k, v in m8p.items()})
     info.update(patch_m8_credits(disc))
+    info.update(patch_m8_name_color(disc))
     for f in extra_patches:
         used, more = f(disc, nxt, workdir); nxt += used; info.update(more)
     disc.save(out_bin)
@@ -2021,6 +2073,9 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     assert disc.exe_words(0x800FF1B0, 1)[0] == 2 << 26 | (i7['title_hook'] >> 2) & 0x3FFFFFF, 'title hook'
     assert disc.exe_words(0x800FEFD4, 1)[0] == 3 << 26 | (i7['title_confirm'] >> 2) & 0x3FFFFFF, 'title confirm (ANIMATION input)'
     out['m7_bonus'] = (vl, vs); out['m7b_slabo'] = (sl, ss)
+    ext, sz, _ = pac_locate(disc, 'STDATA/SELECT.PAC'); oe, osz, _ = pac_locate(od, 'STDATA/SELECT.PAC')
+    assert (ext, sz) == (oe, osz) and disc.read(ext, sz) == m8n_select_pac(od.read(oe, osz)), 'SELECT.PAC (boss-intro name)'
+    out['m8_name_color'] = (ext, sz)
     return out
 
 # ----------------------------------------------------------------- sound banks (audio survey)
