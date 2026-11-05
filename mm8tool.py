@@ -18,8 +18,8 @@ placements) + Wood Man/leaf lifted to C in the STAGE08 overlay + PBGM46/PBGM47; 
 arena, placements) + Cut Man and the P5 0x34 alarm lifted to C in the STAGE09 overlay + PBGM48/PBGM49; play_bgm hook +
 sound guard; the title menu with BONUS MODE as its 4th item and the Saturn bonus menu lifted to C with every
 sub-screen; the Saturn placement list in every stage PAC + the Saturn bat (P2 0x22) lifted to C in the STAGE05
-overlay; the credits hint; the boss-intro name in the Saturn's colors and letters. check_build then re-checks the image (sectors,
-EDC/ECC, music entries, DEMO/bonus/SLABO, SELECT.PAC).
+overlay; the credits hint; the boss-intro name in the Saturn's colors and letters; the HUD head icon and lives digit at the
+Saturn's positions. check_build then re-checks the image (sectors, EDC/ECC, music entries, DEMO/bonus/SLABO, SELECT.PAC, HUD list).
 """
 import os, sys, re, struct, hashlib, argparse, collections, random, functools
 
@@ -1801,6 +1801,45 @@ def patch_m8_name_color(disc):
     disc.write(ext, 0, m8n_select_pac(old))
     return dict(select_lba=ext, select_size=sz)
 
+# ---- README item 5 (Phase 3): the HUD's Mega Man head icon at the Saturn's position. The life-bar panel is drawn from a
+# list of 8-byte sprite records (u16 x, u16 y, then tile and palette bytes; terminator byte 7 = 0xFF): PS1 EXE
+# 0x80136DB0 (drawn by 0x800FADD8 from the life-bar code 0x800FA6AC), Saturn 1STREAD 0x0602B284 (drawn by the HUD
+# 0x06011280). Both hold the same nine pieces: the frame pieces at the same positions, the head icon at y 0x53 (first
+# on the PS1, last on the Saturn), its x one pixel further left on the PS1. The lives digit is a separate sprite: x set by
+# `ori v0, zero, x` at PS1 0x800FA7D8 and by `mov #x, r3` at Saturn 0x060113BA (y 0x53 on both), one pixel further right
+# on the PS1. So on the Saturn the head and the digit sit a pixel closer together. The port takes both x values from
+# the Saturn disc: the head record's x and the digit's immediate.
+M8H_PS1_LIST, M8H_SAT_LIST, M8H_PS1_HEAD, M8H_SAT_HEAD = 0x80136DB0, 0x0602B284, 0, 7    # list addresses, head record
+M8H_PS1_FP, M8H_SAT_FP = '1d9882304234', 'bb04e6119ed1'                                    # the 9-record lists (72 bytes)
+M8H_PS1_DIGIT, M8H_SAT_DIGIT = 0x800FA7D8, 0x060113BA                                      # lives digit x instructions
+M8H_PS1_DIGIT_FP, M8H_SAT_DIGIT_FP = 'bb6ee4f21a5f', '62f16d7ea0ca'
+
+def m8h_digit_x():
+    """The Saturn's lives-digit x: the immediate of its `mov #x, r3` (read from the Saturn disc)."""
+    w = Sat().u16(M8H_SAT_DIGIT)
+    assert fp(w) == M8H_SAT_DIGIT_FP, 'unexpected Saturn HUD code'
+    return w & 0xFF
+
+def m8h_head_x():
+    """The Saturn's head-icon x, read from the Saturn disc (record M8H_SAT_HEAD of the list at M8H_SAT_LIST)."""
+    sat = Sat()
+    assert fp(sat.raw(M8H_SAT_LIST, 72)) == M8H_SAT_FP, 'unexpected Saturn HUD list'
+    return sat.u16(M8H_SAT_LIST + 8 * M8H_SAT_HEAD)
+
+def patch_m8_hud_head(disc):
+    """HUD head icon and lives digit at the Saturn's positions: the head record's x in the PS1 EXE's life-bar panel list
+    and the digit's `ori` immediate. Returns info."""
+    assert fp(disc.exe_words(M8H_PS1_LIST, 18)) == M8H_PS1_FP, 'unexpected PS1 HUD list (already patched?)'
+    a = M8H_PS1_LIST + 8 * M8H_PS1_HEAD
+    old = struct.unpack('<H', disc.exe_read(a, 2))[0]; new = m8h_head_x()
+    assert new == old + 1, 'Saturn and PS1 head-icon x not one pixel apart'
+    disc.exe_write(a, struct.pack('<H', new))
+    w = disc.exe_words(M8H_PS1_DIGIT, 1)[0]
+    assert fp(w) == M8H_PS1_DIGIT_FP, 'unexpected PS1 lives-digit code'
+    dx = m8h_digit_x(); assert dx == (w & 0xFFFF) - 1, 'Saturn and PS1 lives-digit x not one pixel apart'
+    disc.exe_write_words(M8H_PS1_DIGIT, [(w & 0xFFFF0000) | dx])
+    return dict(hud_head_x=(old, new), hud_digit_x=(w & 0xFFFF, dx))
+
 # ---- Phase 3 items 1 + 2: the Saturn's enemy and item placements in every stage, with Sword Man's bats.
 # Every STAGExx(B).PAC gets the Saturn's chunk 0x0A (records in the PS1 byte layout, Saturn order; same 0x800-byte chunk,
 # so every PAC keeps its size and LBA). This supersedes the Phase-1 placement edits (the Saturn lists hold Wood Man,
@@ -1926,6 +1965,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
         STAGE05 overlay with the lifted Saturn bat (P2 0x22), moved to the free sectors;
       - the last credits page gets "BONUS MODE (L1+R1+START BUTTON)" (ENDING.PAC in place, patch_m8_credits);
       - the boss-intro name as on the Saturn: orange-gold, the Saturn's letters (SELECT.PAC in place, patch_m8_name_color);
+      - the HUD's head icon and lives digit at the Saturn's positions, each moved 1 px (EXE, patch_m8_hud_head);
       - extra_patches: callables f(disc, next_free_lba, workdir) -> (sectors used, info dict), applied last, after
         every port (none in the release build)."""
     disc = RawDisc(src_bin)
@@ -1972,6 +2012,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update({'m8p_' + k: v for k, v in m8p.items()})
     info.update(patch_m8_credits(disc))
     info.update(patch_m8_name_color(disc))
+    info.update(patch_m8_hud_head(disc))
     for f in extra_patches:
         used, more = f(disc, nxt, workdir); nxt += used; info.update(more)
     disc.save(out_bin)
@@ -2076,6 +2117,11 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     ext, sz, _ = pac_locate(disc, 'STDATA/SELECT.PAC'); oe, osz, _ = pac_locate(od, 'STDATA/SELECT.PAC')
     assert (ext, sz) == (oe, osz) and disc.read(ext, sz) == m8n_select_pac(od.read(oe, osz)), 'SELECT.PAC (boss-intro name)'
     out['m8_name_color'] = (ext, sz)
+    hx = M8H_PS1_LIST + 8 * M8H_PS1_HEAD                  # README item 5: the head icon's x = the Saturn's, the rest of the list as on the disc
+    assert struct.unpack('<H', disc.exe_read(hx, 2))[0] == m8h_head_x() and disc.exe_read(M8H_PS1_LIST, 72)[2:] == od.exe_read(M8H_PS1_LIST, 72)[2:], 'HUD head icon'
+    ow, nw = od.exe_words(M8H_PS1_DIGIT, 1)[0], disc.exe_words(M8H_PS1_DIGIT, 1)[0]
+    assert nw == (ow & 0xFFFF0000) | m8h_digit_x(), 'HUD lives digit'
+    out['m8_hud'] = (m8h_head_x(), m8h_digit_x())
     return out
 
 # ----------------------------------------------------------------- sound banks (audio survey)
@@ -3950,18 +3996,18 @@ def place_records(chunk, side):
 
 # ----------------------------------------------------------------- CLI
 
-# ----------------------------------------------------------------- release builder (M6; v0.3.0: Phases 1 and 2 + Saturn placements, bats, credits hint)
+# ----------------------------------------------------------------- release builder (M6; v0.4.0: v0.3.0 + the Saturn boss-intro names and HUD positions)
 # The user's discs are checked against the Redump dumps, every track of both discs: each Track 1 (RELEASE_IN_MD5) and
 # the audio tracks (RELEASE_AUDIO_MD5; each counted from its INDEX 00, as Redump's per-track files). Users give the
 # complete disc: a missing track stops the builder. A Track 1 that differs stops it; an audio track that differs only
 # gives a note, because most rippers don't correct the drive's read offset (the audio is shifted by a few samples,
 # inaudible, but the md5 differs); the PS1 audio tracks are copied into the output as the user gave them. The md5
 # of the image the tested toolchain produces is RELEASE_OUT_MD5; another compiler build may give a different (still valid) image.
-RELEASE_VERSION = '0.3.0'
+RELEASE_VERSION = '0.4.0'
 RELEASE_IN_MD5 = {'ps1': '4e9e6dcf27ea0e15c5f4d1f93c800378', 'sat': 'a4d575cd681b7d7c88b45d639ed7ffb7'}
 RELEASE_AUDIO_MD5 = {'ps1': {2: 'a75dcbb5c831a966c47563e7ea4150c9', 3: '2d7b5e8e94a91bf5423b2356f6a34863'},
                      'sat': {2: 'a2201327867523e4e31de62c445e2996'}}
-RELEASE_OUT_MD5 = '395dbfd997c4a321f08f4ad0e21c3bfc'
+RELEASE_OUT_MD5 = '9ed2525bb1b0f0da500fa6b1cae39532'
 RELEASE_NAME = 'Mega Man 8 - Complete'
 _RAW_SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
 

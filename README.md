@@ -8,7 +8,7 @@ Roadmap:
 2. Restore "Bonus Mode" and all functionality within - 100% Complete
 3. Use Saturn enemy count and placements - 100% Complete
 4. Use Saturn text color for Robot Master intro names - 100% Complete
-5. Use Saturn's lives counter placement (under life bar) - Not Started
+5. Use Saturn's lives counter placement (under life bar) - 100% Complete
 6. Assess feasibility of porting Saturn's water effects - Not Started
 7. Assess how to bring over Saturn's Tengu Man stage music without removing the PS1's version - Not Started
 8. Fix any grammatical issues with the dialogue - Not Started
