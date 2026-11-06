@@ -2338,19 +2338,28 @@ def sat_layer_raw(name, voice, note):
 
 def sega_seq_decode(s):
     """-> dict(res, tempos [(steps, usec)], loop_t, end_t, ev [(t, kind, ch, a, b, c)]); kind note (key, vel, gate),
-    cc (ctl, val), prog (p), press (v), bend (v), mark (step byte of an 82 event)."""
+    cc (ctl, val), prog (p), press (v), bend (v), mark (step byte of an 82 event).
+    Note status 0x00-0x7F (as the Saturn sound driver reads it): channel = bits 0-4 (16-31 not handled), bit 0x40 =
+    gate + 0x100, bit 0x20 = step + 0x100. One-byte prefixes 0x88-0x8B add 0x200 / 0x800 / 0x1000 / 0x2000 to the
+    next note's gate, 0x8C-0x8F add 0x100 / 0x200 / 0x800 / 0x1000 to the step (they accumulate)."""
     res, nt, do, lo = struct.unpack('>4H', s[:8])
     tempos = [struct.unpack('>II', s[8 + 8 * k:16 + 8 * k]) for k in range(nt)]
-    ev, T = [], [0]
+    ev, T, G = [], [0], [0]
     def run(i, lim=None, depth=0):
         n = 0
         while lim is None or n < lim:
             b = s[i]
             if b < 0x80:
-                assert not b & 0x10, 'note flag 0x10 not handled'
+                assert not b & 0x10, 'channels 16-31 not handled'
                 key, vel, gate, dt = s[i + 1:i + 5]
-                gate += (0x100 if b & 0x40 else 0) + (0x200 if b & 0x20 else 0)
+                gate += (0x100 if b & 0x40 else 0) + G[0]; G[0] = 0
+                dt += 0x100 if b & 0x20 else 0
                 T[0] += dt; ev.append((T[0], 'note', b & 15, key, vel, gate)); i += 5
+            elif 0x88 <= b <= 0x8F:                       # gate / step prefix of the next note
+                x = (0x200, 0x800, 0x1000, 0x2000, 0x100, 0x200, 0x800, 0x1000)[b - 0x88]
+                if b < 0x8C: G[0] += x
+                else: T[0] += x
+                i += 1; continue
             elif b >> 4 in (0xA, 0xB):
                 assert b >> 4 == 0xB, 'polyphonic pressure not handled'
                 T[0] += s[i + 3]; ev.append((T[0], 'cc', b & 15, s[i + 1], s[i + 2], 0)); i += 4
@@ -2377,12 +2386,24 @@ def _vlq(v):
     while v: out.append(0x80 | (v & 0x7F)); v >>= 7
     return bytes(out[::-1])
 
-def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=None, key_map=None, tempo_scale=1.0):
+def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=None, key_map=None, tempo_scale=1.0,
+                     lfo=None, lfo_level=None, res_scale=1, gate_frames=None, time_scale=1.0):
     """Convert one Sega SEQ song to a Sony SEQ (libsnd): same resolution, times and channels; notes become note-on /
     note-on velocity 0 after the gate (clipped at the loop end); program numbers through prog_map (default: same);
     pitch bend 7-bit -> MSB; bank select (CC 0x20) dropped; velocity / CC 7 through vel_map / cc7_map when given
     (build_music_bank passes the measured Saturn laws); tempo changes as FF 51; loop = CC 99 = 20 + CC 6 = 127 at the
-    loop point and CC 99 = 30 at the end (Capcom's markers). Returns (bytes, info)."""
+    loop point and CC 99 = 30 at the end (Capcom's markers).
+    lfo = {Saturn program: scsp_lfo(...)} imitates the SCSP's LFO on channels playing those programs (the SPU has none):
+    pitch bend (in steps of the tone's bend range / 64) and CC 7 (lfo_level(Saturn CC 7, LFO dB) replaces cc7_map
+    there) on a grid of ~1/32 LFO period, emitted only when the value changes, while the channel's notes sound (+ 0.25 s;
+    gaps under 1 s bridged) and again at the loop point. The LFO restarts at every note-on on the channel (measured on
+    the Saturn: the vibrato starts at the same point on every note).
+    gate_frames = video frames per second: every note's length becomes a whole number of frames (at least one), so that
+    libsnd, which acts once per frame, plays each note the same length (otherwise a short note loses up to a frame).
+    res_scale: the Sony SEQ's resolution and every time are multiplied by it (libsnd rounds its playback rate in coarse
+    steps; a finer resolution brings a song's tempo closer). time_scale stretches every event time by that factor at
+    the finer resolution (an exact tempo correction where libsnd's own tempo steps miss; libsnd keeps a whole number of
+    beats per minute). Returns (bytes, info)."""
     A = sega_seq_decode(s)
     loop_t, end_t = A['loop_t'], A['end_t']
     assert A['last_t'] == end_t, ('song length != tempo track', A['last_t'], end_t)
@@ -2403,9 +2424,62 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
         add(loop_t, 1, 0xB0, (99, 20)); add(loop_t, 2, 0xB0, (6, 127))
         add(end_t, 9, 0xB0, (99, 30))
     nnotes = clipped = 0; cprog = {}
+    lfo_ch = set()
+    if lfo:
+        step_at = []                                    # (first step, seconds per step) per tempo segment
+        tt = 0
+        for d, u in A['tempos']: step_at.append((tt, u / 1e6 / A['res'])); tt += d
+        def sec(x):
+            r = 0.0
+            for k, (t0, sp) in enumerate(step_at):
+                t1 = step_at[k + 1][0] if k + 1 < len(step_at) else None
+                if t1 is None or x < t1: return r + (x - t0) * sp
+                r += (t1 - t0) * sp
+            return r
+        sp0 = min(sp for t0, sp in step_at)
+        span = collections.defaultdict(list); cc7 = collections.defaultdict(list); pp = {}; ons = collections.defaultdict(list)
+        for t, kind, ch, a, b, c in A['ev']:
+            if kind == 'prog': pp[ch] = a
+            elif kind == 'cc' and a == 7: cc7[ch].append((t, b))
+            elif kind == 'note' and c and pp.get(ch) in lfo:
+                span[ch].append((t, min(end_t, t + c + round(0.25 / sp0)), pp[ch])); ons[ch].append(t)
+        for ch, sp in span.items():
+            lfo_ch.add(ch)
+            merged = []
+            for a0, b0, pr in sorted(sp):
+                if merged and a0 - merged[-1][1] < 1.0 / sp0 and merged[-1][2] == pr:
+                    merged[-1][1] = max(merged[-1][1], b0)
+                else: merged.append([a0, b0, pr])
+            def c7_at(x):
+                v = 127
+                for t, b in cc7[ch]:
+                    if t <= x: v = b
+                return v
+            for t, b in cc7[ch]:                         # the song's own CC 7 outside the LFO spans
+                if not any(a0 <= t <= b0 for a0, b0, pr in merged): add(t, 5, 0xB0 | ch, (7, lfo_level(b, 0.0)))
+            for a0, b0, pr in merged:
+                L = lfo[pr]; g = max(1, round(1.0 / (32 * L['hz']) / sp0))
+                on_ch = sorted(ons[ch]); on_set = set(on_ch)
+                pts = set(range(a0, b0 + 1, g)) | {t for t, b in cc7[ch] if a0 <= t <= b0} | {t for t in on_ch if a0 <= t <= b0}
+                if a0 <= loop_t <= b0: pts.add(loop_t)
+                last = None
+                import bisect
+                for x in sorted(pts):
+                    t_on = on_ch[max(0, bisect.bisect_right(on_ch, x) - 1)]   # the LFO restarts at each note-on
+                    i = int(256 * (((sec(x) - sec(t_on)) * L['hz']) % 1.0))
+                    p = i if i < 128 else i - 256                          # MAME's saw waveforms
+                    bend = max(0, min(127, 64 + round(L['cents'] * p / 128 / (L['pb'] * 100 / 64))))
+                    lev = lfo_level(c7_at(x), -L['db'] * (255 - i) / 256)
+                    if x == a0 or x == loop_t or x in on_set: last = None
+                    if L['cents'] and (last is None or bend != last[0]): add(x, 5, 0xE0 | ch, (0, bend))
+                    if L['db'] and (last is None or lev != last[1]): add(x, 5, 0xB0 | ch, (7, lev))
+                    last = (bend, lev)
     for t, kind, ch, a, b, c in A['ev']:
         if kind == 'note':
             off = t + c
+            if gate_frames and c:
+                fr = 1.0 / gate_frames / (A['tempos'][0][1] / 1e6 / A['res'])          # one frame in steps
+                off = t + max(1, round(c / fr)) * fr
             if looped and off > end_t: off = end_t; clipped += 1
             if c == 0: continue
             if vel_map: b = vel_map(cprog.get(ch, 0), b)
@@ -2413,6 +2487,7 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
             add(t, 6, 0x90 | ch, (a, b)); add(off, 4 if off > t else 7, 0x90 | ch, (a, 0)); nnotes += 1
         elif kind == 'cc':
             if a in drop_cc: continue
+            if a == 7 and ch in lfo_ch: continue        # written with the LFO above
             if a == 7 and cc7_map: b = cc7_map(b)
             add(t, 5, 0xB0 | ch, (a, b))
         elif kind == 'prog':
@@ -2424,17 +2499,17 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
             add(t, 5, 0xE0 | ch, (0, a))
     out.sort(key=lambda e: (e[0], e[1], e[2]))
     u0 = A['tempos'][0][1]
-    body = bytearray(b'pQES' + struct.pack('>IH', 1, A['res']) + u0.to_bytes(3, 'big') + b'\x04\x02')
+    body = bytearray(b'pQES' + struct.pack('>IH', 1, A['res'] * res_scale) + u0.to_bytes(3, 'big') + b'\x04\x02')
     t, rs = 0, None
     for et, order, _, st, data in out:
-        body += _vlq(et - t); t = et
+        body += _vlq(round(et * res_scale * time_scale) - round(t * res_scale * time_scale)); t = et
         if st == 0xFF: body += b'\xff' + data; rs = None
         else:
             if st != rs: body.append(st); rs = st
             body += data
-    body += _vlq(max(0, end_t - t)) + b'\xff\x2f\x00'
+    body += _vlq(max(0, round(end_t * res_scale * time_scale) - round(t * res_scale * time_scale))) + b'\xff\x2f\x00'
     info = dict(res=A['res'], tempo=u0, loop_t=loop_t, end_t=end_t, marks=marks, notes=nnotes, clipped=clipped,
-                channels=sorted({e[2] for e in A['ev'] if e[1] == 'note'}), size=len(body))
+                channels=sorted({e[2] for e in A['ev'] if e[1] == 'note'}), size=len(body), lfo_channels=sorted(lfo_ch))
     return bytes(body), info
 
 # ----------------------------------------------------------------- Saturn TON -> PS1 VAB
@@ -2449,6 +2524,27 @@ SCSP_DR_MS = (1e9, 1e9, 118200.0, 101300.0, 88600.0, 70900.0, 59100.0, 50700.0, 
               2200.0, 1800.0, 1600.0, 1400.0, 1100.0, 920.0, 790.0, 690.0, 550.0, 460.0, 390.0, 340.0, 270.0, 230.0,
               200.0, 170.0, 140.0, 110.0, 98.0, 85.0, 68.0, 57.0, 49.0, 43.0, 34.0, 28.0, 25.0, 22.0, 18.0, 14.0, 12.0,
               11.0, 8.5, 7.1, 6.1, 5.4, 4.3, 3.6, 3.1)      # ms for the full 96 dB envelope range (MAME scsp.cpp)
+
+SCSP_AR_MS = (1e9, 1e9, 8100.0, 6900.0, 6000.0, 4800.0, 4000.0, 3400.0, 3000.0, 2400.0, 2000.0, 1700.0, 1500.0, 1200.0,
+              1000.0, 860.0, 760.0, 600.0, 500.0, 430.0, 380.0, 300.0, 250.0, 220.0, 190.0, 150.0, 130.0, 110.0, 95.0, 76.0,
+              63.0, 55.0, 47.0, 38.0, 31.0, 27.0, 24.0, 19.0, 15.0, 13.0, 12.0, 9.4, 7.9, 6.8, 6.0, 4.7, 3.8, 3.4, 3.0, 2.4,
+              2.0, 1.8, 1.6, 1.3, 1.1, 0.93, 0.85, 0.65, 0.53, 0.44, 0.40, 0.35, 0.0, 0.0)  # attack ms (MAME scsp.cpp)
+# SCSP LFO (slot register 0x12 = TON layer bytes 0x14-0x15: LFORE 15, LFOF 14-10, PLFOWS 9-8, PLFOS 7-5, ALFOWS 4-3,
+# ALFOS 2-0): frequency (Hz), pitch depth (cents) and amplitude depth (dB) per setting (MAME scsp.cpp / scsplfo.hxx).
+SCSP_LFO_HZ = (0.17, 0.19, 0.23, 0.27, 0.34, 0.39, 0.45, 0.55, 0.68, 0.78, 0.92, 1.10, 1.39, 1.60, 1.87, 2.27, 2.73,
+               3.13, 3.65, 4.43, 5.46, 6.28, 7.33, 8.89, 10.97, 12.60, 14.69, 17.84, 21.82, 25.15, 29.40, 35.17)
+SCSP_PLFO_CENTS = tuple(round(c * 0.437, 2) for c in (0.0, 7.0, 13.5, 27.0, 55.0, 112.0, 230.0, 494.0))
+# (MAME's pitch depths scaled to the Saturn as measured in Mednafen: PLFOS 2 swings 11.2-12.6 cents peak to peak, not
+# MAME's +-13.5; the other settings are scaled the same way, *hypothesis*)
+SCSP_ALFO_DB = (0.0, 0.4, 0.8, 1.5, 3.0, 6.0, 12.0, 24.0)
+assert len(SCSP_AR_MS) == 64 and len(SCSP_LFO_HZ) == 32
+
+def scsp_lfo(w, pb):
+    """SCSP LFO register word + the voice's pitch-bend range (semitones) -> dict for sega_to_sony_seq's lfo (sawtooth
+    waveforms only, the only ones the US banks use with a depth)."""
+    pws, ps, aws, as_ = (w >> 8) & 3, (w >> 5) & 7, (w >> 3) & 3, w & 7
+    assert (pws == 0 or ps == 0) and (aws == 0 or as_ == 0) and not w & 0x8000, ('LFO waveform / reset not handled', hex(w))
+    return dict(hz=SCSP_LFO_HZ[(w >> 10) & 31], cents=SCSP_PLFO_CENTS[ps], db=SCSP_ALFO_DB[as_], pb=pb)
 
 def ton_layer(L):
     """Decode a raw 0x20-byte TON layer."""
@@ -2503,13 +2599,21 @@ SPU_SR_MEASURED_DBPS = {52: -41.6, 53: -32.4, 54: -31.5, 55: -27.0, 56: -14.46, 
 SPU_SR_BEST = [(r, SPU_SR_MEASURED_DBPS[r] / 44100 if r in SPU_SR_MEASURED_DBPS else d) for r, d in SPU_SR]
 
 def scsp_to_spu_adsr(lay, octave):
-    """SCSP EG (AR, D1R, DL, D2R, RR, key scaling at `octave`) -> PS1 (adsr1, adsr2). Attack: instant (all WOOD2 layers
-    use AR 0x1F). Decay 1 -> SPU decay at the same dB rate down to Sl (DL in 3 dB steps; the SPU's lowest sustain level is
+    """SCSP EG (AR, D1R, DL, D2R, RR, key scaling at `octave`) -> PS1 (adsr1, adsr2). Attack: AR 0x1F = instant (all
+    WOOD2 / CUT2 layers); a slower AR -> the SPU linear attack rate whose rise time is nearest the SCSP's (MAME's
+    table). Decay 1 -> SPU decay at the same dB rate down to Sl (DL in 3 dB steps; the SPU's lowest sustain level is
     -24 dB, so a deeper DL continues at the D1R slope in the sustain phase instead of D2R); D2R -> sustain decrease;
     RR -> release (SPU exponential)."""
     import math
-    assert lay['ar'] == 0x1F and not lay['eghold'] and lay['krs'] != 15
+    assert lay['ar'] >= 1 and not lay['eghold'] and lay['krs'] != 15
     base = octave + 2 * lay['krs']
+    Ar = 0
+    if lay['ar'] < 0x1F:
+        ms = SCSP_AR_MS[max(0, min(63, base + 2 * lay['ar']))]
+        if ms > 0:
+            n = ms * 44.1                                # samples to full level
+            rise = lambda r: 32767 / ((7 - (r & 3)) << max(0, 11 - (r >> 2))) * (1 << max(0, (r >> 2) - 11))
+            Ar = min(range(128), key=lambda r: abs(math.log(rise(r) / n)))
     d1 = scsp_rate_db_per_sample(lay['d1r'], base)
     d2 = scsp_rate_db_per_sample(lay['d2r'], base)
     rr = scsp_rate_db_per_sample(lay['rr'], base)
@@ -2523,7 +2627,7 @@ def scsp_to_spu_adsr(lay, octave):
         sus = d1 if (Sl + 1) / 16 > a else d2       # SPU can't go as deep as DL: keep the D1R slope below -24 dB
     Sr = 0x7F if sus == 0 else _best(SPU_SR, sus)
     Rr = _best(SPU_RR, rr) if rr < 0 else 31
-    adsr1 = 0x0000 | (0 << 8) | (Dr << 4) | Sl           # linear attack, rate 0 (instant)
+    adsr1 = 0x0000 | (Ar << 8) | (Dr << 4) | Sl          # linear attack (rate 0 = instant)
     adsr2 = 0x8000 | 0x4000 | (Sr << 6) | 0x20 | Rr       # exponential sustain decrease, exponential release
     return adsr1, adsr2
 
@@ -2664,7 +2768,7 @@ def _center_shift(key_at_44k):
     import math
     c = math.ceil(key_at_44k - 1e-9)
     sh = round((c - key_at_44k) * 128)
-    if sh == 128: c, sh = c + 1, 0
+    if sh == 128: c, sh = c - 1, 0       # a full semitone of shift = the note below, unshifted
     return c, sh
 
 def scsp_pan_db(dipan):
@@ -2692,17 +2796,47 @@ SAT_CC7_DB_PER_STEP = 0.735
 # A bank without an entry gets the general laws above and no per-voice corrections.
 MUSIC_TUNE = {
     'WOOD2.PAC': dict(
-        gain_db={0: -0.8, 1: -3.7, 2: -2.7, 3: -0.7, 4: -0.9, 5: -0.8, 6: 0.0, 7: 0.2,
+        gain_db={0: -0.8, 1: -3.7, 2: -2.7, 3: 0.6, 4: -0.9, 5: -0.8, 6: 0.0, 7: -1.1,
                  (8, 45): -1.3, (8, 67): 1.7, (8, 51): -0.3, (8, 75): 0.3, (8, 78): 0.2, (8, 77): 1.4},
-        decay_dbps={3: -10.84, 4: -2.93, 5: -2.93, 6: -8.19, 7: -8.19},  # envelope slope to set (sample's own change removed)
-        upsample={0: 2, 1: 4, 2: 4, 3: 2, 4: 0.5, 5: 0.5, 6: 2, 7: 2, 8: 2}),   # voice 0 = the one-shot sounds;
+        decay_dbps={3: -9.2, 4: -2.93, 5: -2.93, 6: -8.19, 7: -8.19},  # envelope slope to set (sample's own change removed)
+        upsample={0: 2, 1: 4, 2: 4, 3: 4, 4: 0.5, 5: 0.5, 6: 2, 7: 2, 8: 2},   # voice 0 = the one-shot sounds;
         # 4/5 at half rate: keys 80-88 asked the SPU for 4.2-6.7x and were capped at 4x (up to 9 semitones flat)
+        shelf_db={6: (9000, 3.0), 7: (9000, 3.0)},   # treble the SPU's interpolation dulls (calibration band shares)
+        seq_res_scale=10, time_scale=1.008,   # tempo: the Saturn's exact speed (libsnd alone played it 0.35 % fast)
+        gate_frames=59.94, level_db=5.6),     # whole-frame note lengths; +3.5 dB over the Saturn, like Capcom's
+                                              # own conversions (PS1 PBGM2A = Saturn BS08C + 3.6 dB)
     'CUT2.PAC': dict(       # calibration rounds in Mednafen (02 §Sound "PBGM49")
-        gain_db={0: -0.4, 1: 1.1, 2: -0.7, 3: 3.8, 4: 1.0, 5: -1.5, 6: -1.3, 7: 4.0, 8: 4.7, 9: 1.5, 10: 1.5,
+        gain_db={0: -0.4, 1: 1.1, 2: -0.7, 3: 3.8, 4: 1.0, 5: -0.3, 6: -0.1, 7: 4.0, 8: 4.7, 9: 1.5, 10: 1.5,
                  (11, 47): 0.3, (11, 51): 1.7, (11, 77): 4.4, (11, 78): 6.5},
         decay_dbps={2: -12.2, 3: -16.2, 4: -16.2, 5: -24.25, 6: -24.25, 7: -8.1, 8: -8.1, 9: -64.8, 10: -64.8},
-        decay_rate={9: 48, 10: 48},   # chosen by test (rates 47-50): the SPU's fast rates aren't in the measured table
-        upsample={0: 2, 2: 2, 3: 0.5, 4: 0.5, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2, 11: 2}),   # 0.5: stored at half rate (SPU 4x pitch cap)
+        decay_rate={9: 49, 10: 49},   # chosen by test (rates 47-50): the SPU's fast rates aren't in the measured table
+        upsample={0: 2, 1: 4, 2: 4, 3: 0.5, 4: 0.5, 5: 2, 6: 2, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4},   # 0.5: stored at half rate (SPU 4x pitch cap)
+        seq_res_scale=10, time_scale=1.002,   # tempo: the Saturn's exact speed (libsnd's 150 BPM step played it 0.2 % fast)
+        gate_frames=59.94, level_db=6.5),     # whole-frame note lengths; +4.1 dB over the Saturn (see WOOD2)
+    'ST03A.PAC': dict(      # Tengu Man stage (Saturn); 3 calibration rounds in Mednafen (reference 02b, ST03A)
+        gain_db={1: 3.8, 2: 5.6, 3: -0.4, 4: -0.4, 5: -6.0, 6: -5.1, 7: 0.2, 8: -0.4, 9: 0.0, 10: 0.0, 11: 0.7, 12: 1.3,
+                 13: -4.3, 14: -4.6, 15: -6.1, (16, 45): -0.6, (16, 67): -2.4, (16, 77): -4.9, (16, 79): 1.1,
+                 (16, 86): -0.5, (16, 87): -0.7, (16, 88): -0.4},
+        decay_dbps={2: -4.1, 3: -4.1, 4: -4.1, 5: -1.9, 6: -25.1, 7: -17.5, 8: -17.5, 9: -12.4, 10: -12.4, 11: -1.8,
+                    12: -1.8, 13: -97.0, 14: -97.0, 15: -97.0},
+        upsample={1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 11: 2, 12: 2, 16: 2},   # within the SPU room (reference 02b)
+        shelf_db={2: (8000, 2.5), 3: (8000, 2.5), 4: (8000, 2.5), 5: (10000, 6.0), 6: (9000, 4.0), 7: (9000, 5.0),
+                  8: (9000, 5.0), 9: (10000, 6.0), 10: (10000, 6.0), 11: (6000, 1.0), 12: (6000, 1.0), 13: (8000, 2.0),
+                  14: (8000, 2.0), 15: (8000, 2.0), 16: (3000, 5.0), (16, 45): None, (16, 79): None,
+                  (16, 86): (5000, 3.0), (16, 87): (5000, 3.0), (16, 88): (5000, 3.0)},
+        # treble lifts (Hz, dB) at the played pitch for what the SPU's interpolation dulls; set from the calibration's
+        # band shares, no SPU room needed (voice 1: its sample has no top end to lift; the Saturn's comes from
+        # interpolation images, which only a higher stored rate gives)
+        reverb=False,       # the Saturn's DSP effect on voices 13-15 is inaudible (tail 56 dB down); the PS1 Room
+                            # reverb made them 17 dB brighter
+        seq_res_scale=10,   # libsnd's rate steps: resolution 48 played 1.6 % fast, 96 0.45 % slow, 480 = the Saturn's speed
+        gate_frames=59.94,  # note lengths in whole frames (libsnd's step): short bass notes kept their length
+        release_rate={2: 7, 3: 7, 4: 7},   # their note-end fade: 20 ms on the Saturn, 10 ms with rate 6
+        level_db=11.0,      # as loud as the PS1's own Tengu Man music (PBGM05; a straight conversion was 11.8 dB
+                            # quieter); the most the samples allow without changing the balance between voices
+        vel_db={'melodic': SAT_VEL_DB,   # drum kit: libsnd fell 0.4-1.8 dB short of the Saturn at velocities 64-115
+                'drum': [(0, -90.0), (40, -48.6), (50, -41.2), (64, -23.4), (72, -17.0), (80, -11.3), (86, -6.6),
+                         (90, -3.4), (100, -4.2), (110, -0.7), (115, -0.2), (120, 0.0), (127, 0.0)]}),
     # Tempo: the Saturn plays 1.25 % below the SEQ's nominal tempo, libsnd 0.90 %; libsnd's tempo is quantised (a 0.35 %
     # change of the SEQ tempo didn't change its speed), so the 0.35 % difference stays.
 }
@@ -2730,7 +2864,7 @@ def _libsnd_level(db):
     return max(1, min(127, round(127 * 10 ** (db / 40))))
 
 @_memo
-def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=None, cal_keys=False):
+def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=None, cal_keys=False, ps1_sfx=False):
     """New PS1 music bank (PBGM47 from WOOD2, later PBGM49 from CUT2) converted from a whole Saturn sound bank:
       - SEQ: song 0 -> Sony SEQ (sega_to_sony_seq; channels and program numbers unchanged).
       - VAB: Saturn voice v (music, 1..15) -> program v, one tone per TON layer (key range, base note + fine -> centre +
@@ -2739,6 +2873,9 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
         multiple of 28 (vag_encode_loop)); program 0 = Capcom's dummy; voice 0 (one-shot sounds) -> program 16 like
         build_boss_intro_bank (tone k -> key 60 + k, muted level-0 layers left out).
       - sound-ID table: the PS1 entry rule (reference §Sound).
+      ps1_sfx: keep the PS1's own stage sounds instead (a bank that replaces an existing PS1 song, ST03A for PBGM05):
+        program 16 = that PBGM's program 16 (tones and ADPCM copied) and its sound-ID table as it is; a music voice 16
+        then goes to program 17.
     Program/tone attribute filler bytes are copied from Capcom's PBGM2A (tpl_n). Returns (pac bytes, info)."""
     import math, statistics
     bank = sat_sound_bank(sat_name)['bank']
@@ -2754,9 +2891,11 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
         elif e[1] == 'note' and e[2] in prog_of: keys_of[prog_of[e[2]]].append(e[3])
     tune = MUSIC_TUNE.get(sat_name, {}) if tune is None else tune
     empty_tone = bytes(tv['tones'][6][0])
-    progs = [bytearray(tv['progs'][6]) for _ in range(17)]
-    tones = [[bytearray(empty_tone) for _ in range(16)] for _ in range(17)]
-    for p in range(17):
+    NP = 18 if 16 in keys_of else 17                   # a music voice 16 (ST03A's drum kit) -> program 17
+    pv_of = lambda v: 17 if v == 16 else v
+    progs = [bytearray(tv['progs'][6]) for _ in range(NP)]
+    tones = [[bytearray(empty_tone) for _ in range(16)] for _ in range(NP)]
+    for p in range(NP):
         for k in range(16): tones[p][k][20:22] = struct.pack('<h', p)
     vags, vag_of = [], {}
     info = dict(bank=bank, layers=[], muted=[], sfx=[])
@@ -2765,18 +2904,61 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
     music = [(v, hdr, [ton_layer(r) for r in raws]) for v, (hdr, raws) in enumerate(voices) if v > 0]
     used = [L for v, hdr, ls in music if v in keys_of for L in ls if L['disdl']]
     a_ref = min(att(L) for L in used)
-    want = {}
+    # level_db (tune): raise the whole bank by that many dB (Capcom's PS1 banks are louder than a straight conversion):
+    # program volume 127 instead of the template's, the rest as sample gain per sample (S, within its peak headroom),
+    # so the tone volumes stay <= 127 and the calibrated balance between voices is kept
+    LV = tune.get('level_db'); S_of = {}; pv_up = 0.0
+    if LV is not None:
+        pv_up = 40 * math.log10(127 / tv['progs'][0][1])
+        for v, hdr, ls in music:
+            if v not in keys_of: continue
+            up_ = tune.get('upsample', {}).get(v, 1)
+            for L in ls:
+                if L['disdl'] == 0: continue
+                g = tune.get('gain_db', {}); g = g.get((v, L['lo']), g.get(v, 0.0))
+                T = -2 * (att(L) - a_ref) + g + LV            # output dB re tone 127 (libsnd: 40 log10 of the tone value)
+                key = (L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up_)
+                peak = max(1, max(abs(x) for x in ton_pcm(t, L)))
+                head = 20 * math.log10(32767 / peak) - 0.5
+                S_of[key] = max(0.0, min(head, max(S_of.get(key, 0.0), T - pv_up)))
+    want = {}; lfo = {}
+    pp = {}; bent = set()
+    for e in A['ev']:
+        if e[1] == 'prog': pp[e[2]] = e[3]
+        elif e[1] == 'bend' and e[2] in pp: bent.add(pp[e[2]])
     for v, hdr, ls in music:
         if v not in keys_of: continue                     # voice not played by the song
-        assert v < 16 and len(ls) <= 16
+        assert v < 17 and len(ls) <= 16
         mk = statistics.median_low(keys_of[v])
         n_t = 0
+        lw = {L['mod'][4:6] for L in ls if L['disdl']}
+        assert len(lw) <= 1, (v, 'layers with different LFOs')
+        if lw and any(next(iter(lw))):
+            pb_v = 1 if v not in bent else hdr[0]   # never bent by the song: 1 semitone, finer steps for the LFO
+            lfo[v] = scsp_lfo(struct.unpack('>H', next(iter(lw)))[0], pb_v)
         for L in ls:
-            assert L['ssctl'] == 0 and L['lpctl'] in (0, 1) and not any(L['mod']) and not any(L['extra']), (v, L)
+            # modulation bytes: only the LFO word (0x14-0x15) and the DSP send IMXL (0x17 bits 0-2, ISEL 0) handled
+            assert L['ssctl'] == 0 and L['lpctl'] in (0, 1) and not any(L['mod'][:4]) and L['mod'][6] == 0 \
+                and not L['mod'][7] & 0xF8 and not any(L['extra']), (v, L)
             if L['disdl'] == 0: info['muted'].append((v, L['lo'])); continue
             pcm = ton_pcm(t, L)
             key44 = L['base'] - L['fine'] / 256.0          # key at which the sample plays at 44.1 kHz
             up = tune.get('upsample', {}).get(v, 1)
+            sh_ = tune.get('shelf_db', {}); sh_ = sh_.get((v, L['lo']), sh_.get(v))   # (Hz, dB): treble lift above Hz at the played pitch (per drum key or voice; None = none)
+            if sh_:
+                import numpy as np
+                kk = L['lo'] if L['lo'] == L['hi'] else mk                    # drum key, or the voice's median key
+                fs = 44100 * 2 ** ((kk - L['base'] + L['fine'] / 256) / 12)    # output rate of this sample there
+                def lift(a):
+                    X = np.fft.rfft(np.asarray(a, float)); f = np.fft.rfftfreq(len(a), 1 / fs)
+                    return np.fft.irfft(X * (1 + (10 ** (sh_[1] / 20) - 1) * f ** 2 / (f ** 2 + sh_[0] ** 2)), len(a))
+                if L['lpctl'] == 0: y = lift(pcm)
+                else:                    # loop kept seamless: filter attack + 4 loop passes, keep a steady pass
+                    n0, n1 = L['lsa'], L['lea']; lp = list(pcm[n0:n1]); e = lift(list(pcm[:n0]) + lp * 4)
+                    y = np.concatenate([e[:n0], e[n0 + 2 * len(lp):n0 + 3 * len(lp)]])
+                pcm = [int(max(-32768, min(32767, round(x)))) for x in y]
+            S = S_of.get((L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up), 0.0)
+            if S: pcm = [max(-32768, min(32767, round(x * 10 ** (S / 20)))) for x in pcm]
             down = 1.0
             if up < 1:
                 # stored at a lower rate (looped voices only, through the loop resampler): the SPU's pitch is capped at
@@ -2791,7 +2973,7 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
                 pcm = _upsample_linear(pcm, up)
                 L = dict(L, lsa=L['lsa'] * up, lea=L['lea'] * up)
                 key44 -= 12 * math.log2(up)   # more samples per period: same pitch needs a higher rate
-            vk = (L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up, down)
+            vk = (L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up, down)   # (a shared sample: lifted at its first key's pitch)
             if vk not in vag_of:
                 if L['lpctl'] == 1:
                     ln = L['lea'] - L['lsa']
@@ -2811,29 +2993,43 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
             dd = tune.get('decay_dbps', {}).get(v)
             if dd is not None:                                     # measured: one exponential slope from key-on
                 sr = tune.get('decay_rate', {}).get(v, _best(SPU_SR_BEST, dd / 44100))   # or an SPU rate chosen by test
-                a1 = 0x00FF; a2 = 0xC000 | (sr << 6) | 0x20 | (a2 & 0x1F)
+                a1 = (a1 & 0x7F00) | 0x00FF; a2 = 0xC000 | (sr << 6) | 0x20 | (a2 & 0x1F)   # keeps the attack
+            if v in tune.get('release_rate', {}): a2 = (a2 & ~0x1F) | tune['release_rate'][v]   # measured note-end fade
             tn = bytearray(empty_tone)
-            tn[0] = 0; tn[1] = 0
+            tn[0] = 0; tn[1] = 4 if L['mod'][7] & 7 and tune.get('reverb', True) else 0   # DSP send -> libsnd reverb (the game's Room reverb)
             g = tune.get('gain_db', {}); g = g.get((v, L['lo']), g.get(v, 0.0))
             want[(v, n_t)] = 127 * 10 ** (-(att(L) - a_ref) / 20) * 10 ** (g / 40)
+            if LV is not None: want[(v, n_t)] *= 10 ** ((LV - pv_up - S) / 40)    # the rest of level_db after S
             tn[2] = max(1, min(127, round(want[(v, n_t)])))
             tn[3] = scsp_pan(L['dipan']); tn[4] = c; tn[5] = sh; tn[6] = L['lo']; tn[7] = L['hi']
-            tn[8:12] = bytes(4); tn[12] = tn[13] = hdr[0]
-            tn[16:24] = struct.pack('<2H2h', a1, a2, v, vi)
-            tones[v][n_t] = tn; n_t += 1
+            tn[8:12] = bytes(4); tn[12] = tn[13] = lfo[v]['pb'] if v in lfo else hdr[0]
+            tn[16:24] = struct.pack('<2H2h', a1, a2, pv_of(v), vi)
+            tones[pv_of(v)][n_t] = tn; n_t += 1
             info['layers'].append(dict(voice=v, keys=(L['lo'], L['hi']), vag=vi, loop=L['lpctl'], vol=tn[2], pan=tn[3],
                                        center=c, shift=sh, adsr=(a1, a2), pb=hdr[0], median_key=mk))
-        progs[v] = bytearray(tv['progs'][0]); progs[v][0] = n_t
+        progs[pv_of(v)] = bytearray(tv['progs'][0]); progs[pv_of(v)][0] = n_t
     mx = max(want.values())
-    if mx > 127:                          # tuned volumes above 127: scale the music tones down, program volume up
+    if LV is not None:
+        for vv in {vv for vv, n in want}: progs[pv_of(vv)][1] = 127
+        info['level'] = dict(level_db=LV, prog=pv_up, sample_db=sorted(S_of.values()), short_db=max(0.0, 40 * math.log10(mx / 127)))
+        for (vv, n), w in want.items(): tones[pv_of(vv)][n][2] = max(1, min(127, round(w)))
+    elif mx > 127:                          # tuned volumes above 127: scale the music tones down, program volume up
         mvol = min(127, round(tv['progs'][0][1] * mx / 127))
-        for (vv, n), w in want.items(): tones[vv][n][2] = max(1, min(127, round(w * 127 / mx)))
-        for vv in {vv for vv, n in want}: progs[vv][1] = mvol
+        for (vv, n), w in want.items(): tones[pv_of(vv)][n][2] = max(1, min(127, round(w * 127 / mx)))
+        for vv in {vv for vv, n in want}: progs[pv_of(vv)][1] = mvol
         info['mvol'] = mvol
-    # ---- voice 0: one-shot sounds -> program 16 (as build_boss_intro_bank)
+    # ---- voice 0: one-shot sounds -> program 16 (as build_boss_intro_bank), or the PS1 bank's own
     hdr0, raws0 = voices[0]
     tone_of = {}
-    for r in raws0:
+    if ps1_sfx:
+        own = ps1_pbgm(bank - 1); ov = vab_split(own[4], own[0x201]); new_vi = {}
+        for k in range(ov['progs'][16][0]):
+            tn = bytearray(ov['tones'][16][k]); vi = struct.unpack('<h', tn[22:24])[0]
+            if vi not in new_vi: vags.append(ov['vags'][vi - 1]); new_vi[vi] = len(vags)
+            tn[22:24] = struct.pack('<h', new_vi[vi]); tones[16][k] = tn
+        progs[16] = bytearray(ov['progs'][16])
+        info['sfx'] = [('ps1', bank - 1, k) for k in range(ov['progs'][16][0])]
+    for r in ([] if ps1_sfx else raws0):
         L = ton_layer(r); k = L['lo']
         assert L['lo'] == L['hi'] and L['lpctl'] == 0 and L['pcm8']
         if L['disdl'] == 0: info['muted'].append((0, k)); continue
@@ -2851,25 +3047,29 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
         tn[6] = tn[7] = key; tn[20:24] = struct.pack('<2h', 16, vag_of[vk][0])
         tones[16][tone_of[k]] = tn
         info['sfx'].append((k, key, c, sh, len(ton_pcm(t, L))))
-    progs[16] = bytearray(tv['progs'][16]); progs[16][0] = len(tone_of)
+    if not ps1_sfx: progs[16] = bytearray(tv['progs'][16]); progs[16][0] = len(tone_of)
     drums = {vv for vv, hdr, ls in music if vv in keys_of and not all(L['lo'] == 0 for L in ls)}
     vel_db = tune.get('vel_db', {'melodic': SAT_VEL_DB}); k7 = tune.get('cc7_db_per_step', SAT_CC7_DB_PER_STEP)
     vel_map = lambda p, vel: _libsnd_level(_interp_db(vel_db.get('drum' if p in drums else 'melodic', vel_db['melodic']), vel))
     cc7_map = lambda c: _libsnd_level(-k7 * (127 - c))
+    pm = {**({0: 16} if cal_keys else {}), **({16: 17} if NP == 18 else {})}
     seq, sinfo = sega_to_sony_seq(seq_song or song, cc7_map=cc7_map, vel_map=vel_map, tempo_scale=tune.get('tempo_factor', 1.0),
-                                  prog_map={0: 16} if cal_keys else None,
+                                  prog_map=pm or None, lfo=lfo or None, res_scale=tune.get('seq_res_scale', 1),
+                                  gate_frames=tune.get('gate_frames'), time_scale=tune.get('time_scale', 1.0),
+                                  lfo_level=lambda c, db: _libsnd_level(-k7 * (127 - c) + db),
                                   key_map=(lambda p, k: 60 + tone_of.get(k, 0) if p == 0 else k) if cal_keys else None)
     info['seq'] = sinfo
     head = bytearray(tv['head'])
     allp = [bytearray(16) for _ in range(128)]
-    for p in range(17): allp[p] = progs[p]
-    for p in range(17, 128): allp[p] = bytearray(tv['progs'][p])
+    for p in range(NP): allp[p] = progs[p]
+    for p in range(NP, 128): allp[p] = bytearray(tv['progs'][p])
     head[0x14:0x16] = struct.pack('<H', sum(pr[0] for pr in progs))
     v = dict(head=head, progs=allp, tones=tones, vags=vags)
     vhdr, body = vab_join(v)
-    pac = pac_build([(5, sound_id_table(sat_name, len(tpl[5]), tone_of)), (4, vhdr), (0x201, body), (1, seq)])
-    info.update(hdr=len(vhdr), body=len(body), seq_size=len(seq), size=len(pac), vags=len(vags), tones=dict(
-        (p, progs[p][0]) for p in range(17) if progs[p][0] and progs[p][1]))
+    ids = own[5] if ps1_sfx else sound_id_table(sat_name, len(tpl[5]), tone_of)
+    pac = pac_build([(5, ids), (4, vhdr), (0x201, body), (1, seq)])
+    info.update(hdr=len(vhdr), body=len(body), seq_size=len(seq), size=len(pac), vags=len(vags), lfo=lfo, tones=dict(
+        (p, progs[p][0]) for p in range(NP) if progs[p][0] and progs[p][1]))
     return pac, info
 
 
