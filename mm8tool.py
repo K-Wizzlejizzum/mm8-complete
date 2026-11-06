@@ -2803,6 +2803,8 @@ MUSIC_TUNE = {
         # 4/5 at half rate: keys 80-88 asked the SPU for 4.2-6.7x and were capped at 4x (up to 9 semitones flat)
         shelf_db={6: (9000, 3.0), 7: (9000, 3.0)},   # treble the SPU's interpolation dulls (calibration band shares)
         seq_res_scale=10, time_scale=1.008,   # tempo: the Saturn's exact speed (libsnd alone played it 0.35 % fast)
+        key_split={1: [(0, 52, {'upsample': 8}), (53, 127, {})],      # low bass notes: the Saturn's images need 8x
+                   3: [(0, 77, {}), (78, 127, {'gain_db': -1.8})]},      # its top notes 1.8 dB loud
         gate_frames=59.94, level_db=5.6),     # whole-frame note lengths; +3.5 dB over the Saturn, like Capcom's
                                               # own conversions (PS1 PBGM2A = Saturn BS08C + 3.6 dB)
     'CUT2.PAC': dict(       # calibration rounds in Mednafen (02 §Sound "PBGM49")
@@ -2812,10 +2814,14 @@ MUSIC_TUNE = {
         decay_rate={9: 49, 10: 49},   # chosen by test (rates 47-50): the SPU's fast rates aren't in the measured table
         upsample={0: 2, 1: 4, 2: 4, 3: 0.5, 4: 0.5, 5: 2, 6: 2, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4},   # 0.5: stored at half rate (SPU 4x pitch cap)
         seq_res_scale=10, time_scale=1.002,   # tempo: the Saturn's exact speed (libsnd's 150 BPM step played it 0.2 % fast)
+        key_split={1: [(0, 48, {}), (49, 127, {'upsample': 2})],      # bass: 4x only where its low notes need it
+                   3: [(0, 71, {'decay_dbps': -11.6}), (72, 127, {'decay_dbps': -17.4})],   # the Saturn's decay is
+                   4: [(0, 71, {'decay_dbps': -14.8}), (72, 127, {'decay_dbps': -23.0})],   # faster from key 72 up
+                   7: [(0, 61, {'upsample': 4}), (62, 127, {})], 8: [(0, 61, {'upsample': 4}), (62, 127, {})]},
         gate_frames=59.94, level_db=6.5),     # whole-frame note lengths; +4.1 dB over the Saturn (see WOOD2)
     'ST03A.PAC': dict(      # Tengu Man stage (Saturn); 3 calibration rounds in Mednafen (reference 02b, ST03A)
         gain_db={1: 3.8, 2: 5.6, 3: -0.4, 4: -0.4, 5: -6.0, 6: -5.1, 7: 0.2, 8: -0.4, 9: 0.0, 10: 0.0, 11: 0.7, 12: 1.3,
-                 13: -4.3, 14: -4.6, 15: -6.1, (16, 45): -0.6, (16, 67): -2.4, (16, 77): -4.9, (16, 79): 1.1,
+                 13: -6.6, 14: -6.9, 15: -6.6, (16, 45): -0.6, (16, 67): -2.4, (16, 77): -4.9, (16, 79): 1.1,
                  (16, 86): -0.5, (16, 87): -0.7, (16, 88): -0.4},
         decay_dbps={2: -4.1, 3: -4.1, 4: -4.1, 5: -1.9, 6: -25.1, 7: -17.5, 8: -17.5, 9: -12.4, 10: -12.4, 11: -1.8,
                     12: -1.8, 13: -97.0, 14: -97.0, 15: -97.0},
@@ -2831,6 +2837,10 @@ MUSIC_TUNE = {
                             # reverb made them 17 dB brighter
         seq_res_scale=10,   # libsnd's rate steps: resolution 48 played 1.6 % fast, 96 0.45 % slow, 480 = the Saturn's speed
         gate_frames=59.94,  # note lengths in whole frames (libsnd's step): short bass notes kept their length
+        key_split={**{v: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})] for v in (13, 14, 15)},
+                   11: [(0, 69, {}), (70, 127, {'gain_db': 1.4})]},
+        # 13-15: the Saturn decays them at -98 dB/s, -129 from key 77; SPU rates 47 / 46 measure -92 / -135 (the
+        # rate model's choice, 44, decayed at -490); 11: its top notes 1.4 dB quiet
         release_rate={2: 7, 3: 7, 4: 7},   # their note-end fade: 20 ms on the Saturn, 10 ms with rate 6
         level_db=11.0,      # as loud as the PS1's own Tengu Man music (PBGM05; a straight conversion was 11.8 dB
                             # quieter); the most the samples allow without changing the balance between voices
@@ -2936,14 +2946,21 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
         if lw and any(next(iter(lw))):
             pb_v = 1 if v not in bent else hdr[0]   # never bent by the song: 1 semitone, finer steps for the LFO
             lfo[v] = scsp_lfo(struct.unpack('>H', next(iter(lw)))[0], pb_v)
-        for L in ls:
+        segs = []           # key_split (tune): {voice: [(lo, hi, overrides)]} -> one tone per layer and key range, with
+        for L in ls:        # its own gain_db / decay_dbps / decay_rate / upsample (the Saturn's level, decay and top end
+            sp = tune.get('key_split', {}).get(v)          # change with pitch; one PS1 tone can't follow that)
+            if not sp or L['lo'] == L['hi']: segs.append((L, {})); continue
+            for a_, b_, ov in sp:
+                lo_, hi_ = max(L['lo'], a_), min(L['hi'], b_)
+                if lo_ <= hi_: segs.append((dict(L, lo=lo_, hi=hi_), ov))
+        for L, ov in segs:
             # modulation bytes: only the LFO word (0x14-0x15) and the DSP send IMXL (0x17 bits 0-2, ISEL 0) handled
             assert L['ssctl'] == 0 and L['lpctl'] in (0, 1) and not any(L['mod'][:4]) and L['mod'][6] == 0 \
                 and not L['mod'][7] & 0xF8 and not any(L['extra']), (v, L)
             if L['disdl'] == 0: info['muted'].append((v, L['lo'])); continue
             pcm = ton_pcm(t, L)
             key44 = L['base'] - L['fine'] / 256.0          # key at which the sample plays at 44.1 kHz
-            up = tune.get('upsample', {}).get(v, 1)
+            up = ov.get('upsample', tune.get('upsample', {}).get(v, 1))
             sh_ = tune.get('shelf_db', {}); sh_ = sh_.get((v, L['lo']), sh_.get(v))   # (Hz, dB): treble lift above Hz at the played pitch (per drum key or voice; None = none)
             if sh_:
                 import numpy as np
@@ -2990,14 +3007,15 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
             rate_at_mk = 44100 * 2 ** ((mk - key44) / 12)
             octave = math.floor(math.log2(rate_at_mk / 44100))
             a1, a2 = scsp_to_spu_adsr(L, octave)
-            dd = tune.get('decay_dbps', {}).get(v)
-            if dd is not None:                                     # measured: one exponential slope from key-on
-                sr = tune.get('decay_rate', {}).get(v, _best(SPU_SR_BEST, dd / 44100))   # or an SPU rate chosen by test
+            dd = ov.get('decay_dbps', tune.get('decay_dbps', {}).get(v))
+            if dd is not None or 'decay_rate' in ov:               # measured: one exponential slope from key-on
+                sr = ov.get('decay_rate', tune.get('decay_rate', {}).get(v) if 'decay_dbps' not in ov else None)
+                if sr is None: sr = _best(SPU_SR_BEST, dd / 44100)  # or an SPU rate chosen by test
                 a1 = (a1 & 0x7F00) | 0x00FF; a2 = 0xC000 | (sr << 6) | 0x20 | (a2 & 0x1F)   # keeps the attack
             if v in tune.get('release_rate', {}): a2 = (a2 & ~0x1F) | tune['release_rate'][v]   # measured note-end fade
             tn = bytearray(empty_tone)
             tn[0] = 0; tn[1] = 4 if L['mod'][7] & 7 and tune.get('reverb', True) else 0   # DSP send -> libsnd reverb (the game's Room reverb)
-            g = tune.get('gain_db', {}); g = g.get((v, L['lo']), g.get(v, 0.0))
+            g = tune.get('gain_db', {}); g = g.get((v, L['lo']), g.get(v, 0.0)) + ov.get('gain_db', 0.0)
             want[(v, n_t)] = 127 * 10 ** (-(att(L) - a_ref) / 20) * 10 ** (g / 40)
             if LV is not None: want[(v, n_t)] *= 10 ** ((LV - pv_up - S) / 40)    # the rest of level_db after S
             tn[2] = max(1, min(127, round(want[(v, n_t)])))
