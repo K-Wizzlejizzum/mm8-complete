@@ -2007,7 +2007,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update({k if k.startswith('pac09') else 'm4_' + k: v for k, v in m4.items()})
     m8t = patch_m8_tengu_bank(disc, nxt); nxt += m8t['tengu_sectors']               # M8t3: the Saturn Tengu Man bank
     info.update(m8t)
-    m7 = patch_m7a(disc, nxt, workdir, info['vf0']); nxt += m7['m7_sectors']          # M7a/M7b: title BONUS MODE, bonus overlay, SLABO
+    m7 = patch_m7a(disc, nxt, workdir, info['vf0'], (m8t['tengu_lba'], m8t['tengu_size'])); nxt += m7['m7_sectors']          # M7a/M7b: title BONUS MODE, bonus overlay, SLABO
     info.update({'m7_' + k: v for k, v in m7.items()})
     patch_music_hook(disc, info['vf0'])
     patch_sound_guard(disc)
@@ -2122,6 +2122,9 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     mo = i7['music_vf_off']                       # M7e: the overlay's copy of the music 0x46-0x49 entries = the stage overlays'
     assert [struct.unpack_from('<3I', bonus, mo + 12 * k) for k in range(4)] == [next(iter(vf[m])) for m in range(0x46, 0x4A)], 'bonus music entries'
     want_bonus[mo:mo + 48] = bonus[mo:mo + 48]
+    eo = i7['e28_off']                            # M8t5: the sound test's two music-5 entries
+    assert bonus[eo:eo + 16] == struct.pack('<4I', *od.file_entry(PS1_TENGU_FILE)[:2], *tg), 'bonus music 5 entries'
+    want_bonus[eo:eo + 16] = bonus[eo:eo + 16]
     assert demo == bytes(want_demo) and bonus == bytes(want_bonus), 'DEMO.BIN / bonus overlay'
     assert sl == vl + (vs + 2047) // 2048 and disc.read(sl, ss) == m7b_slabo_pac(), 'converted SLABO.PAC'
     il0 = sl + (ss + 2047) // 2048                       # M7c: ILL00-29 follow SLABO, 33 sectors each
@@ -3663,7 +3666,7 @@ def patch_title_menu(disc, title_hook, title_confirm):
     disc.exe_write(PS1_TITLE_GROUPS + 7, bytes([18]))   # group 3 (menu shown at once, e.g. back from Bonus Mode): 12..18
     return dict(title_cursor=cur, title_recs=recs)
 
-def patch_m7a(disc, lba, workdir=None, vf0=None):
+def patch_m7a(disc, lba, workdir=None, vf0=None, tengu=None):
     """M7a: DEMO.BIN rebuilt in its own slot (file-table entry 8 + ISO record: new size), the bonus overlay written to
     the free sectors at `lba` (reached through the virtual entry in DEMO.BIN), title-menu EXE patches. Returns info."""
     e = disc.file_entry(PS1_DEMO_FILE)
@@ -3687,6 +3690,8 @@ def patch_m7a(disc, lba, workdir=None, vf0=None):
     l9, s9, _ = disc.file_entry(PS1_STAGE09_FILE); o9 = disc.read(l9, s9)[M7E_MUSIC_VF - Ps1.OVL_BASE:][:48]
     assert len(o9) == 48 and all(struct.unpack_from('<3I', o9, 12 * k)[2] == 4 for k in range(4))
     bonus[info['music_vf_off']:info['music_vf_off'] + 48] = o9
+    if tengu is None: tengu = find_m8_tengu_bank(disc)       # M8t5: music 5's file entry, PS1 then the Saturn bank
+    bonus[info['e28_off']:info['e28_off'] + 16] = struct.pack('<4I', *disc.file_entry(PS1_TENGU_FILE)[:2], *tengu)
     bonus = bytes(bonus)
     new[info['vf_off']:info['vf_off'] + 12] = struct.pack('<3I', lba, len(bonus), 5)
     assert disc.read(e[0] + 0, PS1_DEMO_SLOT * 2048)[e[1]:] == bytes(PS1_DEMO_SLOT * 2048 - e[1])
@@ -3878,7 +3883,28 @@ extern void ps1_task_exit(void);                    /* 0x800F7F00: end the calli
 #define SND_BUSY   (*(volatile u8 *)0x801CF53C)
 static u16 st_pending __attribute__((section(".data"))) = 0;   /* Saturn 0x060733C8: the sound to play once the bank is in */
 __attribute__((noinline, noipa)) u32 h_0027b0f8(u32 st, u32 b, u32 c, u32 d) { bonus_st(st); return 0; }
-__attribute__((noinline, noipa)) u32 h_00209088(u32 n, u32 v, u32 c, u32 d) { bonus_sndplay(n, v); return 0; }
+/* M8t5: the sound test has one more entry than the Saturn's: Tengu Man's stage twice, the PS1's song (TENGU_ST_) and the
+   Saturn's (TENGU_ST_ + 1). Both play music 5 (the Saturn table's entry); before playing, music 5's file-table entry is
+   set to the chosen version's file (bonus_e28: PS1 LBA / size from the user's disc, then the converted bank's), and a
+   loaded music 5 is marked unloaded so play_bgm reads the other file. Later entries play the Saturn table's entry n - 1.
+   bonus_main puts back the entry it found when Bonus Mode is left. */
+extern char bonus_e28[];                            /* linker symbol: address of the 4 words (filled in by the build) */
+#define TENGU_ENTRY ((volatile u32 *)TENGU_FILE_ENTRY_)
+__attribute__((noinline, noipa)) u32 h_00209088(u32 n, u32 v, u32 c, u32 d)
+{
+  n &= 0xFF;
+  if (v == 0 && n >= TENGU_ST_) {
+    if (n <= TENGU_ST_ + 1) {
+      const volatile u32 *e = (const volatile u32 *)bonus_e28 + 2 * (n - TENGU_ST_);
+      if (!SND_BUSY && TENGU_ENTRY[0] != e[0]) {
+        TENGU_ENTRY[0] = e[0]; TENGU_ENTRY[1] = e[1];
+        if (BANK_NUM == TENGU_MUSIC_) BANK_NUM = 0xFF;   /* play_bgm reloads only when the music number changes */
+      }
+      n = TENGU_ST_;
+    } else n--;
+  }
+  bonus_sndplay(n, v); return 0;
+}
 /* Saturn CD-DA status / stop (0x06017804 reads the CD status word into r4; 0x060171C0 / 0x06017AB8 stop CD-DA play when
    it is nonzero). Nothing in the PS1 front end plays CD audio (the title music is sequence 0x10), so the status is 0. */
 __attribute__((noinline, noipa)) u32 h_06017804(u32 p, u32 b, u32 c, u32 d) { *(u16 *)p = 0; return 0; }
@@ -4140,6 +4166,7 @@ __attribute__((noinline, noipa)) u32 h_002761dc(u32 a, u32 b, u32 c, u32 d) { bo
 extern void bonus_menu(u32);
 extern void ps1_stop_bgm(void);
 extern char bonus_music_vf[];                       /* linker symbol: address of the music entries in this overlay's file */
+extern u32 st_anim[];                                /* M8t5: the sound test's name animation (33 steps, generated) */
 void bonus_main(void)
 {
   u32 k;
@@ -4149,7 +4176,15 @@ void bonus_main(void)
   /* M7e: the music virtual entries 0x46-0x49 (the same as the stage overlays'; filled in by the build) where the play_bgm
      hook reads them, for the sound test's CUTMAN STAGE / WOODMAN STAGE (music 0x49 / 0x47) */
   for (k = 0; k < 12; k++) ((volatile u32 *)0x801E4658)[k] = ((volatile u32 *)bonus_music_vf)[k];
-  bonus_menu(0);                               /* Saturn 0x27AAD0: runs until its state 5 (EXIT) */
+  {
+    /* M8t5: the sound-test names play as steps of set 0xAD's animation 0; the 33-step list (Tengu Man's stage twice)
+       replaces the EXE's 32-step one while Bonus Mode runs, and music 5's file-table entry is put back afterwards */
+    volatile u32 *anim = (volatile u32 *)ST_ANIM_PTR_;
+    u32 a0 = *anim, e0 = TENGU_ENTRY[0], e1 = TENGU_ENTRY[1];
+    *anim = (u32)st_anim;
+    bonus_menu(0);                             /* Saturn 0x27AAD0: runs until its state 5 (EXIT) */
+    *anim = a0; TENGU_ENTRY[0] = e0; TENGU_ENTRY[1] = e1;
+  }
 }
 '''
 M7B_GLUE_SYMS = dict(ps1_yield=0x800F7ECC, ps1_stream=0x800FB9C0, ps1_load_done=0x800FC1E0, ps1_stop_bgm=0x800FCD84, ps1_movie=0x800FD444, ps1_flush_cache=0x800D78EC,
@@ -4299,9 +4334,130 @@ def m7b_lift():
             .replace('LETTER_OFFS', '{' + ', '.join(f'{sp[0] << 24 | sp[1]:#x}' for sp in lspans) + '}').replace('LETTER_NFILES', str(len(lfiles)))
             .replace('BONUS_RAM_SIZE', str(port.ram_len)).replace('PAD_OFF', str(pad_off)).replace('VDP_OFF', str(vdp_off)).replace('ILL_CARDS', cards)
             .replace('PAD_MAP', '{' + ', '.join(f'{{{p:#x}, {s:#x}}}' for p, s in M7B_PAD_MAP) + '}'))
+    sn = m8s_names()                                # M8t5: sound test with both Tengu Man stage songs
+    glue = (glue.replace('TENGU_ST_', str(sn['entry'])).replace('TENGU_FILE_ENTRY_', f'{PS1_FILETAB + 12 * PS1_TENGU_FILE:#x}')
+            .replace('TENGU_MUSIC_', str(PS1_TENGU_MUSIC)).replace('ST_ANIM_PTR_', f"{sn['anim_ptr']:#x}"))
+    glue += ('\nu32 st_anim[%d] __attribute__((section(".data"))) = {' % len(sn['steps'])) + ', '.join(f'{w:#x}' for w in sn['steps']) + '};\n'
     return '\n'.join(out) + '\n' + glue + '\n' + m7b_p4_loop_asm() + '\n' + '\n'.join(bodies), port
 
 
+
+# ---- M8t5: the sound test gets both Tengu Man stage songs (README item 7). The test screen (0x27B0F8, lifted) keeps the
+# entry in its state block +6 (mirrored to 0x801B29A2); the name is P4 0x41 variant 7 = set 0xAD playing animation 0 at
+# step = entry (0x801048DC); that animation's 32 steps show frames 0x74-0x93 (one name each), from the EXE's animation
+# lists (0x8014FF74[set] -> 4 animation pointers; set 0xAD's are there although the PS1 has no Bonus Mode). The
+# Saturn's music table 0x27CDAC gives the song of each entry; Tengu Man's stage = the entry with music 5.
+# Changes: entry `entry` is renamed "TENGUMAN STAGE (PS1)" (frame 0x74 + entry), a new entry right after it
+# "TENGUMAN STAGE (SAT)" (frame M8S_FRAME_SAT, the last frame of the voice test's animation 1, whose steps beyond the US
+# list's 100 entries are never shown), every later entry moves up one: a 33-step animation in the bonus overlay
+# replaces the EXE's while Bonus Mode runs; the test screen's last entry 0x1F becomes 0x20 (lifted code); the player
+# wrapper maps entries to the Saturn table and sets music 5's file entry (M7B_GLUE_C). "(", ")" are the tool's own
+# glyphs in blank tiles of the bonus font page; the other letters are the font's (frames 0x74-0x93).
+M8S_SET, M8S_FIRST_FRAME, M8S_FRAME_SAT = 0xAD, 0x74, 0x73
+M8S_PAREN_TILES = (506, 507)
+M8S_NAMES = ('TENGUMAN STAGE (PS1)', 'TENGUMAN STAGE (SAT)')
+M8S_PARENS = {'(': ('....77..', '...77...', '..77....', '..77....', '..77....', '..77....', '..77....', '..77....', '..77....',
+                    '...77...', '....77..'),
+              ')': ('..77....', '...77...', '....77..', '....77..', '....77..', '....77..', '....77..', '....77..', '....77..',
+                    '...77...', '..77....')}       # rows 5-15 of the 16 x 16 tile (the letters' rows), colour 7 = their white
+M8S_WORD_GAP, M8S_STEP = 14, 8                      # piece x step between words / letters in the existing names
+
+@_memo
+def m8s_names():
+    """Sound-test layout facts read from the discs: Tengu Man's entry, the EXE's name animation (pointer slot and
+    steps) and the new 33-step list. Returns a dict."""
+    sat, ps = Sat(), Ps1()
+    table = list(sat.raw(0x27CDAC, 32))
+    entry = table.index(PS1_TENGU_MUSIC); assert table.count(PS1_TENGU_MUSIC) == 1
+    anims = ps.exe.u32(0x8014FF74 + 4 * M8S_SET)
+    a0 = ps.exe.u32(anims)
+    steps = []
+    while True:
+        w = ps.exe.u32(a0 + 4 * len(steps)); steps.append(w)
+        if w & 0x8000: break
+    assert len(steps) == 32 and [w & 0x7FFF for w in steps] == list(range(M8S_FIRST_FRAME, M8S_FIRST_FRAME + 32))
+    a1 = ps.exe.u32(anims + 4); last = 0
+    while not ps.exe.u32(a1 + 4 * last) & 0x8000: last += 1
+    assert ps.exe.u32(a1 + 4 * last) & 0x7FFF == M8S_FRAME_SAT and last >= 100   # beyond the US voice list (0-99)
+    new = [w & ~0x8000 for w in steps]
+    new.insert(entry + 1, (new[entry] & ~0x7FFF) | M8S_FRAME_SAT)
+    new[-1] |= 0x8000
+    return dict(entry=entry, anim_ptr=anims, steps=new, music=table)
+
+def m8s_name_pieces(base, text):
+    """Pieces (tile, byte 1, x, y) of `text`: the existing 'TENGUMAN STAGE' pieces `base`, then the rest of `text` in the
+    font's letters (tiles taken from the other names) and the tool's parentheses."""
+    known = 'TENGUMAN STAGE'
+    assert text.startswith(known + ' ')
+    out = list(base); x = max(p[2] for p in base) + M8S_STEP; y = base[0][3]; b1 = base[0][1] & 0xFC
+    tiles = m8s_font_tiles()
+    x += M8S_WORD_GAP - M8S_STEP
+    for ch in text[len(known) + 1:]:
+        t = M8S_PAREN_TILES[0] if ch == '(' else M8S_PAREN_TILES[1] if ch == ')' else tiles[ch]
+        out.append((t, b1 | t >> 8, x, y)); x += M8S_STEP
+    assert x - M8S_STEP < 128
+    return out
+
+def m8s_font_tiles():
+    """Tiles of the name font for the letters the new names need, read from frames whose text is known: TITLE (frame
+    0x74), TENGUMAN STAGE (frame 0x74 + Tengu Man's entry), plus P from OPENING and 1 from OPENING STAGE 1 (frame 0x77)."""
+    fr = m8s_frames(m7b_slabo_base())
+    def word(f, text):
+        pcs = sorted(fr[f], key=lambda p: p[2]); letters = [c for c in text if c != ' ']
+        assert len(pcs) == len(letters), (hex(f), len(pcs), text)
+        return {c: p[0] for c, p in zip(letters, pcs)}
+    m = {}
+    e = m8s_names()['entry']
+    m.update(word(M8S_FIRST_FRAME + e, 'TENGUMAN STAGE'))
+    m.update(word(M8S_FIRST_FRAME, 'TITLE'))
+    m.update(word(M8S_FIRST_FRAME + 3, 'OPENING STAGE 1'))
+    return m
+
+def m8s_patch_st(csrc):
+    """The lifted test screen 0x27B0F8: the sound test's last entry (the Saturn's r6 = 0x1F before the shared
+    up/down routine 0x27B2BE; the voice test's is 0x63) becomes 0x20."""
+    s = csrc.index('void bonus_st(u32 obj)'); e = csrc.index('\nvoid ', s + 10)
+    body = csrc[s:e]; old = 'L_27b1aa:\n  r6 = 0x1f;'
+    assert body.count(old) == 1 and body.count('r6 = 0x63;') == 1
+    return csrc[:s] + body.replace(old, 'L_27b1aa:\n  r6 = 0x%x;' % (0x1F + 1)) + csrc[e:]
+
+def m8s_frames(c56):
+    c5, c6 = c56; fo = struct.unpack_from('<I', c6, 4 * M8S_SET)[0]; out = {}
+    s8 = lambda v: v - 256 if v > 127 else v
+    first = struct.unpack_from('<HH', c5, fo)[1]
+    for f in range(first // 4):
+        cnt, po = struct.unpack_from('<HH', c5, fo + 4 * f)
+        out[f] = [(c5[fo + po + 4 * k] | (c5[fo + po + 4 * k + 1] & 3) << 8, c5[fo + po + 4 * k + 1], s8(c5[fo + po + 4 * k + 2]), s8(c5[fo + po + 4 * k + 3])) for k in range(cnt)]
+    return out
+
+@_memo
+def m7b_slabo_base():
+    """Chunks 5 and 6 of SLABO.PAC converted, before the PS1 edits (for reading the name frames)."""
+    ch = {t: front_pac_sat_to_ps1(t, b) for t, o, b in unpac(os.path.join(SAT_FILES, 'SLABO.PAC'))}
+    return ch[5], ch[6]
+
+def m8s_slabo_edit(c5, c6, g):
+    """M8t5 edits of the converted SLABO chunks (5 = frames, 0x101 = font page `g`): the two names, the parentheses."""
+    fo = struct.unpack_from('<I', c6, 4 * M8S_SET)[0]
+    fr = m8s_frames((bytes(c5), bytes(c6))); e = m8s_names()['entry']
+    base = [(t, b1, x, y) for t, b1, x, y in fr[M8S_FIRST_FRAME + e]]
+    assert fr[M8S_FRAME_SAT] and len(fr[M8S_FRAME_SAT]) == 1
+    for k, ch in enumerate('()'):
+        tl = M8S_PAREN_TILES[k]; assert not any(ps1_tile(g, tl))
+        rows = ['........'] * 5 + list(M8S_PARENS[ch])
+        img = bytearray(128)
+        for y, r in enumerate(rows):
+            for x, c in enumerate(r):
+                v = int(c) if c != '.' else 0
+                img[8 * y + x // 2] |= v << (4 * (x & 1))
+        ps1_put_tile(g, tl, bytes(img))
+    while len(c5) % 4: c5.append(0)
+    for f, text in ((M8S_FIRST_FRAME + e, M8S_NAMES[0]), (M8S_FRAME_SAT, M8S_NAMES[1])):
+        pcs = m8s_name_pieces(base, text)
+        at = len(c5)
+        c5 += b''.join(bytes([t & 0xFF, b1, x & 0xFF, y & 0xFF]) for t, b1, x, y in pcs)
+        assert at - fo < 0x10000
+        struct.pack_into('<HH', c5, fo + 4 * f, len(pcs), at - fo)
 
 # ---- M7b build: converted SLABO.PAC and the bonus overlay
 M7B_BONUS_MAGIC = b'MM8R-B7b'
@@ -4392,6 +4548,7 @@ def m7b_slabo_pac():
     assert not any(ps1_tile(g, M7C_TRI_TILE))
     tri = lambda v: M7C_TRI_MAP.get(v, v)
     ps1_put_tile(g, M7C_TRI_TILE, bytes(tri(b & 15) | tri(b >> 4) << 4 for b in ps1_tile(g, M7C_TRI_SRC)))
+    m8s_slabo_edit(c5, c6, g)                      # M8t5: both Tengu Man stage songs in the sound test
     return pac_build([(t, bytes(b)) for t, b in ch])
 
 def build_m7b_bonus(workdir=None):
@@ -4402,6 +4559,7 @@ def build_m7b_bonus(workdir=None):
     wd = workdir and os.path.join(workdir, 'm7b_bonus') or tempfile.mkdtemp(prefix='mm8m7b_')
     os.makedirs(wd, exist_ok=True)
     csrc, port = m7b_lift()
+    csrc = m8s_patch_st(csrc)                          # M8t5: 33 sound-test entries
     nletter = len(m7d_letter()[0])
     syms = dict(helper_symbols(), **M7B_GLUE_SYMS, **{f'h_{k:08x}': v for k, v in M7B_FRONTEND_HELPERS.items()})
     for k in M7B_CUSTOM: syms.pop(f'h_{k:08x}', None)  # defined in the glue
@@ -4410,7 +4568,7 @@ def build_m7b_bonus(workdir=None):
         mvf = M7_BONUS_BASE + 12 * (vf + 1 + M7C_ILL_COUNT + nletter) - (M7_BONUS_BASE - PS1_FILETAB) if vf else 0
         data, sy = m7_compile([('m7b_bonus.c', csrc)], 'bonus', M7_BONUS_BASE, dict(syms, bonus_slabo_vf=vf, bonus_ill_vf=vf + 1,
                                                                                     bonus_letter_vf=vf + 1 + M7C_ILL_COUNT,
-                                                                                    bonus_music_vf=mvf),
+                                                                                    bonus_music_vf=mvf, bonus_e28=mvf + 48 if vf else 0),
                               'bonus_main', wd)
         assert sy['bonus_main'] == M7_BONUS_BASE
         out = bytearray(data)
@@ -4420,13 +4578,14 @@ def build_m7b_bonus(workdir=None):
         vf_off = len(out); new_vf = (M7_BONUS_BASE + vf_off - PS1_FILETAB) // 12
         out += bytes(12 * (1 + M7C_ILL_COUNT + nletter))   # SLABO, then ILL00-29 (M7c), then the LETTER files (M7d)
         music_off = len(out); out += bytes(12 * 4)          # M7e: copies of the music 0x46-0x49 entries (bonus_main moves them)
+        e28_off = len(out); out += bytes(16)                # M8t5: music 5's file entry, PS1 (LBA, size) then the Saturn bank's
         if new_vf == vf: break
         vf = new_vf
     assert vf == new_vf and M7_BONUS_BASE + len(out) <= M7B_BONUS_LIMIT, hex(M7_BONUS_BASE + len(out))
     assert M7_BONUS_BASE + music_off == mvf and M7_BONUS_BASE >= M7E_MUSIC_VF + 48
     return bytes(out), dict(slabo_vf=vf, slabo_vf_off=vf_off, ill_vf=vf + 1, ill_vf_off=vf_off + 12, bonus_size=len(out),
                             letter_vf=vf + 1 + M7C_ILL_COUNT, letter_vf_off=vf_off + 12 * (1 + M7C_ILL_COUNT), letter_files=nletter,
-                            music_vf_off=music_off,
+                            music_vf_off=music_off, e28_off=e28_off,
                             csrc=os.path.join(wd, 'm7b_bonus.c'), bonus_menu=sy['bonus_menu'], bonus_ill=sy['bonus_ill'],
                             sat_data=sy['sat_data'], bonus_ram=sy['bonus_ram'])
 
