@@ -2017,6 +2017,8 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update(patch_m8_credits(disc))
     info.update(patch_m8_name_color(disc))
     info.update(patch_m8_hud_head(disc))
+    m8k = patch_m8_ticker(disc, nxt, (m8t['tengu_lba'], m8t['tengu_size']), workdir); nxt += m8k['tk_sectors']   # M8t4
+    info.update({'m8k_' + k: v for k, v in m8k.items()})
     for f in extra_patches:
         used, more = f(disc, nxt, workdir); nxt += used; info.update(more)
     disc.save(out_bin)
@@ -2095,8 +2097,19 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     assert disc.iso_record('OVL/DEMO.BIN')[2:] == (e8[0], e8[1]), 'DEMO.BIN ISO record'
     want_demo, want_bonus, i7 = build_m7_overlays(od.read(*o8[:2]))
     demo = disc.read(*e8[:2])
-    if demo_tail is not None and len(demo) > len(want_demo):
-        out.update(demo_tail(disc, len(want_demo), demo)); demo = demo[:len(want_demo)]
+    m7len = len(want_demo)                               # M8t4: tk_load + the ticker overlay's entry follow the M7 code
+    _, ti = m8k_demo_tail(m7len, 0, 0)
+    tl, ts, tt = struct.unpack('<3I', demo[ti['tk_vf_off']:ti['tk_vf_off'] + 12])
+    tail, ti = m8k_demo_tail(m7len, tl, ts)
+    assert demo[m7len:m7len + len(tail)] == tail, 'DEMO.BIN: M8t4 tk_load'
+    assert disc.read(tl, ts) == m8k_overlay(od.file_entry(PS1_TENGU_FILE)[:2], tg)[0], 'M8t4 ticker overlay'
+    assert disc.exe_words(M8K_INIT_CALL, 1)[0] == 3 << 26 | (ti['tk_load'] >> 2) & 0x3FFFFFF, 'stage-select init call (tk_load)'
+    assert disc.exe_words(M8K_RENDER_CALL, 1)[0] == 3 << 26 | (M8K_BASE >> 2) & 0x3FFFFFF, 'stage-select render call (tk_frame)'
+    out['m8_ticker'] = (tl, ts)
+    full = m7len + len(tail)
+    if demo_tail is not None and len(demo) > full: out.update(demo_tail(disc, full, demo))
+    else: assert len(demo) == full, 'DEMO.BIN size'
+    demo = demo[:m7len]
     vl, vs, vt = struct.unpack('<3I', demo[i7['vf_off']:i7['vf_off'] + 12])
     want_demo[i7['vf_off']:i7['vf_off'] + 12] = struct.pack('<3I', vl, vs, vt)
     bonus = disc.read(vl, vs); so = i7['slabo_vf_off']; sl, ss, stp = struct.unpack('<3I', bonus[so:so + 12])
@@ -3171,6 +3184,281 @@ def find_m8_tengu_bank(disc, bank=None):
         if disc.read(lba, 2048) == bank[:2048] and disc.read(lba, len(bank)) == bank:
             return lba, len(bank)
     return None
+
+# 5x7 glyphs (8x8 cells), ASCII 0x20-0x5F, drawn for this tool (rows separated by |).
+TEXT_FONT = {
+ ' ': '.....|.....|.....|.....|.....|.....|.....', '!': '..#..|..#..|..#..|..#..|..#..|.....|..#..',
+ '(': '...#.|..#..|.#...|.#...|.#...|..#..|...#.', ')': '.#...|..#..|...#.|...#.|...#.|..#..|.#...',
+ '+': '.....|..#..|..#..|#####|..#..|..#..|.....', ',': '.....|.....|.....|.....|.....|..#..|.#...',
+ '-': '.....|.....|.....|#####|.....|.....|.....', '.': '.....|.....|.....|.....|.....|.....|..#..',
+ '/': '....#|...#.|...#.|..#..|.#...|.#...|#....', ':': '.....|..#..|.....|.....|.....|..#..|.....',
+ '<': '...#.|..#..|.#...|#....|.#...|..#..|...#.', '>': '.#...|..#..|...#.|....#|...#.|..#..|.#...',
+ '=': '.....|.....|#####|.....|#####|.....|.....', '?': '.###.|#...#|....#|...#.|..#..|.....|..#..',
+ '0': '.###.|#...#|#..##|#.#.#|##..#|#...#|.###.', '1': '..#..|.##..|..#..|..#..|..#..|..#..|.###.',
+ '2': '.###.|#...#|....#|...#.|..#..|.#...|#####', '3': '#####|...#.|..#..|...#.|....#|#...#|.###.',
+ '4': '...#.|..##.|.#.#.|#..#.|#####|...#.|...#.', '5': '#####|#....|####.|....#|....#|#...#|.###.',
+ '6': '..##.|.#...|#....|####.|#...#|#...#|.###.', '7': '#####|....#|...#.|..#..|.#...|.#...|.#...',
+ '8': '.###.|#...#|#...#|.###.|#...#|#...#|.###.', '9': '.###.|#...#|#...#|.####|....#|...#.|.##..',
+ 'A': '.###.|#...#|#...#|#####|#...#|#...#|#...#', 'B': '####.|#...#|#...#|####.|#...#|#...#|####.',
+ 'C': '.###.|#...#|#....|#....|#....|#...#|.###.', 'D': '###..|#..#.|#...#|#...#|#...#|#..#.|###..',
+ 'E': '#####|#....|#....|####.|#....|#....|#####', 'F': '#####|#....|#....|####.|#....|#....|#....',
+ 'G': '.###.|#...#|#....|#.###|#...#|#...#|.####', 'H': '#...#|#...#|#...#|#####|#...#|#...#|#...#',
+ 'I': '.###.|..#..|..#..|..#..|..#..|..#..|.###.', 'J': '..###|...#.|...#.|...#.|...#.|#..#.|.##..',
+ 'K': '#...#|#..#.|#.#..|##...|#.#..|#..#.|#...#', 'L': '#....|#....|#....|#....|#....|#....|#####',
+ 'M': '#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#', 'N': '#...#|#...#|##..#|#.#.#|#..##|#...#|#...#',
+ 'O': '.###.|#...#|#...#|#...#|#...#|#...#|.###.', 'P': '####.|#...#|#...#|####.|#....|#....|#....',
+ 'Q': '.###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#', 'R': '####.|#...#|#...#|####.|#.#..|#..#.|#...#',
+ 'S': '.####|#....|#....|.###.|....#|....#|####.', 'T': '#####|..#..|..#..|..#..|..#..|..#..|..#..',
+ 'U': '#...#|#...#|#...#|#...#|#...#|#...#|.###.', 'V': '#...#|#...#|#...#|#...#|#...#|.#.#.|..#..',
+ 'W': '#...#|#...#|#...#|#.#.#|#.#.#|#.#.#|.#.#.', 'X': '#...#|#...#|.#.#.|..#..|.#.#.|#...#|#...#',
+ 'Y': '#...#|#...#|.#.#.|..#..|..#..|..#..|..#..', 'Z': '#####|....#|...#.|..#..|.#...|#....|#####',
+ '[': '.###.|.#...|.#...|.#...|.#...|.#...|.###.', ']': '.###.|...#.|...#.|...#.|...#.|...#.|.###.',
+ '^': '..#..|.#.#.|#...#|.....|.....|.....|.....', '_': '.....|.....|.....|.....|.....|.....|#####',
+}
+
+# ----------------------------------------------------------------- M8t4: Tengu Man music toggle on the stage select
+# Stage select (02b §Stage select): mode function 0x800FF8C4, state struct 0x8017054C (+0 state, 1 = waiting for input;
+# +4 = stage under the cursor, Tengu Man = 3). Its init 0x800FF948 reloads DEMO.BIN (overlay 0) when another overlay
+# is loaded, then streams file 0x72 (`jal 0x800FB9C0` at 0x800FF9C8, a0 = 0x72) and waits for it; every frame after
+# that it renders through `jal 0x800F96C0` at 0x800FF92C. M8t4: the init's call reads the ticker overlay into the RAM
+# that is free at the stage select (0x801DD000-0x801E9FFF, zero in Mednafen) first (tk_load in DEMO.BIN, a virtual
+# entry there), then streams file 0x72 as before; the render call goes through tk_frame (first word of the ticker
+# overlay). With the cursor on Tengu Man, tk_frame draws the pedestal ticker ("♪ PLAYSTATION" / "♪ SATURN", from
+# entry 28's LBA) and the blinking hint under the platform ("- [SELECT] : CHANGE MUSIC -") while the stage select is on
+# screen: state 1 (waiting for input), 3 (boss chosen) and 4 up to step 1 (the banner sliding in; step 3 = the white
+# flash and the boss-intro screen, +1 = step). In state 1 Select rewrites entry 28's LBA and size (the PS1's, read from
+# the user's disc, or the converted bank's) and plays the toggle sound. Everything is drawn on the fade's OT entry with
+# 4-bpp sprites from VRAM x 960-1023, y 256-290 (unused there).
+M8K_BASE = 0x801DD000                 # ticker overlay (stage-select time: free RAM)
+M8K_PRIMS = 0x801E8000                # 2 x 0x800 bytes of primitives (free RAM at the stage select)
+M8K_INIT_CALL, M8K_INIT_FP = 0x800FF9C8, '926c3991090f'     # jal 0x800FB9C0 (stream file 0x72), a0 set in the delay slot
+M8K_RENDER_CALL, M8K_RENDER_FP = 0x800FF92C, 'd6e9aa9f4173' # jal 0x800F96C0 (render the rest)
+M8K_TENGU = 3                         # stage under the cursor: Tengu Man
+M8K_SELECT = 0x100                    # pad bit of Select (pad pressed this frame 0x801B2958)
+M8K_SOUND = 0x0E                      # common-bank sound (PCOMMON, loaded everywhere; chosen for the toggle)
+M8K_TICK_GAP = 40                     # px between ticker passes; 1 px every 2 frames (30 px/s)
+M8K_BLINK = (90, 60)                  # hint shown / hidden, frames
+M8K_HINT_XY = (202, 220)              # hint's top-left on screen (its shadow adds a row and a column): centred
+                                      # under the platform, its last row inside 8 lines of overscan
+M8K_INK = 0x57F1                      # ticker letters: the panel's screen green
+M8K_HINT_CLUT = (0, 0x7FFF, 0x1442, 0x5AB5)   # transparent, white, dark shadow, light grey (button corners)
+M8K_SPANS = ((209, 286), (208, 287), (208, 287), (207, 288), (207, 288), (207, 288), (210, 285))  # panel rows y 204-210
+M8K_NOTE = ('..#..', '..##.', '..#.#', '..#..', '.##..', '###..', '.#...')
+M8K_SMALL = {'S': '###|#..|###|..#|###', 'E': '###|#..|##.|#..|###', 'L': '#..|#..|#..|#..|###',
+             'C': '.##|#..|#..|#..|.##', 'T': '###|.#.|.#.|.#.|.#.', 'H': '#.#|#.#|###|#.#|#.#',
+             'A': '.#.|#.#|###|#.#|#.#', 'N': '#..#|##.#|#.##|#..#|#..#', 'G': '.##|#..|#.#|#.#|.##',
+             'M': '#...#|##.##|#.#.#|#...#|#...#', 'U': '#.#|#.#|#.#|#.#|###', 'I': '###|.#.|.#.|.#.|###',
+             '-': '...|...|###|...|...', ':': '.|#|.|#|.'}   # the hint's small letters (5 rows, own widths)
+
+def m8k_text(word, note=False):
+    """Columns (lists of 7 bools) of `word` in TEXT_FONT, 1-px letter gap; `note` puts the tool's note and 4 px first."""
+    cols = [[r[x] == '#' for r in M8K_NOTE] for x in range(5)] + [[False] * 7] * 4 if note else []
+    for k, ch in enumerate(word):
+        g = TEXT_FONT[ch].split('|')
+        cols += [[g[y][x] == '#' for y in range(7)] for x in range(5)]
+        if k < len(word) - 1: cols.append([False] * 7)
+    return cols
+
+def m8k_4bpp(rows, hw):
+    """4-bpp image (u16 list, `hw` halfwords per row) of index rows."""
+    out = []
+    for r in rows:
+        for x4 in range(hw):
+            out.append(sum((r[4 * x4 + k] if 4 * x4 + k < len(r) else 0) << (4 * k) for k in range(4)))
+    return out
+
+def m8k_small(text):
+    """Columns (lists of 5 bools) of `text` in the small letters, 1-px gap; a space is 2 px."""
+    out = []
+    for k, ch in enumerate(text):
+        if ch == ' ': out += [[False] * 5] * 2; continue
+        g = M8K_SMALL[ch].split('|'); out += [[g[y][x] == '#' for y in range(5)] for x in range(len(g[0]))]
+        if k < len(text) - 1: out.append([False] * 5)
+    return out
+
+def m8k_hint():
+    """The hint line as index rows (1 white, 2 shadow, 3 grey corner): '- ', the button (15 x 4 over the small
+    'SELECT'), ' : CHANGE MUSIC -', all in the small letters; 10 rows of glyphs (text on rows 3-7), the shadow one
+    row and column further."""
+    lab = m8k_small('SELECT'); H = 10
+    btn = [[(4 <= x < 19 and y < 4) or (y >= 5 and lab[x][y - 5]) for y in range(H)] for x in range(len(lab))]
+    corner = {(x, y) for x in (4, 18) for y in (0, 3)}
+    lift = lambda cs: [[False] * 3 + c + [False] * 2 for c in cs]
+    left = lift(m8k_small('- ')); right = lift(m8k_small(' : CHANGE MUSIC -'))
+    cols = left + [[False] * H] + btn + right
+    o = len(left) + 1
+    w, h = len(cols) + 1, H + 1
+    img = [[0] * w for _ in range(h)]
+    ink = lambda x, y: 0 <= x < len(cols) and 0 <= y < H and cols[x][y]
+    for x in range(len(cols)):
+        for y in range(H):
+            if not cols[x][y]: continue
+            for dx, dy in ((1, 1), (1, 0), (0, 1)):
+                if not ink(x + dx, y + dy): img[y + dy][x + dx] = 2
+    for x in range(len(cols)):
+        for y in range(H):
+            if cols[x][y]: img[y][x] = 3 if (x - o, y) in corner else 1
+    return img
+
+M8K_C = r"""
+typedef unsigned char u8; typedef unsigned short u16; typedef unsigned int u32; typedef signed short s16;
+extern void render_rest(void);                 /* 0x800F96C0 */
+extern void add_prim(void *ot, void *p);       /* 0x800D313C: libgpu AddPrim */
+extern void load_image(void *rect, void *src); /* 0x800D3E84: libgpu LoadImage */
+extern void sound_centred(int id, int a);      /* 0x800FD100 */
+#define PAD_NEW    (*(volatile u16 *)0x801B2958)
+#define DRAWBUF    (*(volatile u32 *)0x80162A8C)
+#define DRAWSTRUCT (*(volatile u32 *)0x80170334)
+#define SS_STATE   (*(volatile u8 *)0x8017054C)
+#define SS_STEP    (*(volatile u8 *)0x8017054D)
+#define SS_CUR     (*(volatile u8 *)0x80170550)
+#define ENTRY      ((volatile u32 *)@ENTRY@)
+#define PRIMS      ((u32 *)@PRIMS@)
+/* filled in by the build: entry 28's (LBA, size) on the user's disc and the converted bank's; the images */
+volatile u32 ent_ps[2] __attribute__((section(".data"))) = {1, 1};
+volatile u32 ent_sat[2] __attribute__((section(".data"))) = {1, 1};
+u16 img_ps[64 * 7] __attribute__((aligned(4), section(".data"))) = {1};
+u16 img_sat[64 * 7] __attribute__((aligned(4), section(".data"))) = {1};
+u16 img_hint[@HINT_HW@ * @HINT_H@] __attribute__((aligned(4), section(".data"))) = {1};
+static const u16 tk_l[7] = @SPAN_L@, tk_r[7] = @SPAN_R@;
+static const s16 r_ps[4] = {960, 256, 64, 7}, r_sat[4] = {960, 264, 64, 7}, r_clut[4] = {960, 272, 16, 1};
+static const s16 r_hint[4] = {960, 280, @HINT_HW@, @HINT_H@}, r_hclut[4] = {976, 272, 16, 1};
+static const u16 clut_tk[16] = {0, @INK@}, clut_hint[16] = @HINT_CLUT@;
+static u32 frames __attribute__((section(".data"))) = 0, blink __attribute__((section(".data"))) = 0;
+static u8 was __attribute__((section(".data"))) = 0;
+void tk_frame(void)
+{
+  /* shown while the stage select is on screen: waiting for input (1), the boss chosen (3) and the banner sliding
+     in (4, step 1); gone from the white flash on (4, step 2+) */
+  u32 st = SS_STATE, on = st == 1 || st == 3 || (st == 4 && SS_STEP <= 1);
+  if (on && SS_CUR == @TENGU@) {
+    u32 *p = PRIMS + (DRAWBUF & 1) * 0x200;
+    int sat = ENTRY[0] == ent_sat[0], j;
+    u32 tw, vb, P, pos, y;
+    if (!was) { load_image((void *)r_ps, img_ps); load_image((void *)r_sat, img_sat); load_image((void *)r_clut, (void *)clut_tk);
+                load_image((void *)r_hint, img_hint); load_image((void *)r_hclut, (void *)clut_hint); was = 1; frames = 0; blink = 0; }
+    if (st == 1 && (PAD_NEW & @SELECT@)) {
+      sat ^= 1;
+      ENTRY[0] = sat ? ent_sat[0] : ent_ps[0]; ENTRY[1] = sat ? ent_sat[1] : ent_ps[1];
+      sound_centred(@SOUND@, 0); frames = 0;
+    }
+    tw = sat ? @PX_SAT@ : @PX_PS@; vb = sat ? 8 : 0; P = tw + @GAP@; pos = (frames >> 1) % P;
+    for (y = 0; y < 7; y++) {
+      int l = tk_l[y], r = tk_r[y];
+      for (j = (frames >> 1) >= P ? -1 : 0; j <= 1; j++) {   /* no earlier pass right after a (re)start */
+        int xc = 289 - (int)pos + j * (int)P, lo = xc > l ? xc : l, hi = xc + (int)tw - 1 < r ? xc + (int)tw - 1 : r;
+        if (lo > hi) continue;
+        p[0] = 4 << 24; p[1] = 0x65u << 24 | 0x808080;
+        p[2] = (204 + y) << 16 | lo;
+        p[3] = (u32)(272 << 6 | 960 >> 4) << 16 | (vb + y) << 8 | (lo - xc);
+        p[4] = 1 << 16 | (hi - lo + 1);
+        add_prim((void *)(DRAWSTRUCT + 0x94), p); p += 5;
+      }
+    }
+    if (blink < @BLINK_ON@) {
+      p[0] = 4 << 24; p[1] = 0x65u << 24 | 0x808080;
+      p[2] = @HINT_Y@ << 16 | @HINT_X@;
+      p[3] = (u32)(272 << 6 | 976 >> 4) << 16 | 24 << 8 | 0;
+      p[4] = @HINT_H@ << 16 | @HINT_PX@;
+      add_prim((void *)(DRAWSTRUCT + 0x94), p); p += 5;
+    }
+    if (++blink >= @BLINK_ON@ + @BLINK_OFF@) blink = 0;
+    frames++;
+    p[0] = 1 << 24; p[1] = 0xE1u << 24 | 1 << 10 | 1 << 4 | 15;     /* draw mode: texture page x 960, y 256, 4 bpp */
+    add_prim((void *)(DRAWSTRUCT + 0x94), p);
+  } else was = 0;
+  render_rest();
+}
+"""
+M8K_STUB_C = r"""
+extern char tk_vf[];                          /* linker symbol = virtual file number of the ticker overlay */
+extern void file_load(int idx, void *dst);    /* 0x800FB7A4 */
+extern int load_done(void);                   /* 0x800FC1E0 */
+extern void yield_(int n);                    /* 0x800F7ECC */
+extern void ss_wait(void);                    /* 0x8011C858: what the init's own wait loops call */
+extern void flush_cache(void);                /* 0x800D78EC: BIOS FlushCache */
+extern void stream_file(int f);               /* 0x800FB9C0 */
+void tk_load(int f)
+{
+  file_load((int)tk_vf, (void *)TK_BASE_);
+  while (!load_done()) { ss_wait(); yield_(1); }
+  flush_cache();
+  stream_file(f);                             /* the call this replaces (file 0x72) */
+}
+"""
+M8K_STUB_SYMS = dict(file_load=0x800FB7A4, load_done=0x800FC1E0, yield_=0x800F7ECC, ss_wait=0x8011C858,
+                     flush_cache=0x800D78EC, stream_file=0x800FB9C0)
+
+@_memo
+def m8k_images():
+    """(ticker 'PLAYSTATION' u16 list, its width, 'SATURN' list, width, hint u16 list, hint width px, hint hw)."""
+    def strip(word):
+        cols = m8k_text(word, note=True); w = len(cols); assert w <= 256
+        return m8k_4bpp([[1 if cols[x][y] else 0 for x in range(w)] for y in range(7)], 64), w
+    ps, wp = strip('PLAYSTATION'); sa, ws = strip('SATURN')
+    h = m8k_hint(); hpx = len(h[0]); hhw = (hpx + 3) // 4
+    return ps, wp, sa, ws, m8k_4bpp(h, hhw), hpx, hhw
+
+def m8k_overlay(ent_ps, ent_sat, workdir=None):
+    """The ticker overlay (bytes, symbols), linked at M8K_BASE; ent_ps / ent_sat = (LBA, size) of music 5's file."""
+    ps, wp, sa, ws, hint, hpx, hhw = m8k_images()
+    src = M8K_C
+    for k, v in dict(ENTRY_=f'{PS1_FILETAB + 12 * PS1_TENGU_FILE:#x}', PRIMS_=f'{M8K_PRIMS:#x}', HINT_HW_=str(hhw), HINT_H_=str(len(m8k_hint())),
+                     SPAN_L_='{' + ','.join(str(l) for l, r in M8K_SPANS) + '}', SPAN_R_='{' + ','.join(str(r) for l, r in M8K_SPANS) + '}',
+                     INK_=f'{M8K_INK:#x}', HINT_CLUT_='{' + ','.join(f'{c:#x}' for c in M8K_HINT_CLUT) + '}', TENGU_=str(M8K_TENGU),
+                     SELECT_=f'{M8K_SELECT:#x}', SOUND_=f'{M8K_SOUND:#x}', PX_SAT_=str(ws), PX_PS_=str(wp), GAP_=str(M8K_TICK_GAP),
+                     BLINK_ON_=str(M8K_BLINK[0]), BLINK_OFF_=str(M8K_BLINK[1]), HINT_Y_=str(M8K_HINT_XY[1]),
+                     HINT_X_=str(M8K_HINT_XY[0]), HINT_PX_=str(hpx)).items():
+        src = src.replace('@' + k[:-1] + '@', v)
+    assert '@' not in src
+    data, sy = m7_compile([('ticker.c', src)], 'ticker', M8K_BASE,
+                          dict(render_rest=0x800F96C0, add_prim=0x800D313C, load_image=0x800D3E84, sound_centred=0x800FD100),
+                          'tk_frame', workdir and os.path.join(workdir, 'm8k_ticker'))
+    assert sy['tk_frame'] == M8K_BASE and M8K_BASE + len(data) <= M8K_PRIMS, 'ticker overlay'
+    out = bytearray(data)
+    def put(sym, words, fmt):
+        o = sy[sym] - M8K_BASE; b = struct.pack(f'<{len(words)}{fmt}', *words); out[o:o + len(b)] = b
+    put('ent_ps', ent_ps, 'I'); put('ent_sat', ent_sat, 'I')
+    put('img_ps', ps, 'H'); put('img_sat', sa, 'H'); put('img_hint', hint, 'H')
+    return bytes(out), sy
+
+def m8k_demo_tail(demo_len, lba, size, workdir=None):
+    """What M8t4 appends to DEMO.BIN (`demo_len` bytes so far): padding, the ticker overlay's virtual entry, tk_load.
+    Returns (bytes, info)."""
+    base = Ps1.OVL_BASE; out = bytearray()
+    while (demo_len + len(out)) % 4: out.append(0)
+    while (base + demo_len + len(out) - PS1_FILETAB) % 12: out += bytes(4)
+    vf_off = demo_len + len(out); vf = (base + vf_off - PS1_FILETAB) // 12
+    out += struct.pack('<3I', lba, size, 5)
+    while (demo_len + len(out)) % 16: out.append(0)
+    code_base = base + demo_len + len(out)
+    data, sy = m7_compile([('tk_load.c', M8K_STUB_C.replace('TK_BASE_', f'{M8K_BASE:#x}'))], 'tkload', code_base,
+                          dict(M8K_STUB_SYMS, tk_vf=vf), 'tk_load', workdir and os.path.join(workdir, 'm8k_stub'))
+    assert sy['tk_load'] == code_base
+    out += data
+    return bytes(out), dict(tk_vf=vf, tk_vf_off=vf_off, tk_load=code_base)
+
+def patch_m8_ticker(disc, lba, bank, workdir=None):
+    """M8t4: the ticker overlay into the free sectors at `lba` (bank = (LBA, size) of the converted Tengu Man bank),
+    tk_load appended to DEMO.BIN (after the M7 code; still in its slot), the two stage-select calls repointed."""
+    rd = lambda a: disc.exe_words(a, 1)[0]
+    assert fp(rd(M8K_INIT_CALL)) == M8K_INIT_FP and fp(rd(M8K_RENDER_CALL)) == M8K_RENDER_FP, 'stage-select calls'
+    e28 = disc.file_entry(PS1_TENGU_FILE)
+    ovl, sy = m8k_overlay(e28[:2], bank, workdir)
+    nsec = place_file(disc, lba, ovl)
+    e = disc.file_entry(PS1_DEMO_FILE)
+    demo = disc.read(e[0], e[1])
+    tail, info = m8k_demo_tail(len(demo), lba, len(ovl), workdir)
+    demo = demo + tail
+    assert len(demo) <= PS1_DEMO_SLOT * 2048, f'DEMO.BIN grows to {len(demo):#x}'
+    disc.write(e[0], 0, demo + bytes(-len(demo) % 2048))
+    disc.set_file_entry(PS1_DEMO_FILE, e[0], len(demo))
+    rl, ro, ext, sz = disc.iso_record('OVL/DEMO.BIN')
+    disc.write(rl, ro + 10, struct.pack('<I', len(demo)) + struct.pack('>I', len(demo)))
+    disc.exe_write_words(M8K_INIT_CALL, [3 << 26 | (info['tk_load'] >> 2) & 0x3FFFFFF])
+    disc.exe_write_words(M8K_RENDER_CALL, [3 << 26 | (M8K_BASE >> 2) & 0x3FFFFFF])
+    info.update(tk_lba=lba, tk_size=len(ovl), tk_sectors=nsec, tk_demo_size=len(demo))
+    return info
 
 def sat_ill_image(n):
     """Official illustration n (BONUS/ILLnn.PAC): (256 BGR555 colours, 256x256 index array). Chunk 9 = 1024-colour CRAM
