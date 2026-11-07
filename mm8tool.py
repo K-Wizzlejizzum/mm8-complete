@@ -19,7 +19,7 @@ arena, placements) + Cut Man and the P5 0x34 alarm lifted to C in the STAGE09 ov
 sound guard; the title menu with BONUS MODE as its 4th item and the Saturn bonus menu lifted to C with every
 sub-screen; the Saturn placement list in every stage PAC + the Saturn bat (P2 0x22) lifted to C in the STAGE05
 overlay; the credits hint; the boss-intro name in the Saturn's colors and letters; the HUD head icon and lives digit at the
-Saturn's positions. check_build then re-checks the image (sectors, EDC/ECC, music entries, DEMO/bonus/SLABO, SELECT.PAC, HUD list).
+Saturn's positions; the Saturn's Tengu Man stage song converted to a second bank for music 5. check_build then re-checks the image (sectors, EDC/ECC, music entries, DEMO/bonus/SLABO, SELECT.PAC, HUD list).
 """
 import os, sys, re, struct, hashlib, argparse, collections, random, functools
 
@@ -1959,6 +1959,8 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
       - STAGE09 overlay with Cut Man (P2 0x62) and the alarm (P5 0x34) lifted to C (build_m4_overlay) and the
         restored STAGE09.PAC (patch_m4a), both moved to the free sectors, with PBGM48 (CUT1 on PBGM29) and PBGM49
         (CUT2 converted whole) between them; music 0x48/0x49 reach them through the overlay's virtual file entries;
+      - the Saturn Tengu Man stage song (ST03A converted, PS1 stage sounds kept) in the free sectors
+        (patch_m8_tengu_bank); music 5 still loads the PS1's PBGM05 until the switch rewrites its file-table entry;
       - play_bgm hook (patch_music_hook), sound bank-mismatch guard (patch_sound_guard);
       - STAGE08.PAC rebuilt in place + STAGE08B placements + Wood Man's door lists (patch_m2a);
       - every stage's placement list = the Saturn's (patch_m8_placements; also drops floor bolts 19 and 38) and the
@@ -2003,6 +2005,8 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     nxt = lba49 + info['pbgm49_sectors']
     m4 = patch_m4a(disc, nxt); nxt += m4['pac09_sectors']
     info.update({k if k.startswith('pac09') else 'm4_' + k: v for k, v in m4.items()})
+    m8t = patch_m8_tengu_bank(disc, nxt); nxt += m8t['tengu_sectors']               # M8t3: the Saturn Tengu Man bank
+    info.update(m8t)
     m7 = patch_m7a(disc, nxt, workdir, info['vf0']); nxt += m7['m7_sectors']          # M7a/M7b: title BONUS MODE, bonus overlay, SLABO
     info.update({'m7_' + k: v for k, v in m7.items()})
     patch_music_hook(disc, info['vf0'])
@@ -2060,6 +2064,11 @@ def check_build(orig_bin, new_bin, demo_tail=None):
         lba, size, typ = next(iter(es))
         assert typ == 4 and size == len(want[m]) and disc.read(lba, size) == want[m], hex(m)
     out = dict(sectors_checked=changed, music={hex(m): next(iter(e)) for m, e in sorted(vf.items())})
+    tg = find_m8_tengu_bank(disc)                    # M8t3: the Saturn Tengu Man bank = a fresh build; the music-5
+    assert tg is not None, 'Saturn Tengu Man bank'   # entry is the PS1's (default) or points at that bank
+    e5 = disc.file_entry(PS1_TENGU_FILE)
+    assert e5 == RawDisc(orig_bin).file_entry(PS1_TENGU_FILE) or e5 == (*tg, 4), 'music 5 file entry'
+    out['tengu_bank'] = tg; out['tengu_saturn'] = e5[:2] == tg
     # full-disc layout: with separate track files track 2 (END1.DA) starts after the new track 1 plus its
     # 150-sector pregap; entry 138, both ISO extents and the PVD size moved by the inserted sectors
     od = RawDisc(orig_bin); pv = lambda d: struct.unpack('<I', d.read(16, 84)[80:84])[0]
@@ -3134,6 +3143,34 @@ def patch_music_hook(disc, vf0):
                m_r(0, A0, A0, 16, 0), m_r(0, A0, A0, 16, 3),   # sll a0, a0, 16; sra a0, a0, 16
                m_i(0x0B, V0, A2, 1),                           # sltiu a2, v0, 1   (loop count: 0 = forever)
                m_i(0x0D, 0, A1, 1), 0, 0, 0])                  # ori a1, zero, 1; nops; (jal 0x800C6474 kept)
+
+# ----------------------------------------------------------------- M8t3: Saturn Tengu Man stage music (README item 7)
+# Both versions of Tengu Man's stage song are on the disc: the PS1's PBGM05 (file-table entry 0x17 + 5) and the Saturn's
+# ST03A converted to a PS1 bank with the PS1 stage sounds kept (build_music_bank ps1_sfx). The switch is the file-table
+# entry itself: the table in the EXE is read-only to the game (only 0x800FC238 reads it, copying LBA / size / type into a
+# load request) and the EXE is loaded once at boot, so an entry rewritten at run time stays until power-off or reset, and
+# play_bgm keeps music number 5 (the stage's sound IDs need bank byte = music + 1). Default after boot: the PS1's song.
+PS1_TENGU_MUSIC = 5                   # music number of Tengu Man's stage (PBGM05)
+PS1_TENGU_FILE = 0x17 + PS1_TENGU_MUSIC   # its file-table entry (play_bgm: file = music + 0x17)
+
+def m8t_tengu_bank():
+    """The Saturn Tengu Man stage bank (ST03A converted, PS1 stage sounds kept): (bytes, info)."""
+    return build_music_bank('ST03A.PAC', ps1_sfx=True)
+
+def patch_m8_tengu_bank(disc, lba):
+    """Write the converted Saturn Tengu Man bank into the free sectors at `lba` (no file-table entry of its own: the
+    switch rewrites entry PS1_TENGU_FILE at run time)."""
+    bank, binfo = m8t_tengu_bank()
+    return dict(tengu_lba=lba, tengu_size=len(bank), tengu_sectors=place_file(disc, lba, bank),
+                **{'tengu_bank_' + k: v for k, v in binfo.items() if k not in ('layers', 'sfx')})
+
+def find_m8_tengu_bank(disc, bank=None):
+    """(LBA, size) of the Saturn Tengu Man bank in the track-1 extension of a built image (None if absent)."""
+    bank = bank if bank is not None else m8t_tengu_bank()[0]
+    for lba in range(PS1_FREE_LBA[0], PS1_FREE_LBA[1] + PS1_EXTEND_SECTORS):
+        if disc.read(lba, 2048) == bank[:2048] and disc.read(lba, len(bank)) == bank:
+            return lba, len(bank)
+    return None
 
 def sat_ill_image(n):
     """Official illustration n (BONUS/ILLnn.PAC): (256 BGR555 colours, 256x256 index array). Chunk 9 = 1024-colour CRAM
