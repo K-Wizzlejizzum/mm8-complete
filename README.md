@@ -10,7 +10,7 @@ Roadmap:
 4. Use Saturn text color for Robot Master intro names - 100% Complete
 5. Use Saturn's lives counter placement (under life bar) - 100% Complete
 6. Assess feasibility of porting Saturn's water effects - Not Started
-7. Assess how to bring over Saturn's Tengu Man stage music without removing the PS1's version - Not Started
+7. Assess how to bring over Saturn's Tengu Man stage music without removing the PS1's version - 100% Complete
 8. Fix any grammatical issues with the dialogue - Not Started
 9. Add the Battle & Chase and Super Adventure Rockman adverts that were present in the Japanese PSX version - Not Started
 10. (Stretch Goal) Assess the need for a full re-translation - Not Started
