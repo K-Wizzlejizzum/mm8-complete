@@ -1,5 +1,5 @@
-# saturn_addr ps1_addr votes  (from 242 shared handler pairs)
-# votes column: n/total from alignment, "manual" = hand-verified (mm8tool MANUAL), "inline" = no PS1 function
+# saturn_addr psx_addr votes  (from 242 shared handler pairs)
+# votes column: n/total from alignment, "manual" = hand-verified (mm8tool MANUAL), "inline" = no PSX function
 0020e854 80111858 9/9
 0020e8aa 80111918 42/42
 0020e90a 801119e0 48/48
@@ -113,6 +113,6 @@
 06016960 80109318 2/2
 06016aa6 80101bf0 manual
 06016b94 80101dbc 2/2
-060196a4 -------- inline  signed divide r1/r0 -> PS1 inline div+mflo
-06019800 -------- inline  signed modulo r1%r0 -> PS1 inline div+mfhi
-06019a98 -------- inline  variable shift via jump table (r1 = count) -> PS1 inline sllv/srav
+060196a4 -------- inline  signed divide r1/r0 -> PSX inline div+mflo
+06019800 -------- inline  signed modulo r1%r0 -> PSX inline div+mfhi
+06019a98 -------- inline  variable shift via jump table (r1 = count) -> PSX inline sllv/srav
