@@ -6,9 +6,7 @@
 !README.md
 !mm8tool.py
 !helper_map.txt
-# Screenshots of the patched game (PNG, plus GIF for animations) for the README and release page.
+# Screenshots of the patched game (PNG, plus GIF for animations).
 !screenshots/
 !screenshots/*.png
 !screenshots/*.gif
-# patches/ stays out: xdeltas carry game data. The release is a builder that
-# reads everything game-related from the user's own discs.
