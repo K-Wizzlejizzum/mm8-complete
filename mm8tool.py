@@ -1845,7 +1845,7 @@ def patch_m8_hud_head(disc):
 # so every PAC keeps its size and LBA). This supersedes the Phase-1 placement edits (the Saturn lists hold Wood Man,
 # Cut Man, their gates / triggers / alarms, and neither floor bolt 19 nor 38). Left out: P5 0x29 (the Saturn's line-scroll
 # water, item 3, not ported; the PSX P5 table entry points into overlay code that is not a handler outside STAGE00).
-# The attract demos (PDEMO00-04) keep the PSX lists: their recorded input was made for them. Every other type the Saturn
+# The attract demos (PDEMO00-04) get the Saturn lists with the Saturn's recorded input (patch_m8_demos). Every other type the Saturn
 # places in a stage the PSX already places in that stage, except Sword Man's bat (P2 0x22): the PSX STAGE05 overlay
 # table points it at the stub, so the Saturn handler 0x22442C is lifted to C (like the bosses) and appended to
 # STAGE05.BIN (moved to the free sectors), with table entry 0x22 pointing at it.
@@ -1913,6 +1913,84 @@ def patch_m8_placements(disc, lba, workdir=None):
                 ovl05_sectors=place_moved_file(disc, PSX_STAGE05_FILE, new5, 'OVL/STAGE05.BIN', lba))
     return info
 
+# ---- Phase 3 item 7: the Saturn's attract demos. Title sub-state 5 plays PDEMO0n.PAC = stage n (02e §Attract demos).
+# Each PDEMO0n.PAC gets the Saturn's chunk 0x0A (m8p_chunk, the Saturn stage list) and the Saturn's demo record
+# (chunk 0x11) converted to the PSX layout: header words byte-swapped (frame index 0), the 3000 game-input words
+# translated bit by bit (d-pad by direction, buttons by button-config slot; each system's slot -> bit table is read
+# from its input routine on the disc), the raw-pad words rebuilt from the translated game words with the pad button
+# that the PSX's own records pair with each game bit, the start state swapped field by field, the rest of the chunk
+# (save area and run-time state of the demo routine) kept from the PSX. Same chunk sizes: in place, no sectors.
+M8D_DEMOS = ['PDEMO0%d' % i for i in range(5)]
+M8D_SAT_INPUT, M8D_PSX_INPUT = (0x06016BB8, 0x06016C18), (0x801019D0, 0x80101A9C)   # game word = pad + config table
+M8D_SAT_FP, M8D_PSX_FP = '36b12747c1f6', 'e0ed1674d3c2'
+M8D_FRAMES, M8D_RAW, M8D_GAME, M8D_STATE, M8D_SAVE = 3000, 0x0C, 0x177C, 0x2EEC, 0x2F84
+M8D_STATE_SWAP = [(0x14, 'I'), (0x18, 'I'), (0x1C, 'I'), (0x20, 'H')] + [(0x58 + 4 * k + 2, 'H') for k in range(16)]
+PAD_DPAD = {'sat': {'U': 0x1000, 'D': 0x2000, 'L': 0x4000, 'R': 0x8000},           # pad hardware bit layouts
+            'psx': {'U': 0x1000, 'R': 0x2000, 'D': 0x4000, 'L': 0x8000}}
+
+def m8d_slot_bits(side):
+    """The 7 game-input bits of button-config slots 0-6, in slot order, read from the input routine's OR immediates."""
+    if side == 'psx':
+        exe = Psx().exe; lo, hi = M8D_PSX_INPUT; code = exe.d[lo - exe.b:hi - exe.b]
+        assert fp(code) == M8D_PSX_FP, 'unexpected PSX input routine'
+        ws = struct.unpack('<%dI' % (len(code) // 4), code)
+        return [w & 0xFFFF for w in ws if w >> 26 == 0x0D and (w >> 16) & 31 == 3]          # ori v1, *, imm
+    s = Sat(); lo, hi = M8D_SAT_INPUT
+    assert fp(s.raw(lo, hi - lo)) == M8D_SAT_FP, 'unexpected Saturn input routine'
+    regs, out = {}, []
+    for a in range(lo, hi, 2):
+        w = s.u16(a); n = (w >> 8) & 15
+        if w >> 12 == 0xE: regs[n] = (w & 0xFF) - (0x100 if w & 0x80 else 0)                # mov #imm, Rn
+        elif w >> 12 == 0x9: regs[n] = s.s16(a + 4 + 2 * (w & 0xFF))                        # mov.w @(disp, PC), Rn
+        elif w & 0xF00F == 0x200B and n == 4: out.append(regs[(w >> 4) & 15])               # or Rm, r4
+    return out
+
+def m8d_tables():
+    """(Saturn game bit -> PSX game bit, PSX game bit -> PSX raw pad bit)."""
+    sb, pb = m8d_slot_bits('sat'), m8d_slot_bits('psx')
+    assert len(sb) == len(pb) == 7 and sb[6] == pb[6] and len(set(sb)) == len(set(pb)) == 7
+    g = dict(zip(sb, pb)); g.update({PAD_DPAD['sat'][d]: PAD_DPAD['psx'][d] for d in 'UDLR'})
+    raw, game = [], []
+    for st in M8D_DEMOS:
+        c = pac_chunks('psx', st)[0x11]
+        raw += struct.unpack_from('<%dH' % M8D_FRAMES, c, M8D_RAW); game += struct.unpack_from('<%dH' % M8D_FRAMES, c, M8D_GAME)
+    r = {}
+    for b in pb:
+        hit = [1 << k for k in range(16) if all(bool(x & b) == bool(y >> k & 1) for x, y in zip(game, raw))]
+        if any(x & b for x in game): assert len(hit) == 1, hex(b); r[b] = hit[0]
+    r.update({PAD_DPAD['psx'][d]: PAD_DPAD['psx'][d] for d in 'UDLR'})
+    return g, r
+
+def m8d_chunk(st, tables=None):
+    """The PSX chunk 0x11 of `st` built from the Saturn's demo record."""
+    g, r = tables or m8d_tables()
+    sat, psx = pac_chunks('sat', st)[0x11], pac_chunks('psx', st)[0x11]
+    assert len(sat) == len(psx) and struct.unpack('>I', sat[:4])[0] == M8D_FRAMES, st
+    out = bytearray(psx)
+    out[0:12] = struct.pack('<3I', 0, *struct.unpack('>2I', sat[4:12]))
+    game = []
+    for v in struct.unpack_from('>%dH' % M8D_FRAMES, sat, M8D_GAME):
+        assert all(1 << k in g for k in range(16) if v >> k & 1), (st, hex(v))
+        game.append(sum(g[1 << k] for k in range(16) if v >> k & 1))
+    rawv = [sum(r[1 << k] for k in range(16) if v >> k & 1) for v in game]
+    struct.pack_into('<%dH' % M8D_FRAMES, out, M8D_GAME, *game)
+    struct.pack_into('<%dH' % M8D_FRAMES, out, M8D_RAW, *rawv)
+    state = bytearray(sat[M8D_STATE:M8D_SAVE])
+    for o, f in M8D_STATE_SWAP:
+        state[o:o + struct.calcsize(f)] = struct.pack('<' + f, *struct.unpack_from('>' + f, state, o))
+    out[M8D_STATE:M8D_SAVE] = state
+    return bytes(out)
+
+def patch_m8_demos(disc):
+    """Saturn chunks 0x0A and 0x11 in PDEMO00-04.PAC (in place). Returns info."""
+    t = m8d_tables()
+    for st in M8D_DEMOS:
+        ext, sz, chunks = pac_locate(disc, f'STDATA/{st}.PAC')
+        for typ, new in ((0xA, m8p_chunk(st)), (0x11, m8d_chunk(st, t))):
+            ty, off, n = next(c for c in chunks if c[0] == typ); assert len(new) == n, (st, typ)
+            disc.write(ext, off, new)
+    return dict(m8_demos=len(M8D_DEMOS))
+
 def relocate_p5_table(out, stage, extra, at):
     """Append a copy of the EXE P5 table (52 entries) + `extra` handlers (types 0x34...) at overlay offset `at` (out is
     extended as needed) and repoint the overlay's P5 loop (lui/addiu)."""
@@ -1968,6 +2046,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
       - the last credits page gets "BONUS MODE (L1+R1+START BUTTON)" (ENDING.PAC in place, patch_m8_credits);
       - the boss-intro name as on the Saturn: orange-gold, the Saturn's letters (SELECT.PAC in place, patch_m8_name_color);
       - the HUD's head icon and lives digit at the Saturn's positions, each moved 1 px (EXE, patch_m8_hud_head);
+      - the attract demos = the Saturn's: placement lists and converted demo records (PDEMO00-04.PAC in place, patch_m8_demos);
       - extra_patches: callables f(disc, next_free_lba, workdir) -> (sectors used, info dict), applied last, after
         every port (none in the release build)."""
     disc = RawDisc(src_bin)
@@ -2017,6 +2096,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update(patch_m8_credits(disc))
     info.update(patch_m8_name_color(disc))
     info.update(patch_m8_hud_head(disc))
+    info.update(patch_m8_demos(disc))
     m8k = patch_m8_ticker(disc, nxt, (m8t['tengu_lba'], m8t['tengu_size']), workdir); nxt += m8k['tk_sectors']   # M8t4
     info.update({'m8k_' + k: v for k, v in m8k.items()})
     for f in extra_patches:
@@ -2091,6 +2171,15 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     want5, i5 = build_m8_bat_overlay(od.read(*od.file_entry(PSX_STAGE05_FILE)[:2]))
     assert disc.read(e5[0], e5[1]) == want5 and disc.iso_record('OVL/STAGE05.BIN')[2:] == (e5[0], e5[1]), 'STAGE05 overlay (bat)'
     out['m8_placements'] = len(m8p_stages()); out['m8_bat'] = (e5[0], e5[1])
+    t8 = m8d_tables()                                      # item 7: PDEMO00-04 = Saturn lists + converted records
+    for st in M8D_DEMOS:
+        ext, sz, chunks = pac_locate(disc, f'STDATA/{st}.PAC'); oe, osz, ochunks = pac_locate(od, f'STDATA/{st}.PAC')
+        assert (ext, sz, chunks) == (oe, osz, ochunks), st
+        new_pac, old_pac = disc.read(ext, sz), od.read(oe, osz); want = bytearray(old_pac)
+        for typ, c in ((0xA, m8p_chunk(st)), (0x11, m8d_chunk(st, t8))):
+            ty, off, n = next(x for x in chunks if x[0] == typ); want[off:off + n] = c
+        assert new_pac == bytes(want), st
+    out['m8_demos'] = len(M8D_DEMOS)
     # M7a: DEMO.BIN rebuilt in its own slot; its virtual entry points at the bonus overlay
     e8, o8 = disc.file_entry(PSX_DEMO_FILE), od.file_entry(PSX_DEMO_FILE)
     assert e8[0] == o8[0] and e8[2] == o8[2] and e8[1] <= PSX_DEMO_SLOT * 2048, 'DEMO.BIN entry'
@@ -4713,7 +4802,7 @@ RELEASE_VERSION = '0.5.0'
 RELEASE_IN_MD5 = {'psx': '4e9e6dcf27ea0e15c5f4d1f93c800378', 'sat': 'a4d575cd681b7d7c88b45d639ed7ffb7'}
 RELEASE_AUDIO_MD5 = {'psx': {2: 'a75dcbb5c831a966c47563e7ea4150c9', 3: '2d7b5e8e94a91bf5423b2356f6a34863'},
                      'sat': {2: 'a2201327867523e4e31de62c445e2996'}}
-RELEASE_OUT_MD5 = '06601c952ab31775bb342eb7e61e73d4'
+RELEASE_OUT_MD5 = '1db0d65c93b3bc6992ec04d6710d33a7'
 RELEASE_NAME = 'Mega Man 8 - Complete'
 _RAW_SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
 
