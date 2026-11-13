@@ -5134,7 +5134,7 @@ def place_records(chunk, side):
 # gives a note, because most rippers don't correct the drive's read offset (the audio is shifted by a few samples,
 # inaudible, but the md5 differs); the PSX audio tracks are copied into the output as the user gave them. The md5
 # of the image the tested toolchain produces is RELEASE_OUT_MD5; another compiler build may give a different (still valid) image.
-RELEASE_VERSION = '0.5.0'
+RELEASE_VERSION = '0.6.0'
 RELEASE_IN_MD5 = {'psx': '4e9e6dcf27ea0e15c5f4d1f93c800378', 'sat': 'a4d575cd681b7d7c88b45d639ed7ffb7'}
 RELEASE_AUDIO_MD5 = {'psx': {2: 'a75dcbb5c831a966c47563e7ea4150c9', 3: '2d7b5e8e94a91bf5423b2356f6a34863'},
                      'sat': {2: 'a2201327867523e4e31de62c445e2996'}}
