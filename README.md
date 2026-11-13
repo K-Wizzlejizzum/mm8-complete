@@ -13,7 +13,7 @@ A fan project that turns **Mega Man 8 (USA, PlayStation, SLUS-00453)** into the 
 5. Use Saturn's lifebar HUD - **100% Complete**
 6. Add Tengu Man's Saturn Track, with ability to switch between both versions - **100% Complete**
 7. Update attract mode to use the Saturn's demos (placements and recorded input) - **100% Complete**
-8. Assess feasibility of porting Saturn's water effects - **Not Started**
+8. Port Saturn's water effects - **100% Complete**
 9. Review the sound effects and voice lines that differ between the Saturn and PSX versions and port the Saturn's where appropriate - **Not Started**
 10. Assess feasibility of porting all Saturn versions of music - **Not Started**
 11. Reassess the remaining color differences between the Saturn and PSX versions once all other Saturn porting is complete - **Not Started**

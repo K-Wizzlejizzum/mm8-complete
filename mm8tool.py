@@ -35,6 +35,10 @@ KNOWN_MD5 = {
     ('psx', 'OVL/STAGE08.BIN'): '7147c0c48c431bc7be2206b398925181',
     ('psx', 'OVL/STAGE09.BIN'): 'f0bca16e43a42a4cbedc7a552ec938b3',
     ('psx', 'OVL/STAGE05.BIN'): '899e7882145ad499100923cb2c5a1fdb',
+    ('psx', 'OVL/STAGE00.BIN'): 'cc69ec64594e04b1e5626391639ee101',
+    ('psx', 'OVL/STAGE06.BIN'): 'e8418d962715863c9b9d7bc29e669fa9',
+    ('psx', 'OVL/STAGE07.BIN'): '11990761bcb509ace2514daa00e3ff35',
+    ('psx', 'OVL/STAGE0D.BIN'): '4ef684f26d2bb5b91d5710eebd828241',
 }
 
 # ----------------------------------------------------------------- disc / PAC
@@ -1843,13 +1847,12 @@ def patch_m8_hud_head(disc):
 # ---- Phase 3 items 1 + 2: the Saturn's enemy and item placements in every stage, with Sword Man's bats.
 # Every STAGExx(B).PAC gets the Saturn's chunk 0x0A (records in the PSX byte layout, Saturn order; same 0x800-byte chunk,
 # so every PAC keeps its size and LBA). This supersedes the Phase-1 placement edits (the Saturn lists hold Wood Man,
-# Cut Man, their gates / triggers / alarms, and neither floor bolt 19 nor 38). Left out: P5 0x29 (the Saturn's line-scroll
-# water, item 3, not ported; the PSX P5 table entry points into overlay code that is not a handler outside STAGE00).
+# Cut Man, their gates / triggers / alarms, and neither floor bolt 19 nor 38). The Saturn's P5 0x29 (line-scroll water,
+# README item 8) is placed too: its four stages' overlays get the lifted handler (patch_m8_water).
 # The attract demos (PDEMO00-04) get the Saturn lists with the Saturn's recorded input (patch_m8_demos). Every other type the Saturn
 # places in a stage the PSX already places in that stage, except Sword Man's bat (P2 0x22): the PSX STAGE05 overlay
 # table points it at the stub, so the Saturn handler 0x22442C is lifted to C (like the bosses) and appended to
 # STAGE05.BIN (moved to the free sectors), with table entry 0x22 pointing at it.
-M8P_SKIP = {(0x29, 4)}                                # (type, pool) not carried over
 M8P_STAGES = [f'STAGE0{c}{h}' for c in '0123456789ABCD' for h in ('', 'B')]   # filtered to the PACs on both discs
 M8P_MAGIC = b'MM8R-M8\0'
 PSX_STAGE05_FILE = 14
@@ -1872,11 +1875,11 @@ def m8p_stages():
             and os.path.exists(os.path.join(PSX_FILES, 'STDATA', st + '.PAC'))]
 
 def m8p_chunk(stage):
-    """The PSX chunk 0x0A for `stage` built from the Saturn's list (PSX byte layout, M8P_SKIP left out), then the PSX's
+    """The PSX chunk 0x0A for `stage` built from the Saturn's list (PSX byte layout), then the PSX's
     own terminator record and zero padding to the PSX chunk size."""
     sc, pc = pac_chunks('sat', stage)[0xA], pac_chunks('psx', stage)[0xA]
     recs = [sc[i:i + 4] + struct.pack('<2H', *struct.unpack('>2H', sc[i + 4:i + 8]))
-            for i in range(0, placement_terminator(sc), 8) if (sc[i + 1], sc[i + 3]) not in M8P_SKIP]
+            for i in range(0, placement_terminator(sc), 8)]
     t = placement_terminator(pc)
     assert set(pc[t + 8:]) <= {0} and len(recs) < 255, stage
     out = b''.join(recs) + pc[t:t + 8]
@@ -2028,6 +2031,325 @@ def build_m4_overlay(ovl, vf_addr, workdir=None):
 PSX_STAGE08_FILE, PSX_STAGE08_ENTRY = 17, (126370, 0x9394, 0xE)   # file-table index and original (LBA, size, type)
 sectors = lambda n: (n + 2047) // 2048
 
+# ---- README item 8 (Phase 3): the Saturn's water effects (02h). The Saturn's P5 0x29 (line-scroll water: the ripple
+# below the surface in the intro stage and Aqua Man's stage, the wave in and out of space in Astro Man's room, regular
+# and Wily 4) is lifted to C from the Saturn program on the disc (WaterPort: the sine table, the two 256-line tables,
+# the VDP2 register shadow, the P2 pool, layer 1 and the DA98 block map to PSX addresses; the VDP2 VRAM fill and the
+# table DMA are no-ops) and appended to the four overlays that place it (moved to the free sectors), with the P5
+# table relocated so entry 0x29 points at it. Its SCRCTL value and tables drive the PSX side (M8W_RENDER_C): the
+# ripple moves everything under the water line (map, backgrounds, sprites; not the HUD), layer 1 moves up / down,
+# the transition shifts the backdrop with wrap-around. The EXE on the disc is unchanged: the first water frame copies
+# the dispatcher (M8W_DISP_ASM) to free RAM 0x801D3000 and points the layer renderer's three link calls and its return
+# at it; for an overlay without a hook it goes on to the game's own code.
+M8W_STAGES = [('STAGE00', 9, 0x801D84DC), ('STAGE06', 15, 0x801D8450), ('STAGE07', 16, 0x801D8384), ('STAGE0D', 22, 0x801D8370)]   # (overlay, file entry, P5 loop lui)
+M8W_LIMIT = {'STAGE0D': 0x801FC000}             # STAGE0D already ends at 0x801F923C; nothing else uses up to the task slots
+M8W_RR, M8W_RR_LEN = 0x800F96C0, 0x218          # the stage layer renderer
+M8W_LINK = 0x800F9DD0                           # link a layer's buckets into the ordering table (scratch, depth, a, b)
+M8W_DISP = 0x801D3000                           # dispatcher: free RAM between the EXE image and the overlays
+M8W_LST, M8W_BUF = 0x801A9400, 0x801A1400       # line-scroll tables (0x1000 bytes), copy packets (free screen buffer)
+WATER_CODE_TABLES = {0x27CA98: 5, 0x27CAAC: 2, 0x27CAB4: 2, 0x27CABC: 2, 0x27CAC4: 2, 0x27CACC: 6}
+WATER_DATA = (0x27CA98, 0x27CAE4)
+WATER_MEM = [(0x296D2C, 0x296DAE, '0x801395f0', 'quarter-wave sine table (same halfwords, PSX EXE)'),
+             (0x06003000, 0x06004000, '(u32)w_lst', 'line-scroll tables A / B (Saturn high WRAM)'),
+             (0x060673B4, 0x06067500, '(u32)w_vdp2', 'VDP2 register shadow (SCRCTL at +0x9A)'),
+             (0x06031CE0, 0x060334E1, '0x8015b174', 'P2 pool (+ end pointer)'),
+             (0x0602FF20, 0x0602FF50, '0x801d2944', 'layer 1 struct'),
+             (0x0602DA98, 0x0602DAC4, '0x801b297c', 'DA98 block (boss bar word, water line +0xC)')]
+WATER_NOP = r"""__attribute__((noinline, noipa)) u32 h_%08x(u32 a, u32 b, u32 c, u32 d) { return 0; }   /* %s */"""
+WATER_CUSTOM = {0x06009DC2: WATER_NOP % (0x06009DC2, 'VDP2 VRAM fill: nothing to do on the PSX'),
+                0x060094C0: WATER_NOP % (0x060094C0, 'DMA setup: the PSX side reads w_lst directly'),
+                0x06009444: WATER_NOP % (0x06009444, 'DMA of the tables to VDP2 VRAM: not needed')}
+
+class WaterPort(BossPort):
+    """Saturn addresses of the water object mapped to PSX expressions (WATER_MEM), any access size."""
+    def _mem(self, v):
+        for lo, hi, p, nm in WATER_MEM:
+            if lo <= v < hi: return f'({p} + {v - lo:#x})'
+        return None
+    def region(self, v):
+        for k, (lo, hi, p, nm) in enumerate(WATER_MEM):
+            if lo <= v < hi: return k
+        return None
+    def value(self, v, a):
+        r = self._mem(v) if _addr_like(v) else None
+        return r if r is not None else BossPort.value(self, v, a)
+    def const_addr(self, sat, size, kind, a):
+        r = self._mem(sat)
+        return r if r is not None else BossPort.const_addr(self, sat, size, kind, a)
+    def cx_addr(self, B, sat, size, kind, a, expr, disp):
+        rb, rs = self.region(B), self.region(sat)
+        if rb is not None and rb == rs: return f'({expr} + ({disp}))'
+        return BossPort.cx_addr(self, B, sat, size, kind, a, expr, disp)
+
+WATER_SPEC = dict(name='water', data=WATER_DATA, globals=WM_GLOBALS, code_tables=WATER_CODE_TABLES, half_tables=[],
+                  cfile='m8w_water.c', blocks=CUT_BLOCKS, custom=WATER_CUSTOM,
+                  custom_arity={0x06009DC2: 3, 0x060094C0: 3, 0x06009444: 3},
+                  handlers=[('p5_water', 0x204E0C, 0x29, list(WATER_CODE_TABLES), (0x08, 0x0C, 0x10))])
+
+@_memo
+def water_lift():
+    """(C source of the lifted P5 0x29 handler, the WaterPort used)."""
+    sat = Sat(); code = Code([(sat.BASE2, sat.p2), (sat.BASE1, sat.p1)])
+    port = WaterPort(WATER_SPEC); bodies = []
+    for name, entry, typ, tabkeys, words in WATER_SPEC['handlers']:
+        port.word_fields = words
+        src, _ = lift(code, name, entry, {k: WATER_CODE_TABLES[k] for k in tabkeys}, port); bodies.append(src)
+    src = wm_c_file(sat, port, bodies)
+    head = 'typedef int s32; typedef unsigned int u32;'
+    assert head in src
+    return src.replace(head, head + '\nextern unsigned char w_vdp2[]; extern u32 w_lst[];', 1), port
+
+M8W_RENDER_C = r'''/* README item 8 (water effects): the PSX side of the Saturn's line scroll. The lifted Saturn P5 0x29 handler writes
+   the Saturn's SCRCTL value (w_vdp2 + 0x9A) and its two 256-line tables (w_lst: A = map / backdrop horizontal, B =
+   layer-1 vertical or horizontal; 16.16); this code, called from the stage layer renderer's hook, turns them into
+   drawing on the PSX (02h):
+   - SCRCTL 0x402 (water ripple): everything below the surface except the HUD ripples sideways with table A: everything
+     drawn before the HUD (backgrounds, map, sprites, the water layer: the copies go after the last packet of
+     ordering-table entry 0x8C; the HUD renderer runs later and adds to entry 0x90) is shifted line by line on the
+     frame buffer with VRAM copies. Table B (the Saturn's up / down movement of the background layer) is not used:
+     its line copies were most of the ripple's GPU work, and the intro stage slowed down on real consoles with it.
+   - SCRCTL 2 / 0x200 (Astro Man's transition into space / back to the lab): everything drawn before the map's back
+     tiles is shifted line by line with wrap-around, with table A / table B.
+   The copy packets live in the unused end of the pristine screen buffer (m8w_buf, two buffers up to w_lst; the water
+   stages' screen chunks end below 0x801A1040); NWORDS covers the most copies a frame can need, so no pass is skipped. Ordering-table nodes stay <= 16 words. The renderer reaches the hook
+   through a resident dispatcher (M8W_DISP_ASM) that the first water frame installs. */
+typedef signed char s8; typedef unsigned char u8; typedef short s16; typedef unsigned short u16;
+typedef int s32; typedef unsigned int u32;
+
+#define R8(a)  (*(volatile u8 *)(a))
+#define R16(a) (*(volatile s16 *)(a))
+#define R32(a) (*(volatile u32 *)(a))
+
+extern void link_layer(u8 *scr, u32 depth, u32 *a, u32 *b);   /* 0x800F9DD0: link a layer's buckets */
+
+#define BUFIDX    0x80162A8Cu      /* frame buffer index (0 / 1) */
+#define DBPTR     0x80170334u      /* this frame's draw block: ordering table at +0x70.., E5 draw offset at +0x28 */
+#define SCR0      496              /* free VRAM rows 496-503 (x 0-319): line scratch */
+
+u8 w_vdp2[0x14C] __attribute__((aligned(4), section(".data"))) = { 0 };   /* Saturn VDP2 register shadow */
+extern u32 w_lst[];        /* Saturn 0x06003000-0x06003FFF; linker symbol = 0x801A9400 (free screen buffer) */
+#define SCRCTL  (*(volatile u16 *)(w_vdp2 + 0x9A))
+
+extern u32 m8w_buf[];      /* linker symbol: two packet buffers of NWORDS words, ending at w_lst */
+#define NWORDS  4096       /* hpass_ripple <= 160 copies, hpass_wrap <= 720 (5 words each) */
+#define BUF(i)  (m8w_buf + (i) * NWORDS)
+
+/* All state in .data (inside the loaded file, zero at every load; the overlay has no .bss). */
+#define DATA __attribute__((section(".data")))
+s16 w_oh[240] DATA;          /* whole pixels; the transition's offsets reach beyond +-127 */
+static u32 *pool DATA, *pend DATA, mode DATA;   /* mode = this frame's SCRCTL (set at layer 0, cleared at the end) */
+
+static void __attribute__((noinline)) convert(void)   /* whole pixels = the high halfword of each 16.16 word */
+{
+  const s16 *A = (const s16 *)w_lst + 1;
+  s16 *oh = w_oh;
+  s32 i;
+  if (mode == 0x200) A += 0x400;                     /* back to the lab: table B */
+  for (i = 0; i < 240; i++, A += 2) oh[i] = *A;
+}
+
+/* VRAM copy commands, 4 per ordering-table node, written straight into the packet pool; q / node / k kept in locals.
+   CP_BEGIN reserves room for up to `max` copies (else the pass is skipped this frame). */
+#define CP_BEGIN(max) u32 *q = pool, *node = 0, *first = 0, k = 4; if (q + (max) * 5 > pend) return
+#define CP(sx, sy, dx, dy, w, h) do { if (k == 4) { if (node) node[0] |= (u32)q & 0xFFFFFF; else first = q; \
+    node = q; *q++ = 0; k = 0; } q[0] = 0x80000000u; q[1] = ((u32)(sy) << 16) | (u32)(sx); \
+    q[2] = ((u32)(dy) << 16) | (u32)(dx); q[3] = ((u32)(h) << 16) | (u32)(w); q += 4; node[0] += 4u << 24; k++; } while (0)
+#define CP_END(otp) do { u32 *ot_ = (otp); pool = q; if (first) { node[0] |= ot_[0] & 0xFFFFFF; \
+    ot_[0] = (ot_[0] & 0xFF000000) | ((u32)first & 0xFFFFFF); } } while (0)
+static u32 fbuf(u32 db) { return (R32(db + 0x28) >> 11) & 0x7FF; }
+
+static void __attribute__((noinline)) hpass_ripple(void)                         /* everything drawn before the HUD (entry 0x90), left by its offset */
+{
+  u32 db = R32(DBPTR), fb = fbuf(db);
+  s32 l = 0;
+  CP_BEGIN(160);
+  while (l < 240) {
+    s32 o = w_oh[l], m = l + 1;
+    while (m < 240 && w_oh[m] == o) m++;
+    if (o > 0 && o < 320) CP(o, fb + l, 0, fb + l, 320 - o, m - l);     /* in place: left to right */
+    l = m;
+  }
+  {                                     /* after the last packet of entry 0x8C: the HUD is added to entry 0x90 later */
+    u32 *t = (u32 *)(db + 0x8C), stop = (db + 0x90) & 0xFFFFFF, n = 0;
+    while ((t[0] & 0xFFFFFF) != stop && n++ < 8192) t = (u32 *)((t[0] & 0xFFFFFF) | 0x80000000u);
+    CP_END(t);
+  }
+}
+
+static void hpass_wrap(void)                           /* transition: everything drawn before entry 0x78, wrapping */
+{
+  u32 db = R32(DBPTR), fb = fbuf(db), l;
+  CP_BEGIN(720);
+  for (l = 0; l < 240; l++) {                          /* per line, o = offset mod 320 (negative = to the right) */
+    s32 o = w_oh[l] % 320;
+    if (o < 0) o += 320;
+    if (!o) continue;
+    CP(0, fb + l, 0, SCR0 + (l & 7), o, 1);            /* the o pixels that wrap, saved */
+    CP(o, fb + l, 0, fb + l, 320 - o, 1);              /* the rest, left in place */
+    CP(0, SCR0 + (l & 7), 320 - o, fb + l, o, 1);      /* the saved pixels at the right end */
+  }
+  CP_END((u32 *)(db + 0x78));
+}
+
+/* Resident dispatcher (m8w_disp.S, assembled for 0x801D3000) and the renderer words it takes over; m8w_cfg.c is
+   generated by the build from the disc's EXE (the three link calls and the final return of 0x800F96C0). */
+void m8w_hook(u8 *scr, u32 depth, u32 *a, u32 *b);
+extern const u32 m8w_disp_code[], m8w_disp_words, m8w_disp_table;
+extern const u32 m8w_sites[4], m8w_site_words[4];
+extern void flush_cache(void);                 /* 0x800D78EC: BIOS FlushCache */
+extern void p5_water(u8 *o);
+#define OVLNO 0x801C738Cu                      /* overlay number */
+
+/* P5 0x29 entry: install the dispatcher (once; the renderer's words are checked every frame), register this
+   overlay's hook, then the lifted Saturn handler. */
+void p5_water_entry(u8 *o)
+{
+  u32 i;
+  if (R32(m8w_sites[3]) != m8w_site_words[3]) {
+    for (i = 0; i < m8w_disp_words; i++) ((volatile u32 *)0x801D3000u)[i] = m8w_disp_code[i];
+    for (i = 0; i < 16; i++) ((volatile u32 *)m8w_disp_table)[i] = 0;
+    for (i = 0; i < 4; i++) R32(m8w_sites[i]) = m8w_site_words[i];
+    flush_cache();
+  }
+  ((volatile u32 *)m8w_disp_table)[R8(OVLNO) & 15] = (u32)m8w_hook;
+  p5_water(o);
+}
+
+/* The stage layer renderer calls this instead of link_layer for each active layer (a, b = its two bucket lists), and
+   once more after the three layers with a = 0. */
+void m8w_hook(u8 *scr, u32 depth, u32 *a, u32 *b)
+{
+  u32 layer;
+  if (!a) {
+    if (mode == 0x402) hpass_ripple();
+    else if (mode == 2 || mode == 0x200) hpass_wrap();
+    mode = 0;
+    return;
+  }
+  layer = ((u32)a - 0x8015C988u) / 0x180;
+  if (layer == 0) {
+    mode = SCRCTL;
+    if (mode != 0x402 && mode != 2 && mode != 0x200) mode = 0;
+    pool = BUF(R8(BUFIDX) & 1); pend = pool + NWORDS;
+    if (mode) convert();
+  }
+  link_layer(scr, depth, a, b);
+}
+'''
+
+M8W_DISP_ASM = r'''# Resident dispatcher (copied to 0x801D3000 by the first water frame; 0x801D3000-0x801D7FFF lies between the EXE image
+# and the overlays and has no fixed user). The stage layer renderer's three link calls and its final return are pointed
+# here; the per-overlay table (16 words after the code) holds the hook of each water overlay, 0 for every other one.
+    .set noreorder
+    .set noat
+    .text
+    .globl disp_link
+disp_link:                       # link_layer(scr, depth, a, b) or the overlay's hook with the same arguments
+    lui   $t0, 0x801c
+    lbu   $t0, 0x738c($t0)
+    lui   $t1, %hi(disp_table)
+    andi  $t0, $t0, 15
+    sll   $t0, $t0, 2
+    addu  $t1, $t1, $t0
+    lw    $t1, %lo(disp_table)($t1)
+    nop
+    beqz  $t1, 1f
+    nop
+    jr    $t1
+    nop
+1:  j     0x800F9DD0
+    nop
+    .globl disp_end
+disp_end:                        # the renderer's return: hook(scratch, 0xFF, 0, 0) then back to its caller
+    lui   $t0, 0x801c
+    lbu   $t0, 0x738c($t0)
+    lui   $t1, %hi(disp_table)
+    andi  $t0, $t0, 15
+    sll   $t0, $t0, 2
+    addu  $t1, $t1, $t0
+    lw    $t1, %lo(disp_table)($t1)
+    nop
+    beqz  $t1, 2f
+    lui   $a0, 0x1f80
+    li    $a1, 0xff
+    move  $a2, $zero
+    jr    $t1
+    move  $a3, $zero
+2:  jr    $ra
+    nop
+    .align 4
+    .globl disp_table
+disp_table:
+    .space 64
+'''
+
+def _m8w_asm(text, base, wd, name):
+    import subprocess
+    s, o, elf, ld = (os.path.join(wd, name + x) for x in ('.S', '.o', '.elf', '.ld'))
+    open(s, 'w').write(text)
+    subprocess.run([_CROSS + 'as', '-EL', '-march=r3000', '-mabi=32', '-o', o, s], check=True)
+    open(ld, 'w').write('SECTIONS { . = %#x; .text : { *(.text*) } /DISCARD/ : { *(.MIPS.*) *(.reginfo) *(.pdr) *(.gnu.attributes) *(.note*) } }\n' % base)
+    subprocess.run([LD, '-EL', '-T', ld, o, '-o', elf], check=True)
+    return elf_image(elf)
+
+def m8w_disp_cfg(disc, wd):
+    """m8w_cfg.c: the dispatcher's code (assembled for M8W_DISP), the four renderer words it takes over (the three
+    `jal link` and the final `jr ra` of the layer renderer, found in the disc's EXE) and their new values."""
+    data, sy = _m8w_asm(M8W_DISP_ASM, M8W_DISP, wd, 'm8w_disp')
+    assert sy['disp_table'] + 64 <= Psx.OVL_BASE
+    rr = disc.exe_words(M8W_RR, M8W_RR_LEN // 4)
+    jal = lambda t: 3 << 26 | (t >> 2) & 0x3FFFFFF
+    sites = [M8W_RR + 4 * k for k, w in enumerate(rr) if w == jal(M8W_LINK)]
+    rets = [M8W_RR + 4 * k for k, w in enumerate(rr) if w == 0x03E00008]
+    assert len(sites) == 3 and len(rets) == 1, 'unexpected layer renderer'
+    words = [jal(sy['disp_link'])] * 3 + [2 << 26 | (sy['disp_end'] >> 2) & 0x3FFFFFF]
+    n = (sy['disp_table'] - M8W_DISP) >> 2
+    code = struct.unpack('<%dI' % n, data[:4 * n])
+    return ('typedef unsigned int u32;\nconst u32 m8w_disp_code[] = { %s };\nconst u32 m8w_disp_words = %d, m8w_disp_table = %#x;\n'
+            'const u32 m8w_sites[4] = { %s };\nconst u32 m8w_site_words[4] = { %s };\n'
+            % (', '.join('%#x' % w for w in code), n, sy['disp_table'], ', '.join('%#x' % a for a in sites + rets),
+               ', '.join('%#x' % w for w in words)))
+
+def build_m8w_overlay(disc, name, idx, lui, workdir=None):
+    """(overlay `name` with the lifted water handler + the PSX side appended and P5 entry 0x29 pointing at it, symbols)."""
+    import tempfile
+    wd = os.path.join(workdir or tempfile.mkdtemp(prefix='mm8w_'), name); os.makedirs(wd, exist_ok=True)
+    e = disc.file_entry(idx); ovl = disc.read(e[0], e[1])
+    assert md5_bytes(ovl) == KNOWN_MD5[('psx', f'OVL/{name}.BIN')], f'unexpected {name} overlay (already patched?)'
+    base = Psx.OVL_BASE; out = bytearray(ovl)
+    PSX_P5_LUI[name] = lui
+    p5 = relocate_p5_table(out, name, [], (len(out) + 0xF) & ~0xF)
+    code_base = (base + len(out) + 0xF) & ~0xF
+    files = [('m8w_water.c', water_lift()[0]), ('m8w_render.c', M8W_RENDER_C),
+             ('m8w_cfg.c', m8w_disp_cfg(disc, wd))]
+    srcs = []
+    for fn, txt in files:
+        p = os.path.join(wd, fn); open(p, 'w').write(txt); srcs.append(p)
+    syms = dict(helper_symbols(), link_layer=M8W_LINK, flush_cache=0x800D78EC, m8w_buf=M8W_BUF, w_lst=M8W_LST)
+    old = CFLAGS[:]; CFLAGS[:] = old + ['-fno-common']
+    try: data, sy = compile_c(srcs, code_base, syms, workdir=wd)
+    finally: CFLAGS[:] = old
+    bad = check_r3000(data, code_base, sy['sat_data']); assert not bad, bad[:5]
+    end = code_base + len(data)
+    past = [k for k, v in sy.items() if end <= v < base + 0x100000 and k not in syms]
+    assert not past, f'symbols outside the loaded image (.bss?): {past}'
+    assert end <= M8W_LIMIT.get(name, 0x801F8000), (name, hex(end))
+    out += bytes(code_base - base - len(out)) + data
+    struct.pack_into('<I', out, p5 - base + 4 * 0x29, sy['p5_water_entry'])
+    return bytes(out), dict(code=code_base, end=end, p5=p5, p5_water=sy['p5_water'], hook=sy['m8w_hook'])
+
+def patch_m8_water(disc, lba, workdir=None):
+    """The four water overlays with the lifted P5 0x29 (moved to the free sectors from `lba`). The records come from
+    patch_m8_placements / patch_m8_demos (the Saturn lists). Returns info (m8w_sectors = sectors used)."""
+    info, used = {}, 0
+    for name, idx, lui in M8W_STAGES:
+        out, inf = build_m8w_overlay(disc, name, idx, lui, workdir)
+        n = place_moved_file(disc, idx, out, f'OVL/{name}.BIN', lba + used)
+        info.update({f'{name}_{k}': v for k, v in inf.items()}, **{f'{name}_lba': lba + used, f'{name}_size': len(out)})
+        used += n
+    info['m8w_sectors'] = used
+    return info
+
 def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     """The current patch on a raw PSX track 1 (all in place, sector EDC/ECC fixed):
       - track 1 extended by PSX_EXTEND_SECTORS empty sectors (extend_track1);
@@ -2047,6 +2369,9 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
       - the boss-intro name as on the Saturn: orange-gold, the Saturn's letters (SELECT.PAC in place, patch_m8_name_color);
       - the HUD's head icon and lives digit at the Saturn's positions, each moved 1 px (EXE, patch_m8_hud_head);
       - the attract demos = the Saturn's: placement lists and converted demo records (PDEMO00-04.PAC in place, patch_m8_demos);
+      - the stage-select ticker (patch_m8_ticker);
+      - the Saturn's water effects: STAGE00 / 06 / 07 / 0D overlays with the lifted P5 0x29 handler, moved to the free
+        sectors (patch_m8_water);
       - extra_patches: callables f(disc, next_free_lba, workdir) -> (sectors used, info dict), applied last, after
         every port (none in the release build)."""
     disc = RawDisc(src_bin)
@@ -2099,6 +2424,8 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update(patch_m8_demos(disc))
     m8k = patch_m8_ticker(disc, nxt, (m8t['tengu_lba'], m8t['tengu_size']), workdir); nxt += m8k['tk_sectors']   # M8t4
     info.update({'m8k_' + k: v for k, v in m8k.items()})
+    m8w = patch_m8_water(disc, nxt, workdir); nxt += m8w['m8w_sectors']                # item 8: water effects
+    info.update({'m8w_' + k if not k.startswith('m8w') else k: v for k, v in m8w.items()})
     for f in extra_patches:
         used, more = f(disc, nxt, workdir); nxt += used; info.update(more)
     disc.save(out_bin)
@@ -2163,7 +2490,7 @@ def check_build(orig_bin, new_bin, demo_tail=None):
         t, off, cn = next(c for c in chunks if c[0] == 0xA)
         new_pac = disc.read(ext, sz)
         assert new_pac[off:off + cn] == m8p_chunk(st), st
-        assert m5_bolt19() not in new_pac[off:off + cn] and not any(r[0] == 0x29 and r[2] == 4 for r in place_records(new_pac[off:off + cn], 'psx')), st
+        assert m5_bolt19() not in new_pac[off:off + cn], st
         if st[:7] not in ('STAGE08', 'STAGE09'):          # (STAGE08/09.PAC are rebuilt by M2a / M4a)
             old_pac = od.read(oe, osz)
             assert (ext, sz) == (oe, osz) and new_pac[:off] == old_pac[:off] and new_pac[off + cn:] == old_pac[off + cn:], st
@@ -2180,6 +2507,11 @@ def check_build(orig_bin, new_bin, demo_tail=None):
             ty, off, n = next(x for x in chunks if x[0] == typ); want[off:off + n] = c
         assert new_pac == bytes(want), st
     out['m8_demos'] = len(M8D_DEMOS)
+    for name, idx, lui in M8W_STAGES:                     # item 8: the water overlays = fresh builds; the EXE's renderer as on the disc
+        e = disc.file_entry(idx)
+        assert disc.read(e[0], e[1]) == build_m8w_overlay(od, name, idx, lui)[0] and disc.iso_record(f'OVL/{name}.BIN')[2:] == (e[0], e[1]), name
+    assert disc.exe_words(M8W_RR, M8W_RR_LEN // 4) == od.exe_words(M8W_RR, M8W_RR_LEN // 4), 'layer renderer'
+    out['m8_water'] = [disc.file_entry(idx)[:2] for _, idx, _ in M8W_STAGES]
     # M7a: DEMO.BIN rebuilt in its own slot; its virtual entry points at the bonus overlay
     e8, o8 = disc.file_entry(PSX_DEMO_FILE), od.file_entry(PSX_DEMO_FILE)
     assert e8[0] == o8[0] and e8[2] == o8[2] and e8[1] <= PSX_DEMO_SLOT * 2048, 'DEMO.BIN entry'
@@ -3426,7 +3758,7 @@ void tk_frame(void)
   if (on && SS_CUR == @TENGU@) {
     u32 *p = PRIMS + (DRAWBUF & 1) * 0x200;
     int sat = ENTRY[0] == ent_sat[0], j;
-    u32 tw, vb, P, pos, y;
+    u32 tw, vb, P, pos, y, y0;
     if (!was) { load_image((void *)r_ps, img_ps); load_image((void *)r_sat, img_sat); load_image((void *)r_clut, (void *)clut_tk);
                 load_image((void *)r_hint, img_hint); load_image((void *)r_hclut, (void *)clut_hint); was = 1; frames = 0; blink = 0; }
     if (st == 1 && (PAD_NEW & @SELECT@)) {
@@ -3435,17 +3767,30 @@ void tk_frame(void)
       sound_centred(@SOUND@, 0); frames = 0;
     }
     tw = sat ? @PX_SAT@ : @PX_PS@; vb = sat ? 8 : 0; P = tw + @GAP@; pos = (frames >> 1) % P;
+    /* Clipped to the panel's row spans by the drawing area (E3 / E4 per row), the strip always drawn from u = 0:
+       the earlier version clipped by starting at u = lo - xc, and real consoles garbled the ticker once its left
+       end reached the panel edge (emulators drew it correctly). Packets go to the head of entry +0x94, so the one
+       added first (the drawing area put back from the draw struct's own E3 / E4) is drawn last. */
+    p[0] = 2 << 24; p[1] = *(volatile u32 *)(DRAWSTRUCT + 0x20); p[2] = *(volatile u32 *)(DRAWSTRUCT + 0x24);
+    add_prim((void *)(DRAWSTRUCT + 0x94), p); p += 3;
+    y0 = (*(volatile u32 *)(DRAWSTRUCT + 0x20) >> 10) & 0x1FF;     /* this buffer's top row in VRAM */
     for (y = 0; y < 7; y++) {
       int l = tk_l[y], r = tk_r[y];
+      u32 *q = p, n = 2;
+      q[1] = 0xE3u << 24 | (y0 + 204 + y) << 10 | l;
+      q[2] = 0xE4u << 24 | (y0 + 204 + y) << 10 | r;
       for (j = (frames >> 1) >= P ? -1 : 0; j <= 1; j++) {   /* no earlier pass right after a (re)start */
-        int xc = 289 - (int)pos + j * (int)P, lo = xc > l ? xc : l, hi = xc + (int)tw - 1 < r ? xc + (int)tw - 1 : r;
-        if (lo > hi) continue;
-        p[0] = 4 << 24; p[1] = 0x65u << 24 | 0x808080;
-        p[2] = (204 + y) << 16 | lo;
-        p[3] = (u32)(272 << 6 | 960 >> 4) << 16 | (vb + y) << 8 | (lo - xc);
-        p[4] = 1 << 16 | (hi - lo + 1);
-        add_prim((void *)(DRAWSTRUCT + 0x94), p); p += 5;
+        int xc = 289 - (int)pos + j * (int)P;
+        if (xc > r || xc + (int)tw - 1 < l) continue;
+        q[n + 1] = 0x65u << 24 | 0x808080;
+        q[n + 2] = (204 + y) << 16 | (xc & 0xFFFF);
+        q[n + 3] = (u32)(272 << 6 | 960 >> 4) << 16 | (vb + y) << 8;
+        q[n + 4] = 1 << 16 | tw;
+        n += 4;
       }
+      if (n == 2) continue;
+      q[0] = n << 24;
+      add_prim((void *)(DRAWSTRUCT + 0x94), q); p += n + 1;
     }
     if (blink < @BLINK_ON@) {
       p[0] = 4 << 24; p[1] = 0x65u << 24 | 0x808080;
@@ -4095,22 +4440,14 @@ static void ill_distribute(void)                    /* Saturn 0x0600B54C: the ch
   psx_load_image(ill_bw_rect, ill_bw);
   ill_shown = ill_cur;
 }
-/* Read stall (M7c v2 test: the screen paused briefly before each new picture). When a read ends, the loader's ready
-   callback (interrupt time) stops the drive with CdControlB(CdlPause) at 0x800FC1A4 and waits for the pause to complete,
-   a few frames in which no frame is shown (Mednafen: 3-4 identical frames before the swap; the game loop itself keeps
-   running). The game only reads behind black screens; the Saturn viewer reads while the picture is up. For the
-   illustration reads only, that call becomes CdControl (0x800CEEE8, same arguments: returns once the drive has
-   acknowledged the command); the next read already waits for the drive (0x800FB7A4: status, then CdSync). Restored when
-   the read has finished. */
-extern void psx_flush_cache(void);
-#define PAUSE_CALL (*(volatile u32 *)0x800FC1A4)
-#define JAL_CDCONTROLB (0x0C000000u | (0x800CF14Cu >> 2 & 0x3FFFFFF))   /* jal 0x800CF14C */
-#define JAL_CDCONTROL  (0x0C000000u | (0x800CEEE8u >> 2 & 0x3FFFFFF))   /* jal 0x800CEEE8 */
+/* The reads use the game's own loader unchanged: when a read ends, its ready callback (interrupt time) stops the drive
+   with CdControlB(CdlPause) at 0x800FC1A4 and waits for the pause to complete, so a new picture holds for a few frames
+   before the swap (an earlier version turned that call into the non-blocking CdControl during these reads; real
+   consoles were reported to freeze in this screen with it, and it was the only change to the game's CD handling, so it was removed). */
 static u32 ill_start(u32 name)
 {
   u32 n = (name - ILL_NAMES) / 13;
   if (name < ILL_NAMES || n >= 30 || name != ILL_NAMES + 13 * n) return 0;
-  PAUSE_CALL = JAL_CDCONTROL; psx_flush_cache();
   psx_file_load((u32)bonus_ill_vf + n, ILL_BUF);
   ill_cur = n;
   return 1;
@@ -4127,7 +4464,6 @@ __attribute__((noinline, noipa)) u32 h_0600b50c(u32 name, u32 b, u32 c, u32 d) {
 __attribute__((noinline, noipa)) u32 h_0600a928(u32 a, u32 b, u32 c, u32 d)
 {
   if (!psx_load_done()) return 1;
-  if (PAUSE_CALL != JAL_CDCONTROLB) { PAUSE_CALL = JAL_CDCONTROLB; psx_flush_cache(); }
   if (ill_pending) { ill_pending = 0; ill_distribute(); }
   return 0;
 }
@@ -4802,7 +5138,7 @@ RELEASE_VERSION = '0.5.0'
 RELEASE_IN_MD5 = {'psx': '4e9e6dcf27ea0e15c5f4d1f93c800378', 'sat': 'a4d575cd681b7d7c88b45d639ed7ffb7'}
 RELEASE_AUDIO_MD5 = {'psx': {2: 'a75dcbb5c831a966c47563e7ea4150c9', 3: '2d7b5e8e94a91bf5423b2356f6a34863'},
                      'sat': {2: 'a2201327867523e4e31de62c445e2996'}}
-RELEASE_OUT_MD5 = '1db0d65c93b3bc6992ec04d6710d33a7'
+RELEASE_OUT_MD5 = 'a2c185492673fcb91b1059d2216b394f'
 RELEASE_NAME = 'Mega Man 8 - Complete'
 _RAW_SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
 
