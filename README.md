@@ -26,10 +26,10 @@ A fan project that turns **Mega Man 8 (USA, PlayStation, SLUS-00453)** into the 
 
 ### Post-Release (Quality of Life Changes)
 
-15. Fix any grammatical issues with the dialogue - **Not Started**
-16. Review HUD transparency - **Not Started**
-17. Overhaul the bolt/shop system to allow for all items to be purchased in a single playthrough - **Not Started**
-18. Assess the need for a full re-translation - **Not Started**
+15. Review HUD transparency - **Not Started**
+16. Overhaul the bolt/shop system to allow for all items to be purchased in a single playthrough - **Not Started**
+17. Assess the need for a full re-translation - **Not Started**
+18. Fix any grammatical issues with the dialogue - **Not Started**
 
 ### Post-Release (Cleanup & Optimizations)
 
