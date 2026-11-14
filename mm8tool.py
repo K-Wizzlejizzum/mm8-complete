@@ -1994,6 +1994,44 @@ def patch_m8_demos(disc):
             disc.write(ext, off, new)
     return dict(m8_demos=len(M8D_DEMOS))
 
+# ---- Water effects (item 8): the intro's caustic backdrop. The Saturn's STAGE00 layer 1 (the backdrop behind the map,
+# grid chunk 1) carries a net of light lines on screens 70 (row 5) and 72-78 (row 4), x 0x800-0xEFF, y 0x400-0x5FF:
+# the rooms below the water line. The PSX made screen 70 one flat block and dropped the net from 72-78 (17 blocks and
+# 16 tiles fewer). The screens are restored from the Saturn (restore_stage_map: new tiles from the blank slots 0x4D0 on,
+# new blocks appended; the map is drawn semi-transparent over layer 1, so the net shows through it as on the Saturn).
+# The map-tile chunk grows by one sector; merging the three grid chunks (pac_merge_grids) saves one, so STAGE00.PAC and
+# PDEMO00.PAC (a copy of STAGE00) keep their size and LBA: in place, no sectors.
+M8WC_STAGES = ('STAGE00', 'PDEMO00')
+M8WC_SCREENS = (70, 72, 73, 74, 75, 76, 77, 78)
+M8WC_TILE_FIRST = 0x4D0           # PSX STAGE00 0x103 slots 0x4D0-0x4DF blank and unused; the chunk (0x4E0 tiles) grows after
+
+def m8wc_chunks(st):
+    """{3, 4, 0x103: bytes} of `st` with the Saturn's caustic screens restored, and the restore info."""
+    new, info = restore_stage_map(st, {}, [], list(M8WC_SCREENS), M8WC_TILE_FIRST)
+    return {t: new[t] for t in (3, 4, 0x103)}, info
+
+def m8wc_pac(pac, st):
+    """A STAGE00 / PDEMO00 PAC (as on the disc, other chunks already patched) with the caustic screens restored and
+    the grids merged; same size."""
+    ents = [(t, b) for t, o, b in unpac_bytes(pac)]
+    orig = pac_chunks('psx', st)
+    assert [t for t, _ in ents[:3]] == [0, 1, 2] and all(b == orig[t] for t, b in ents if t in (0, 1, 2, 3, 4, 0x103)), \
+        f'unexpected {st}.PAC (already patched?)'
+    new, info = m8wc_chunks(st)
+    out = pac_build(pac_merge_grids([(t, new.get(t, b)) for t, b in ents]))
+    assert len(out) == len(pac), f'{st}.PAC with the caustics is {len(out):#x} bytes, slot is {len(pac):#x}'
+    return out, info
+
+def patch_m8_caustics(disc):
+    """The Saturn's caustic backdrop in STAGE00.PAC and PDEMO00.PAC (rebuilt in place, same size). Returns info."""
+    info = {}
+    for st in M8WC_STAGES:
+        ext, sz, _ = pac_locate(disc, f'STDATA/{st}.PAC')
+        pac, i = m8wc_pac(disc.read(ext, sz), st)
+        disc.write(ext, 0, pac)
+        info[st.lower() + '_caustic_tiles'] = i['new_tiles']; info[st.lower() + '_caustic_blocks'] = i['new_blocks']
+    return info
+
 def relocate_p5_table(out, stage, extra, at):
     """Append a copy of the EXE P5 table (52 entries) + `extra` handlers (types 0x34...) at overlay offset `at` (out is
     extended as needed) and repoint the overlay's P5 loop (lui/addiu)."""
@@ -2369,6 +2407,8 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
       - the boss-intro name as on the Saturn: orange-gold, the Saturn's letters (SELECT.PAC in place, patch_m8_name_color);
       - the HUD's head icon and lives digit at the Saturn's positions, each moved 1 px (EXE, patch_m8_hud_head);
       - the attract demos = the Saturn's: placement lists and converted demo records (PDEMO00-04.PAC in place, patch_m8_demos);
+      - the intro's caustic backdrop (layer 1 below the water line) from the Saturn (STAGE00 / PDEMO00.PAC in place,
+        patch_m8_caustics);
       - the stage-select ticker (patch_m8_ticker);
       - the Saturn's water effects: STAGE00 / 06 / 07 / 0D overlays with the lifted P5 0x29 handler, moved to the free
         sectors (patch_m8_water);
@@ -2422,6 +2462,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update(patch_m8_name_color(disc))
     info.update(patch_m8_hud_head(disc))
     info.update(patch_m8_demos(disc))
+    info.update(patch_m8_caustics(disc))                                        # item 8: the intro's caustic backdrop
     m8k = patch_m8_ticker(disc, nxt, (m8t['tengu_lba'], m8t['tengu_size']), workdir); nxt += m8k['tk_sectors']   # M8t4
     info.update({'m8k_' + k: v for k, v in m8k.items()})
     m8w = patch_m8_water(disc, nxt, workdir); nxt += m8w['m8w_sectors']                # item 8: water effects
@@ -2491,7 +2532,11 @@ def check_build(orig_bin, new_bin, demo_tail=None):
         new_pac = disc.read(ext, sz)
         assert new_pac[off:off + cn] == m8p_chunk(st), st
         assert m5_bolt19() not in new_pac[off:off + cn], st
-        if st[:7] not in ('STAGE08', 'STAGE09'):          # (STAGE08/09.PAC are rebuilt by M2a / M4a)
+        if st in M8WC_STAGES:                            # (item 8: rebuilt with the caustic backdrop, same size and LBA)
+            old_pac = bytearray(od.read(oe, osz)); ot, ooff, ocn = next(c for c in pac_locate(od, f'STDATA/{st}.PAC')[2] if c[0] == 0xA)
+            old_pac[ooff:ooff + ocn] = m8p_chunk(st)
+            assert (ext, sz) == (oe, osz) and new_pac == m8wc_pac(bytes(old_pac), st)[0], st
+        elif st[:7] not in ('STAGE08', 'STAGE09'):        # (STAGE08/09.PAC are rebuilt by M2a / M4a)
             old_pac = od.read(oe, osz)
             assert (ext, sz) == (oe, osz) and new_pac[:off] == old_pac[:off] and new_pac[off + cn:] == old_pac[off + cn:], st
     e5 = disc.file_entry(PSX_STAGE05_FILE)
@@ -2501,10 +2546,11 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     t8 = m8d_tables()                                      # item 7: PDEMO00-04 = Saturn lists + converted records
     for st in M8D_DEMOS:
         ext, sz, chunks = pac_locate(disc, f'STDATA/{st}.PAC'); oe, osz, ochunks = pac_locate(od, f'STDATA/{st}.PAC')
-        assert (ext, sz, chunks) == (oe, osz, ochunks), st
+        assert (ext, sz) == (oe, osz) and (chunks == ochunks or st in M8WC_STAGES), st
         new_pac, old_pac = disc.read(ext, sz), od.read(oe, osz); want = bytearray(old_pac)
         for typ, c in ((0xA, m8p_chunk(st)), (0x11, m8d_chunk(st, t8))):
-            ty, off, n = next(x for x in chunks if x[0] == typ); want[off:off + n] = c
+            ty, off, n = next(x for x in ochunks if x[0] == typ); want[off:off + n] = c
+        if st in M8WC_STAGES: want = m8wc_pac(bytes(want), st)[0]
         assert new_pac == bytes(want), st
     out['m8_demos'] = len(M8D_DEMOS)
     for name, idx, lui in M8W_STAGES:                     # item 8: the water overlays = fresh builds; the EXE's renderer as on the disc
