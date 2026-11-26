@@ -21,7 +21,7 @@ sub-screen; the Saturn placement list in every stage PAC + the Saturn bat (P2 0x
 overlay; the credits hint; the boss-intro name in the Saturn's colors and letters; the HUD head icon and lives digit at the
 Saturn's positions; the Saturn's Tengu Man stage song converted to a second bank for music 5. check_build then re-checks the image (sectors, EDC/ECC, music entries, DEMO/bonus/SLABO, SELECT.PAC, HUD list).
 """
-import os, sys, re, struct, hashlib, argparse, collections, random, functools
+import os, sys, re, struct, hashlib, argparse, collections, functools
 
 
 WORK = os.path.abspath(os.environ.get('MM8_WORK', './mm8work'))
@@ -1211,7 +1211,6 @@ def lift(code, name, entry, tables, port, extra_entries=(), stops=(), stack_word
         return d, addr
     def emit_ins(i, a, ind='  '):
         mn, n, m = i.mn, i.n, i.m
-        R = lambda k: f'r{k}'
         if mem_ops(i):
             kind, size, b, disp, idx, vr = mem_ops(i)
             if mn.startswith('sts.l'):
@@ -2311,9 +2310,7 @@ M8W_DISP_ASM = r'''# Resident dispatcher (copied to 0x801D3000 by the first wate
 # here; the per-overlay table (16 words after the code) holds the hook of each water overlay, 0 for every other one.
     .set noreorder
     .set noat
-    .text
-    .globl disp_link
-disp_link:                       # link_layer(scr, depth, a, b) or the overlay's hook with the same arguments
+    .macro HOOK_OF_OVERLAY       # t1 = disp_table[loaded overlay & 15] (0 = no hook)
     lui   $t0, 0x801c
     lbu   $t0, 0x738c($t0)
     lui   $t1, %hi(disp_table)
@@ -2322,6 +2319,11 @@ disp_link:                       # link_layer(scr, depth, a, b) or the overlay's
     addu  $t1, $t1, $t0
     lw    $t1, %lo(disp_table)($t1)
     nop
+    .endm
+    .text
+    .globl disp_link
+disp_link:                       # link_layer(scr, depth, a, b) or the overlay's hook with the same arguments
+    HOOK_OF_OVERLAY
     beqz  $t1, 1f
     nop
     jr    $t1
@@ -2330,14 +2332,7 @@ disp_link:                       # link_layer(scr, depth, a, b) or the overlay's
     nop
     .globl disp_end
 disp_end:                        # the renderer's return: hook(scratch, 0xFF, 0, 0) then back to its caller
-    lui   $t0, 0x801c
-    lbu   $t0, 0x738c($t0)
-    lui   $t1, %hi(disp_table)
-    andi  $t0, $t0, 15
-    sll   $t0, $t0, 2
-    addu  $t1, $t1, $t0
-    lw    $t1, %lo(disp_table)($t1)
-    nop
+    HOOK_OF_OVERLAY
     beqz  $t1, 2f
     lui   $a0, 0x1f80
     li    $a1, 0xff
@@ -2419,7 +2414,26 @@ def patch_m8_water(disc, lba, workdir=None):
     info['m8w_sectors'] = used
     return info
 
-def build_image(src_bin, out_bin, workdir=None, extra_patches=(), music_spu_low=False, saturn_music=None):
+def sat_music_numbers():
+    """{PSX music number: Saturn bank file} for every bank of the SAT_TUNES sets other than the shipped three (Saturn
+    bank n + 1 = PBGMn, the bank number read from the bank's sound-ID table). Music 5 (the Tengu Man bank) is left out."""
+    tuned = {b for v in SAT_TUNES.values() if not v.get('shipped') for b in v['banks']}
+    out = {}
+    for f in sorted(tuned):
+        tab = pac_chunks('sat', f)[0x201]
+        ids = {k for k in range(len(tab) // 8) if any(tab[8 * k:8 * k + 8])} - {0}
+        bank = collections.Counter(tab[8 * k] for k in ids).most_common(1)[0][0] if ids else tab[0]
+        n = bank - 1
+        assert os.path.exists(os.path.join(PSX_FILES, 'SOUND', f'PBGM{n:02X}.PAC')) and n not in out, f
+        if n != PSX_TENGU_MUSIC: out[n] = f
+    return out
+
+def sat_music_banks():
+    """{PSX music number: converted bank} for every Saturn bank of sat_music_numbers, the PSX stage sounds kept
+    (psx_sfx). Music 5 (the shipped Tengu Man bank) and 0x46-0x49 are placed by their own build steps."""
+    return {n: build_music_bank(f, psx_sfx=True)[0] for n, f in sorted(sat_music_numbers().items())}
+
+def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=None):
     """The current patch on a raw PSX track 1 (all in place, sector EDC/ECC fixed):
       - track 1 extended by PSX_EXTEND_SECTORS empty sectors (extend_track1);
       - STAGE08 overlay with the relocated enemy table + lifted Wood Man / leaf code (build_m2_overlay) in the free
@@ -2444,18 +2458,16 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), music_spu_low=
       - the stage-select ticker (patch_m8_ticker);
       - the Saturn's water effects: STAGE00 / 06 / 07 / 0D overlays with the lifted P5 0x29 handler, moved to the free
         sectors (patch_m8_water);
-      - music_spu_low: the music bank loaded right after the common sound bank (patch_music_spu_low; off in the
-        release build until the converted Saturn songs that need the room ship);
       - extra_patches: callables f(disc, next_free_lba, workdir) -> (sectors used, info dict), applied last, after
         every port (none in the release build);
-      - saturn_music ({music number: converted bank bytes}; None in the release build): every bank placed after the
-        Tengu Man bank (track 1 extended by enough more sectors), the sound test with both versions of every song,
-        music_spu_low and the SEQ room (patch_music_seq_room) on; disc.sat_music = {music: (LBA, size)} incl. music 5."""
+      - every converted Saturn song (saturn_music = {music number: bank bytes}; None = sat_music_banks()): each bank
+        placed after the Tengu Man bank (track 1 extended by enough more sectors), the sound test with both versions of
+        every song, the music bank right after the common sound bank (patch_music_spu_low) and the SEQ room
+        (patch_music_seq_room); disc.sat_music = {music: (LBA, size)} incl. music 5."""
+    if saturn_music is None: saturn_music = sat_music_banks()
     disc = RawDisc(src_bin)
-    ext = PSX_EXTEND_SECTORS
-    if saturn_music is not None:
-        assert all(0 <= m < PSX_BGM_FIRST_NEW and m != PSX_TENGU_MUSIC for m in saturn_music)
-        ext += -(-(sum(sectors(len(b)) for b in saturn_music.values()) + SAT_MUSIC_SPARE) // 1024) * 1024
+    assert all(0 <= m < PSX_BGM_FIRST_NEW and m != PSX_TENGU_MUSIC for m in saturn_music)
+    ext = PSX_EXTEND_SECTORS + -(-(sum(sectors(len(b)) for b in saturn_music.values()) + SAT_MUSIC_SPARE) // 1024) * 1024
     extend_track1(disc, ext)
     assert disc.file_entry(PSX_STAGE08_FILE) == PSX_STAGE08_ENTRY, 'unexpected STAGE08 table entry (already patched?)'
     nxt = disc.free[0]
@@ -2492,18 +2504,16 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), music_spu_low=
     info.update({k if k.startswith('pac09') else 'm4_' + k: v for k, v in m4.items()})
     m8t = patch_m8_tengu_bank(disc, nxt); nxt += m8t['tengu_sectors']               # M8t3: the Saturn Tengu Man bank
     info.update(m8t)
-    sat = None
-    if saturn_music is not None:                                                    # every converted Saturn bank
-        sat = {}
-        for m in sorted(saturn_music):
-            sat[m] = (nxt, len(saturn_music[m])); nxt += place_file(disc, nxt, saturn_music[m])
-        info['sat_music_sectors'] = sum(sectors(v[1]) for v in sat.values())
+    sat = {}                                                                        # every converted Saturn bank
+    for m in sorted(saturn_music):
+        sat[m] = (nxt, len(saturn_music[m])); nxt += place_file(disc, nxt, saturn_music[m])
+    info['sat_music_sectors'] = sum(sectors(v[1]) for v in sat.values())
     m7 = patch_m7a(disc, nxt, workdir, info['vf0'], (m8t['tengu_lba'], m8t['tengu_size']), sat); nxt += m7['m7_sectors']          # M7a/M7b: title BONUS MODE, bonus overlay, SLABO
     info.update({'m7_' + k: v for k, v in m7.items()})
     patch_music_hook(disc, info['vf0'])
     patch_sound_guard(disc)
     info.update(patch_m2a(disc))
-    m8p = patch_m8_placements(disc, nxt, workdir); nxt += m8p['ovl05_sectors']    # supersedes patch_m5 (bolt 19)
+    m8p = patch_m8_placements(disc, nxt, workdir); nxt += m8p['ovl05_sectors']    # also drops floor bolts 19 and 38
     info.update({'m8p_' + k: v for k, v in m8p.items()})
     info.update(patch_m8_credits(disc))
     info.update(patch_m8_name_color(disc))
@@ -2515,32 +2525,31 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), music_spu_low=
     info.update({'m8k_' + k: v for k, v in m8k.items()})
     m8w = patch_m8_water(disc, nxt, workdir); nxt += m8w['m8w_sectors']                # item 8: water effects
     info.update({'m8w_' + k if not k.startswith('m8w') else k: v for k, v in m8w.items()})
-    if music_spu_low or saturn_music is not None: info.update(patch_music_spu_low(disc))
-    if saturn_music is not None:
-        info.update(patch_music_seq_room(disc))
-        for m, b in saturn_music.items():
-            ch = {t: c for t, o, c in unpac_bytes(b)}
-            assert len(ch[1]) <= info['seq_room'] and len(ch[0x201]) <= SPU_MUSIC_BODY_MAX_LOW, (hex(m), len(ch[1]), len(ch[0x201]))
-        disc.sat_music = {**sat, PSX_TENGU_MUSIC: (m8t['tengu_lba'], m8t['tengu_size'])}
-        info['sat_music'] = disc.sat_music
+    info.update(patch_music_spu_low(disc))
+    info.update(patch_music_seq_room(disc))
+    for m, b in saturn_music.items():
+        ch = {t: c for t, o, c in unpac_bytes(b)}
+        assert len(ch[1]) <= info['seq_room'] and len(ch[0x201]) <= SPU_MUSIC_BODY_MAX_LOW, (hex(m), len(ch[1]), len(ch[0x201]))
+    disc.sat_music = {**sat, PSX_TENGU_MUSIC: (m8t['tengu_lba'], m8t['tengu_size'])}
+    info['sat_music'] = disc.sat_music
     for f in extra_patches:
         used, more = f(disc, nxt, workdir); nxt += used; info.update(more)
     disc.save(out_bin)
     info.update(sectors_changed=len(disc.touched), free_lba=nxt, free_sectors_left=disc.free[1] - nxt)
     return info
 
-SAT_MUSIC_SPARE = 256                 # sectors kept free past the banks for the overlays that follow (saturn_music)
+SAT_MUSIC_SPARE = 256                 # sectors kept free past the Saturn banks for the overlays that follow
 
 def check_build(orig_bin, new_bin, demo_tail=None, saturn_music=None):
     """Independent check of a build: every sector that differs from the original (after the track-1 insertion) has a
     valid MSF header for its position, Mode 2 Form 1 and valid EDC/ECC (inserted sectors included; track 1's moved last
     sector unchanged apart from its header);
     the stage overlays' music entries 0x46-0x49 point at files equal to freshly built PBGM46-49. demo_tail(disc,
-    want_len, demo) -> info: accepts code appended to DEMO.BIN (none in the release build). Returns a dict (raises
-    AssertionError on a failure)."""
+    want_len, demo) -> info: accepts code appended to DEMO.BIN (none in the release build). saturn_music: the converted
+    Saturn banks the build placed (None = sat_music_banks()). Returns a dict (raises AssertionError on a failure)."""
+    if saturn_music is None: saturn_music = sat_music_banks()
     o = open(orig_bin, 'rb').read(); n = open(new_bin, 'rb').read(); S = 2352
-    last = len(o) // S - 1; ins = PSX_EXTEND_SECTORS
-    if saturn_music is not None: ins = (len(n) - len(o)) // S; assert ins > PSX_EXTEND_SECTORS and ins % 1024 == 0
+    last = len(o) // S - 1; ins = (len(n) - len(o)) // S; assert ins > PSX_EXTEND_SECTORS and ins % 1024 == 0
     assert len(n) == len(o) + ins * S
     bcd = lambda v: (v // 10) << 4 | v % 10
     changed = 0; to_fix = []
@@ -2623,7 +2632,7 @@ def check_build(orig_bin, new_bin, demo_tail=None, saturn_music=None):
     assert e8[0] >= PSX_FREE_LBA[0] and e8[2] == o8[2] and e8[1] <= PSX_DEMO_SLOT_M8K * 2048, 'DEMO.BIN entry'
     assert disc.iso_record('OVL/DEMO.BIN')[2:] == (e8[0], e8[1]), 'DEMO.BIN ISO record'
     assert disc.read(e8[0], PSX_DEMO_SLOT_M8K * 2048)[e8[1]:] == bytes(PSX_DEMO_SLOT_M8K * 2048 - e8[1]), 'DEMO.BIN slot'
-    pairs = tuple(sorted(saturn_music)) if saturn_music is not None else None
+    pairs = tuple(sorted(saturn_music))
     want_demo, want_bonus, i7 = build_m7_overlays(od.read(*o8[:2]), None, pairs)
     demo = disc.read(*e8[:2])
     m7len = len(want_demo)
@@ -2648,21 +2657,17 @@ def check_build(orig_bin, new_bin, demo_tail=None, saturn_music=None):
     mo = i7['music_vf_off']                       # M7e: the overlay's copy of the music 0x46-0x49 entries = the stage overlays'
     assert [struct.unpack_from('<3I', bonus, mo + 12 * k) for k in range(4)] == [next(iter(vf[m])) for m in range(0x46, 0x4A)], 'bonus music entries'
     want_bonus[mo:mo + 48] = bonus[mo:mo + 48]
-    eo = i7['e28_off']                            # M8t5: the sound test's two music-5 entries
-    assert bonus[eo:eo + 16] == struct.pack('<4I', *od.file_entry(PSX_TENGU_FILE)[:2], *tg), 'bonus music 5 entries'
-    want_bonus[eo:eo + 16] = bonus[eo:eo + 16]
-    if pairs is not None:                         # the pairs sound test's table = the placed banks / the user's PSX entries
-        so_, ne = i7['st_off'], i7['st_entries']; satm = {}
-        for k, (i, m, v) in enumerate(m8s_names(pairs)['entries']):
-            a, l, z = struct.unpack_from('<3I', bonus, so_ + 12 * k)
-            if v == 2: assert (a, l, z) == (0, 0, 0); continue
-            assert a == PSX_FILETAB + 12 * (0x17 + m)
-            if v == 0: assert (l, z) == od.file_entry(0x17 + m)[:2], hex(m)
-            else: satm[m] = (l, z)
-        assert satm.pop(PSX_TENGU_MUSIC) == tg and set(satm) <= set(pairs)
-        for m, (l, z) in satm.items(): assert disc.read(l, z) == saturn_music[m], hex(m)
-        want_bonus[so_:so_ + 12 * ne] = bonus[so_:so_ + 12 * ne]
-        out['sat_music'] = satm
+    so_, ne = i7['st_off'], i7['st_entries']; satm = {}   # the sound test's table = the placed banks / the user's PSX entries
+    for k, (i, m, v) in enumerate(m8s_names(pairs)['entries']):
+        a, l, z = struct.unpack_from('<3I', bonus, so_ + 12 * k)
+        if v == 2: assert (a, l, z) == (0, 0, 0); continue
+        assert a == PSX_FILETAB + 12 * (0x17 + m)
+        if v == 0: assert (l, z) == od.file_entry(0x17 + m)[:2], hex(m)
+        else: satm[m] = (l, z)
+    assert satm.pop(PSX_TENGU_MUSIC) == tg and set(satm) <= set(pairs)
+    for m, (l, z) in satm.items(): assert disc.read(l, z) == saturn_music[m], hex(m)
+    want_bonus[so_:so_ + 12 * ne] = bonus[so_:so_ + 12 * ne]
+    out['sat_music'] = satm
     assert demo == bytes(want_demo) and bonus == bytes(want_bonus), 'DEMO.BIN / bonus overlay'
     assert sl == vl + (vs + 2047) // 2048 and disc.read(sl, ss) == m7b_slabo_pac(pairs), 'converted SLABO.PAC'
     il0 = sl + (ss + 2047) // 2048                       # M7c: ILL00-29 follow SLABO, 33 sectors each
@@ -3344,9 +3349,33 @@ def scsp_to_spu_adsr(lay, octave, eg_fix=False):
     adsr2 = 0x8000 | 0x4000 | (Sr << 6) | 0x20 | Rr       # exponential sustain decrease, exponential release
     return adsr1, adsr2
 
+def _pcm16(y):
+    """Float samples -> list of 16-bit ints: rounded half to even (as round()) and clamped, in one numpy pass."""
+    import numpy as np
+    return np.clip(np.rint(np.asarray(y, float)), -32768, 32767).astype(np.int64).tolist()
+
+def _memo_put(d, key, val, cap):
+    """Store val in the bounded cache d (emptied when it reaches cap entries); returns val."""
+    if len(d) >= cap: d.clear()
+    d[key] = val
+    return val
+
+_RESAMPLE_MEMO = {}
+
 def resample_loop(pcm, lsa, lea, new_len, taps=24):
     """Windowed-sinc resample so the loop [lsa, lea) becomes exactly new_len samples (loop treated as periodic, so the
-    seam stays seamless). Returns (out, out_loop_start) with out[out_loop_start:] = the loop."""
+    seam stays seamless). Returns (out, out_loop_start) with out[out_loop_start:] = the loop. The converter tries
+    several storage lengths per sample, often the same one twice: results are cached by a SHA-256 of their inputs
+    (16-bit samples stored compactly)."""
+    import array
+    key = (hashlib.sha256(array.array('i', pcm[:lea]).tobytes()).digest(), lsa, lea, new_len, taps)
+    r = _RESAMPLE_MEMO.get(key)
+    if r is None:
+        out, nls = _resample_loop(pcm, lsa, lea, new_len, taps)
+        r = _memo_put(_RESAMPLE_MEMO, key, (array.array('h', out), nls), 1000)
+    return r[0].tolist(), r[1]
+
+def _resample_loop(pcm, lsa, lea, new_len, taps):
     import numpy as np
     x = np.asarray(pcm[:lea], float); L = lea - lsa; q = new_len / L
     n_ls = int(np.ceil(lsa * q))
@@ -3362,7 +3391,7 @@ def resample_loop(pcm, lsa, lea, new_len, taps=24):
         src = np.where(idx >= lea, lsa + (idx - lsa) % L, idx)
         val = np.where((src >= 0) & (src < lea), x[np.clip(src, 0, lea - 1)], 0.0)
         out += w * val
-    return [int(max(-32768, min(32767, round(v)))) for v in out], n_ls
+    return tuple(_pcm16(out)), n_ls
 
 def resample_oneshot(pcm, q, taps=24):
     """Windowed-sinc resample of a one-shot sample by q (output length ~ len * q); used for the tiny pitch corrections
@@ -3374,28 +3403,48 @@ def resample_oneshot(pcm, q, taps=24):
         idx = k0 + j; d = tau - idx
         w = fc * np.sinc(fc * d) * (0.5 + 0.5 * np.cos(np.pi * d / taps))
         out += w * np.where((idx >= 0) & (idx < len(x)), x[np.clip(idx, 0, len(x) - 1)], 0.0)
-    return [int(max(-32768, min(32767, round(v)))) for v in out]
+    return _pcm16(out)
+
+_VAG_DQ = [[(n << 12) >> sh for n in range(-8, 8)] for sh in range(13)]   # [shift][nibble + 8] -> decoded step
+_VAG_DQS = [[((n - 16 if n >= 8 else n) << 12) >> sh if sh <= 12 else 0 for n in range(16)] for sh in range(16)]   # [shift][raw nibble]
+
+_VAG_CANDS = [(f, sh) for f in range(5) for sh in range(13)]   # the search order of (filter, shift)
+_VAG_SEED = [0]                                                  # index of the last block's winner (search speed only)
 
 def _vag_block_py(x, s1, s2, filters=range(5)):
     """Best (err, filter, shift, nibbles, s1, s2) for one 28-sample block: the first (filter, shift) in search order
-    with the smallest squared error (reference implementation; _vag_block uses the C version when it can)."""
-    best = None
-    for f in filters:
-        f0, f1 = VAG_FILTERS[f]
-        for sh in range(13):
-            a1, a2, err, nib = s1, s2, 0, []
-            for v in x:
-                p = (a1 * f0 + a2 * f1 + 32) >> 6
-                q = (v - p) * (1 << sh)
-                n = (q + 2048) >> 12 if q >= 0 else -((-q + 2047) >> 12)
-                n = max(-8, min(7, n))
-                d = max(-32768, min(32767, ((n << 12) >> sh) + p))
-                err += (v - d) ** 2
-                if best is not None and err >= best[0]: break
-                nib.append(n); a2, a1 = a1, d
-            else:
-                best = (err, f, sh, nib, a1, a2)
-    return best
+    with the smallest squared error (the Python version; _vag_block uses the C version when it can; `verify` checks
+    both against the reference search). Rounding: (q + 2048) >> 12 rounds half up for every sign of q. For speed the
+    previous block's winner is tried first, so the other candidates stop early; a candidate before the current best in
+    search order also wins on an equal error, one after it only on a smaller one, so the result is the same."""
+    cands = _VAG_CANDS if filters == range(5) else [(f, sh) for f in filters for sh in range(13)]
+    def run(f, sh, thr):                         # squared error, or -1 once it reaches thr
+        f0, f1 = VAG_FILTERS[f]; dq = _VAG_DQ[sh]; a1 = s1; a2 = s2; err = 0
+        for v in x:
+            p = (a1 * f0 + a2 * f1 + 32) >> 6
+            n = (((v - p) << sh) + 2048) >> 12
+            if n > 7: n = 7
+            elif n < -8: n = -8
+            d = dq[n + 8] + p
+            if d > 32767: d = 32767
+            elif d < -32768: d = -32768
+            e = v - d; err += e * e
+            if err >= thr: return -1
+            a2 = a1; a1 = d
+        return err
+    bk = _VAG_SEED[0] if filters == range(5) else 0
+    be = run(*cands[bk], 1 << 62); k0 = bk
+    for k, c in enumerate(cands):
+        if k != k0:
+            e = run(*c, be + 1 if k < bk else be)
+            if e >= 0: be, bk = e, k
+    if filters == range(5): _VAG_SEED[0] = bk
+    f, sh = cands[bk]; f0, f1 = VAG_FILTERS[f]; dq = _VAG_DQ[sh]; a1, a2, nib = s1, s2, []
+    for v in x:                                  # the winner's nibbles and history
+        p = (a1 * f0 + a2 * f1 + 32) >> 6
+        n = min(7, max(-8, (((v - p) << sh) + 2048) >> 12))
+        a2 = a1; a1 = min(32767, max(-32768, dq[n + 8] + p)); nib.append(n)
+    return (be, f, sh, nib, a1, a2)
 
 _VAG_C = r"""
 typedef long long i64;
@@ -3449,42 +3498,66 @@ def _vag_c():
             _vag_lib = False
     return _vag_lib or None
 
+_VAG_MEMO = {}
+
 def _vag_block(x, s1, s2, filters=range(5)):
-    """Best (err, filter, shift, nibbles, s1, s2) for one 28-sample block (the search vag_encode uses)."""
-    c = _vag_c()
-    if c is None or filters != range(5) or len(x) != 28: return _vag_block_py(x, s1, s2, filters)
-    lib, ct = c
-    xa = (ct.c_int * 28)(*x); err = ct.c_longlong(); res = (ct.c_int * 60)()
-    lib.vag_block(xa, s1, s2, 5, ct.byref(err), res)
-    return (err.value, res[0], res[1], list(res[32:60]), res[2], res[3])
+    """Best (err, filter, shift, nibbles, s1, s2) for one 28-sample block (the search vag_encode uses). Most blocks are
+    searched more than once with the same input (a loop is encoded for several storage lengths, and re-encoded until
+    its history is stable): results are cached by their exact input."""
+    if filters != range(5) or len(x) != 28: return _vag_block_py(x, s1, s2, filters)
+    key = struct.pack('<30i', *x, s1, s2); r = _VAG_MEMO.get(key)
+    if r is None:
+        c = _vag_c()
+        if c is None: r = _vag_block_py(x, s1, s2)
+        else:
+            lib, ct = c
+            xa = (ct.c_int * 28)(*x); err = ct.c_longlong(); res = (ct.c_int * 60)()
+            lib.vag_block(xa, s1, s2, 5, ct.byref(err), res)
+            r = (err.value, res[0], res[1], res[32:60], res[2], res[3])
+        r = _memo_put(_VAG_MEMO, key, (r[0], r[1], r[2], tuple(r[3]), r[4], r[5]), 100000)
+    return (r[0], r[1], r[2], list(r[3]), r[4], r[5])
 
 LOOP_REPEATS = (1, 2, 3, 4, 6, 8)   # a short loop is stored this many times over when that encodes it more cleanly
 LOOP_REPEAT_MAX = 1024              # ... up to this many samples of loop
 SPU_MUSIC_BODY_MAX = 170240         # the stage music bank's VAB body below the reverb work area of the SPU's sound memory
 SPU_MUSIC_BODY_MAX_LOW = 181216     # the same with the music bank loaded right after the common sound bank (patch_music_spu_low)
 
-def _loop_snr(vb, pcm, loop_start, passes=1):
-    """Decoded quality (dB) of a looping VAG against its source over the attack, the first pass into the loop and a
-    second pass (the first pass decodes with the pre-loop history, the encoder assumes the loop end's)."""
-    import numpy as np
-    out = []; s1 = s2 = 0
-    for i in range(16, len(vb) - 15, 16):
-        sh, f = vb[i] & 15, vb[i] >> 4
+def _vag_dec(vb, start, s1, s2, out):
+    """Decode the 16-byte ADPCM blocks of vb from byte `start` to its end onto the list out, from the predictor
+    history (s1, s2); -> the history after the last block. Flags are ignored (no loop jumps)."""
+    dqs = _VAG_DQS
+    for i in range(start, len(vb) - 15, 16):
+        h = vb[i]; dq = dqs[h & 15]; f = h >> 4
         f0, f1 = VAG_FILTERS[f] if f < 5 else (0, 0)
-        for j in range(28):
-            n = (vb[i + 2 + j // 2] >> (4 * (j & 1))) & 15
-            if n >= 8: n -= 16
-            v = max(-32768, min(32767, ((n << 12) >> sh if sh <= 12 else 0) + ((s1 * f0 + s2 * f1 + 32) >> 6))); out.append(v); s2, s1 = s1, v
+        for b in vb[i + 2:i + 16]:
+            for n in (b & 15, b >> 4):
+                v = dq[n] + ((s1 * f0 + s2 * f1 + 32) >> 6)
+                if v > 32767: v = 32767
+                elif v < -32768: v = -32768
+                out.append(v); s2 = s1; s1 = v
+    return s1, s2
+
+def vag_decode(b):
+    """PSX SPU ADPCM -> list of 16-bit samples (16-byte blocks of 28 samples, from the first block, no loop)."""
+    out = []; _vag_dec(b, 0, 0, 0, out)
+    return out
+
+_LOOP_SNR_MEMO = {}
+
+def _loop_snr(vb, pcm, loop_start, passes=1):
+    """Decoded quality (dB) of a looping VAG against its source over the attack, the first pass into the loop and
+    further passes (the first pass decodes with the pre-loop history, the encoder assumes the loop end's). Cached by
+    a SHA-256 of the inputs (the converter scores the same candidate more than once)."""
+    import array
+    key = (hashlib.sha256(bytes(vb)).digest(), hashlib.sha256(array.array('i', pcm).tobytes()).digest(), loop_start, passes)
+    r = _LOOP_SNR_MEMO.get(key)
+    if r is not None: return r
+    import numpy as np
+    out = []; s1, s2 = _vag_dec(vb, 16, 0, 0, out)
     for _ in range(passes):                         # further passes: the loop decoded again from the loop end's history
-        for i in range(16 + 16 * (loop_start // 28), len(vb) - 15, 16):
-            sh, f = vb[i] & 15, vb[i] >> 4
-            f0, f1 = VAG_FILTERS[f] if f < 5 else (0, 0)
-            for j in range(28):
-                n = (vb[i + 2 + j // 2] >> (4 * (j & 1))) & 15
-                if n >= 8: n -= 16
-                v = max(-32768, min(32767, ((n << 12) >> sh if sh <= 12 else 0) + ((s1 * f0 + s2 * f1 + 32) >> 6))); out.append(v); s2, s1 = s1, v
+        s1, s2 = _vag_dec(vb, 16 + 16 * (loop_start // 28), s1, s2, out)
     ref = np.asarray(list(pcm) + list(pcm[loop_start:]) * passes, float); d = np.asarray(out[:len(ref)], float)
-    return float(10 * np.log10((ref ** 2).sum() / max(1e-9, ((d - ref[:len(d)]) ** 2).sum())))
+    return _memo_put(_LOOP_SNR_MEMO, key, float(10 * np.log10((ref ** 2).sum() / max(1e-9, ((d - ref[:len(d)]) ** 2).sum()))), 2000)
 
 def _vag_block_dual(x, ha, hb, filters=range(5)):
     """One ADPCM block decoded from two predictor histories (the loop's first blocks: the first pass comes from the
@@ -3590,250 +3663,777 @@ def scsp_pan(dipan):
 SAT_VEL_DB = [(0, -90.0), (40, -48.6), (50, -41.2), (64, -24.1), (72, -18.0), (80, -12.0), (86, -7.2),
               (90, -4.3), (100, -6.0), (110, -1.9), (115, -0.6), (120, 0.0), (127, 0.0)]
 SAT_CC7_DB_PER_STEP = 0.735
-# Per-bank tuning from `calibrate`: gain_db / decay_dbps per voice (or (voice, key) for drum keys), upsampling factors.
-# A bank without an entry gets the general laws above and no per-voice corrections.
-MUSIC_TUNE = {
+# Every converted Saturn song's tune (README items 1, 6 and 10): song -> its banks (banks with the same music share
+# one tune), the tune (gain_db / decay_dbps per voice or (voice, key) for drum keys, storage factors, the converter's
+# opt-in keys) and, for the calibrated sets, the calibration set key, rounds and score. 'shipped': WOOD2 / CUT2 / ST03A,
+# built by their own steps (PBGM47 / PBGM49, the Tengu Man bank); sat_music_banks builds the others.
+SAT_TUNES = {
     # The shipped Saturn banks: WOOD2 and ST03A keep the v1 calibration (loop_repeats 1 and pan_route False rebuild
     # the v1 bank exactly); CUT2 uses the calibration v2 settings with the v1 sample storage and pan routing, which
     # bring the whole song and its parts closer to the Saturn.
-    'WOOD2.PAC': {'pitch_grid': True, 'loop_dual': 1, 'cents': {3: 1.2}, 'up_wrap': True,
-                  'decay_dbps': {3: -9.2, 4: -2.93, 5: -2.93, 6: -8.19, 7: -8.19},
-                  'gain_db': {0: -0.8,
-                              1: -3.7,
-                              2: -2.7,
-                              3: 0.6,
-                              4: -0.9,
-                              5: -0.8,
-                              6: 0.0,
-                              7: -1.1,
-                              (8, 45): -1.3,
-                              (8, 51): -0.3,
-                              (8, 67): 1.7,
-                              (8, 75): 0.3,
-                              (8, 77): 1.4,
-                              (8, 78): 0.2},
-                  'gate_frames': 59.94,
-                  'key_split': {1: [(0, 52, {'upsample': 8}), (53, 127, {})], 3: [(0, 77, {}), (78, 127, {'gain_db': -1.8})]},
-                  'level_db': 3.59,
-                  'loop_repeats': 1,
-                  'pan_route': False,
-                  'seq_res_scale': 10,
-                  'interp_comp': [1, 2, 3, 6, 7],      # the Saturn's treble after the SPU's interpolation (whole song)
-                  'time_scale': 1.008,
-                  'upsample': {0: 2, 1: 4, 2: 4, 3: 4, 4: 0.5, 5: 0.5, 6: 2, 7: 2, 8: 2}},
-    'CUT2.PAC': {'interp_comp': True,                 # the Saturn's treble after the SPU's interpolation (whole song)
-                 'up_wrap': True,                     # loops upsampled without a step at the seam
-                 'adsr': {(1, 55): (255, 57283),
-                          (2, 0): (230, 52899),
-                          (2, 74): (230, 52901),
-                          (2, 83): (231, 52872),
-                          (2, 91): (231, 52873),
-                          (2, 97): (228, 52963),
-                          (3, 0): (230, 52899),
-                          (3, 67): (230, 52899),
-                          (3, 72): (215, 52835),
-                          (3, 77): (215, 52835),
-                          (4, 0): (230, 52899),
-                          (4, 67): (230, 52873),
-                          (4, 72): (215, 52835),
-                          (4, 77): (215, 52835),
-                          (5, 0): (209, 24547),
-                          (5, 67): (209, 52899),
-                          (5, 74): (209, 52963),
-                          (5, 83): (208, 21091),
-                          (6, 0): (208, 21091),
-                          (6, 67): (209, 52899),
-                          (6, 74): (209, 52963),
-                          (6, 83): (209, 52963),
-                          (7, 0): (234, 53026),
-                          (7, 56): (235, 53027),
-                          (7, 63): (233, 53001),
-                          (7, 67): (252, 52936),
-                          (7, 73): (250, 52963),
-                          (8, 0): (236, 53028),
-                          (8, 55): (232, 53000),
-                          (8, 62): (234, 53027),
-                          (8, 67): (250, 52963),
-                          (8, 73): (249, 52963),
-                          (9, 0): (178, 52515),
-                          (9, 68): (182, 52259),
-                          (9, 72): (141, 52259),
-                          (9, 78): (141, 52259),
-                          (9, 83): (157, 52259),
-                          (10, 0): (178, 52515),
-                          (10, 68): (183, 52259),
-                          (10, 72): (157, 52259),
-                          (10, 78): (141, 52259),
-                          (10, 83): (157, 52259)},
-                 'cents': {},
-                 'pitch_grid': True,
-                 'loop_dual': 1,
-                 'cc7_mid': {6: 'cut', 7: 'cut'},     # the Saturn driver silences notes held through a CC 7 change
-                 'decay_dbps': {},
-                 'gain_db': {0: -0.4,
-                             1: 0.86,
-                             2: -1.1,
-                             3: 4.43,
-                             4: 1.4,
-                             5: 0.51,
-                             6: -0.46,
-                             7: 3.7,
-                             8: 4.37,
-                             9: 2.12,
-                             10: 2.1,
-                             (11, 47): 0.25,
-                             (11, 51): 2.35,
-                             (11, 77): 4.74,
-                             (11, 78): 6.38},
-                 'gate_frames': 59.94,
-                 'key_split': {1: [(0, 48, {}), (49, 127, {'upsample': 2})],
-                               3: [(0, 71, {'decay_dbps': -11.6}), (72, 127, {'decay_dbps': -17.4})],
-                               4: [(0, 71, {'decay_dbps': -14.8}), (72, 127, {'decay_dbps': -23.0})],
-                               7: [(0, 61, {'upsample': 4}), (62, 127, {})],
-                               8: [(0, 61, {'upsample': 4}), (62, 127, {})]},
-                 'level_db': 3.63,
-                 'loop_repeats': 1,
-                 'pan_route': True,
-                 'peg': {},
-                 'reverb': True,
-                 'seq_res_scale': 10,
-                 'time_scale': 1.002,
-                 'upsample': {0: 2, 1: 4, 2: 4, 3: 0.5, 4: 0.5, 5: 2, 6: 2, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4},
-                 'vel_db': {3: [(0, -90.0),
-                                (40, -48.6),
-                                (50, -41.2),
-                                (64, -22.39),
-                                (72, -16.69),
-                                (80, -11.25),
-                                (86, -6.66),
-                                (90, -3.85),
-                                (100, -5.67),
-                                (110, -1.59),
-                                (115, -0.35),
-                                (120, 0.03),
-                                (122, 0.02),
-                                (127, 0.0)],
-                            8: [(0, -90.0),
-                                (40, -48.6),
-                                (50, -41.2),
-                                (64, -22.5),
-                                (72, -16.74),
-                                (80, -11.32),
-                                (86, -6.74),
-                                (90, -3.82),
-                                (100, -5.74),
-                                (110, -1.61),
-                                (115, -0.41),
-                                (120, 0.01),
-                                (122, 0.01),
-                                (127, 0.0)],
-                            'drum': [(0, -90.0),
-                                     (40, -46.32),
-                                     (50, -39.52),
-                                     (64, -23.23),
-                                     (72, -17.39),
-                                     (80, -11.48),
-                                     (86, -7.08),
-                                     (90, -4.27),
-                                     (100, -5.6),
-                                     (110, -1.85),
-                                     (115, -0.34),
-                                     (120, 0.0),
-                                     (122, 0.0),
-                                     (127, 0.0)],
-                            'melodic': [(0, -90.0),
-                                        (40, -46.43),
-                                        (50, -40.04),
-                                        (64, -23.58),
-                                        (72, -17.4),
-                                        (80, -11.7),
-                                        (86, -7.2),
-                                        (90, -4.28),
-                                        (100, -5.5),
-                                        (110, -1.76),
-                                        (115, -0.37),
-                                        (120, 0.16),
-                                        (122, 0.06),
-                                        (127, 0.0)]}},
-    'ST03A.PAC': {'adsr': {(6, 0): (4587, 20296)},     # note envelope fitted to the Saturn's (one-part recordings)
-                  'up_wrap': True,                    # loops upsampled without a step at the seam
-                  'pitch_grid': True, 'loop_dual': 1, 'cents': {2: -1.3, 3: -2.1},
-                  'decay_dbps': {2: -4.1,
-                                 3: -4.1,
-                                 4: -4.1,
-                                 5: -1.9,
-                                 6: -25.1,
-                                 7: -17.5,
-                                 8: -17.5,
-                                 9: -12.4,
-                                 10: -12.4,
-                                 11: -1.8,
-                                 12: -1.8,
-                                 13: -97.0,
-                                 14: -97.0,
-                                 15: -97.0},
-                  'gain_db': {1: 3.8,
-                              2: 5.6,
-                              3: -0.4,
-                              4: -0.4,
-                              5: -6.0,
-                              6: -5.1, (6, 0): -6.51,
-                              7: 0.2,
-                              8: -0.4,
-                              9: 0.0,
-                              10: 0.0,
-                              11: 0.7,
-                              12: 1.3,
-                              13: -6.6,
-                              14: -6.9,
-                              15: -6.6,
-                              (16, 45): -0.6,
-                              (16, 67): -2.4,
-                              (16, 77): -0.5,
-                              (16, 79): 1.1,
-                              (16, 86): -0.5,
-                              (16, 87): -0.7,
-                              (16, 88): -0.4},
-                  'gate_frames': 59.94,
-                  'key_split': {11: [(0, 69, {}), (70, 127, {'gain_db': 1.4})],
-                                13: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})],
-                                14: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})],
-                                15: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})]},
-                  'level_db': 11.71,
-                  'loop_repeats': 1,
-                  'pan_route': False,
-                  'release_rate': {2: 7, 3: 7, 4: 7},
-                  'reverb': False,
-                  'seq_res_scale': 10,
-                  'interp_comp': True,             # the Saturn's treble after the SPU's interpolation (replaces the shelves)
-                  'upsample': {1: 2, 2: 3, 3: 3, 4: 3, 5: 2, 6: 2, 11: 2, 12: 2, 16: 2},   # 2-4 at 3x: less ADPCM noise in their 27-cycle loop
-                  'vel_db': {'drum': [(0, -90.0),
-                                      (40, -48.6),
-                                      (50, -41.2),
-                                      (64, -23.4),
-                                      (72, -17.0),
-                                      (80, -11.3),
-                                      (86, -6.6),
-                                      (90, -3.4),
-                                      (100, -4.2),
-                                      (110, -0.7),
-                                      (115, -0.2),
-                                      (120, 0.0),
-                                      (127, 0.0)],
-                             'melodic': [(0, -90.0),
-                                         (40, -48.6),
-                                         (50, -41.2),
-                                         (64, -24.1),
-                                         (72, -18.0),
-                                         (80, -12.0),
-                                         (86, -7.2),
-                                         (90, -4.3),
-                                         (100, -6.0),
-                                         (110, -1.9),
-                                         (115, -0.6),
-                                         (120, 0.0),
-                                         (127, 0.0)]}},
+    'WOOD2.PAC': {'banks': ['WOOD2.PAC'], 'shipped': True, 'tune': {'pitch_grid': True, 'loop_dual': 1, 'cents': {3: 1.2}, 'up_wrap': True,
+                                                                    'decay_dbps': {3: -9.2, 4: -2.93, 5: -2.93, 6: -8.19, 7: -8.19},
+                                                                    'gain_db': {0: -0.8,
+                                                                                1: -3.7,
+                                                                                2: -2.7,
+                                                                                3: 0.6,
+                                                                                4: -0.9,
+                                                                                5: -0.8,
+                                                                                6: 0.0,
+                                                                                7: -1.1,
+                                                                                (8, 45): -1.3,
+                                                                                (8, 51): -0.3,
+                                                                                (8, 67): 1.7,
+                                                                                (8, 75): 0.3,
+                                                                                (8, 77): 1.4,
+                                                                                (8, 78): 0.2},
+                                                                    'gate_frames': 59.94,
+                                                                    'key_split': {1: [(0, 52, {'upsample': 8}), (53, 127, {})], 3: [(0, 77, {}), (78, 127, {'gain_db': -1.8})]},
+                                                                    'level_db': 3.59,
+                                                                    'loop_repeats': 1,
+                                                                    'pan_route': False,
+                                                                    'seq_res_scale': 10,
+                                                                    'interp_comp': [1, 2, 3, 6, 7],      # the Saturn's treble after the SPU's interpolation (whole song)
+                                                                    'time_scale': 1.008,
+                                                                    'upsample': {0: 2, 1: 4, 2: 4, 3: 4, 4: 0.5, 5: 0.5, 6: 2, 7: 2, 8: 2}}},
+    'CUT2.PAC': {'banks': ['CUT2.PAC'], 'shipped': True, 'tune': {'interp_comp': True,                 # the Saturn's treble after the SPU's interpolation (whole song)
+                                                                  'up_wrap': True,                     # loops upsampled without a step at the seam
+                                                                  'adsr': {(1, 55): (255, 57283),
+                                                                           (2, 0): (230, 52899),
+                                                                           (2, 74): (230, 52901),
+                                                                           (2, 83): (231, 52872),
+                                                                           (2, 91): (231, 52873),
+                                                                           (2, 97): (228, 52963),
+                                                                           (3, 0): (230, 52899),
+                                                                           (3, 67): (230, 52899),
+                                                                           (3, 72): (215, 52835),
+                                                                           (3, 77): (215, 52835),
+                                                                           (4, 0): (230, 52899),
+                                                                           (4, 67): (230, 52873),
+                                                                           (4, 72): (215, 52835),
+                                                                           (4, 77): (215, 52835),
+                                                                           (5, 0): (209, 24547),
+                                                                           (5, 67): (209, 52899),
+                                                                           (5, 74): (209, 52963),
+                                                                           (5, 83): (208, 21091),
+                                                                           (6, 0): (208, 21091),
+                                                                           (6, 67): (209, 52899),
+                                                                           (6, 74): (209, 52963),
+                                                                           (6, 83): (209, 52963),
+                                                                           (7, 0): (234, 53026),
+                                                                           (7, 56): (235, 53027),
+                                                                           (7, 63): (233, 53001),
+                                                                           (7, 67): (252, 52936),
+                                                                           (7, 73): (250, 52963),
+                                                                           (8, 0): (236, 53028),
+                                                                           (8, 55): (232, 53000),
+                                                                           (8, 62): (234, 53027),
+                                                                           (8, 67): (250, 52963),
+                                                                           (8, 73): (249, 52963),
+                                                                           (9, 0): (178, 52515),
+                                                                           (9, 68): (182, 52259),
+                                                                           (9, 72): (141, 52259),
+                                                                           (9, 78): (141, 52259),
+                                                                           (9, 83): (157, 52259),
+                                                                           (10, 0): (178, 52515),
+                                                                           (10, 68): (183, 52259),
+                                                                           (10, 72): (157, 52259),
+                                                                           (10, 78): (141, 52259),
+                                                                           (10, 83): (157, 52259)},
+                                                                  'cents': {},
+                                                                  'pitch_grid': True,
+                                                                  'loop_dual': 1,
+                                                                  'cc7_mid': {6: 'cut', 7: 'cut'},     # the Saturn driver silences notes held through a CC 7 change
+                                                                  'decay_dbps': {},
+                                                                  'gain_db': {0: -0.4,
+                                                                              1: 0.86,
+                                                                              2: -1.1,
+                                                                              3: 4.43,
+                                                                              4: 1.4,
+                                                                              5: 0.51,
+                                                                              6: -0.46,
+                                                                              7: 3.7,
+                                                                              8: 4.37,
+                                                                              9: 2.12,
+                                                                              10: 2.1,
+                                                                              (11, 47): 0.25,
+                                                                              (11, 51): 2.35,
+                                                                              (11, 77): 4.74,
+                                                                              (11, 78): 6.38},
+                                                                  'gate_frames': 59.94,
+                                                                  'key_split': {1: [(0, 48, {}), (49, 127, {'upsample': 2})],
+                                                                                3: [(0, 71, {'decay_dbps': -11.6}), (72, 127, {'decay_dbps': -17.4})],
+                                                                                4: [(0, 71, {'decay_dbps': -14.8}), (72, 127, {'decay_dbps': -23.0})],
+                                                                                7: [(0, 61, {'upsample': 4}), (62, 127, {})],
+                                                                                8: [(0, 61, {'upsample': 4}), (62, 127, {})]},
+                                                                  'level_db': 3.63,
+                                                                  'loop_repeats': 1,
+                                                                  'pan_route': True,
+                                                                  'peg': {},
+                                                                  'reverb': True,
+                                                                  'seq_res_scale': 10,
+                                                                  'time_scale': 1.002,
+                                                                  'upsample': {0: 2, 1: 4, 2: 4, 3: 0.5, 4: 0.5, 5: 2, 6: 2, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4},
+                                                                  'vel_db': {3: [(0, -90.0),
+                                                                                 (40, -48.6),
+                                                                                 (50, -41.2),
+                                                                                 (64, -22.39),
+                                                                                 (72, -16.69),
+                                                                                 (80, -11.25),
+                                                                                 (86, -6.66),
+                                                                                 (90, -3.85),
+                                                                                 (100, -5.67),
+                                                                                 (110, -1.59),
+                                                                                 (115, -0.35),
+                                                                                 (120, 0.03),
+                                                                                 (122, 0.02),
+                                                                                 (127, 0.0)],
+                                                                             8: [(0, -90.0),
+                                                                                 (40, -48.6),
+                                                                                 (50, -41.2),
+                                                                                 (64, -22.5),
+                                                                                 (72, -16.74),
+                                                                                 (80, -11.32),
+                                                                                 (86, -6.74),
+                                                                                 (90, -3.82),
+                                                                                 (100, -5.74),
+                                                                                 (110, -1.61),
+                                                                                 (115, -0.41),
+                                                                                 (120, 0.01),
+                                                                                 (122, 0.01),
+                                                                                 (127, 0.0)],
+                                                                             'drum': [(0, -90.0),
+                                                                                      (40, -46.32),
+                                                                                      (50, -39.52),
+                                                                                      (64, -23.23),
+                                                                                      (72, -17.39),
+                                                                                      (80, -11.48),
+                                                                                      (86, -7.08),
+                                                                                      (90, -4.27),
+                                                                                      (100, -5.6),
+                                                                                      (110, -1.85),
+                                                                                      (115, -0.34),
+                                                                                      (120, 0.0),
+                                                                                      (122, 0.0),
+                                                                                      (127, 0.0)],
+                                                                             'melodic': [(0, -90.0),
+                                                                                         (40, -46.43),
+                                                                                         (50, -40.04),
+                                                                                         (64, -23.58),
+                                                                                         (72, -17.4),
+                                                                                         (80, -11.7),
+                                                                                         (86, -7.2),
+                                                                                         (90, -4.28),
+                                                                                         (100, -5.5),
+                                                                                         (110, -1.76),
+                                                                                         (115, -0.37),
+                                                                                         (120, 0.16),
+                                                                                         (122, 0.06),
+                                                                                         (127, 0.0)]}}},
+    'ST03A.PAC': {'banks': ['ST03A.PAC'], 'shipped': True, 'tune': {'adsr': {(6, 0): (4587, 20296)},     # note envelope fitted to the Saturn's (one-part recordings)
+                                                                    'up_wrap': True,                    # loops upsampled without a step at the seam
+                                                                    'pitch_grid': True, 'loop_dual': 1, 'cents': {2: -1.3, 3: -2.1},
+                                                                    'decay_dbps': {2: -4.1,
+                                                                                   3: -4.1,
+                                                                                   4: -4.1,
+                                                                                   5: -1.9,
+                                                                                   6: -25.1,
+                                                                                   7: -17.5,
+                                                                                   8: -17.5,
+                                                                                   9: -12.4,
+                                                                                   10: -12.4,
+                                                                                   11: -1.8,
+                                                                                   12: -1.8,
+                                                                                   13: -97.0,
+                                                                                   14: -97.0,
+                                                                                   15: -97.0},
+                                                                    'gain_db': {1: 3.8,
+                                                                                2: 5.6,
+                                                                                3: -0.4,
+                                                                                4: -0.4,
+                                                                                5: -6.0,
+                                                                                6: -5.1, (6, 0): -6.51,
+                                                                                7: 0.2,
+                                                                                8: -0.4,
+                                                                                9: 0.0,
+                                                                                10: 0.0,
+                                                                                11: 0.7,
+                                                                                12: 1.3,
+                                                                                13: -6.6,
+                                                                                14: -6.9,
+                                                                                15: -6.6,
+                                                                                (16, 45): -0.6,
+                                                                                (16, 67): -2.4,
+                                                                                (16, 77): -0.5,
+                                                                                (16, 79): 1.1,
+                                                                                (16, 86): -0.5,
+                                                                                (16, 87): -0.7,
+                                                                                (16, 88): -0.4},
+                                                                    'gate_frames': 59.94,
+                                                                    'key_split': {11: [(0, 69, {}), (70, 127, {'gain_db': 1.4})],
+                                                                                  13: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})],
+                                                                                  14: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})],
+                                                                                  15: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})]},
+                                                                    'level_db': 11.71,
+                                                                    'loop_repeats': 1,
+                                                                    'pan_route': False,
+                                                                    'release_rate': {2: 7, 3: 7, 4: 7},
+                                                                    'reverb': False,
+                                                                    'seq_res_scale': 10,
+                                                                    'interp_comp': True,             # the Saturn's treble after the SPU's interpolation (replaces the shelves)
+                                                                    'upsample': {1: 2, 2: 3, 3: 3, 4: 3, 5: 2, 6: 2, 11: 2, 12: 2, 16: 2},   # 2-4 at 3x: less ADPCM noise in their 27-cycle loop
+                                                                    'vel_db': {'drum': [(0, -90.0),
+                                                                                        (40, -48.6),
+                                                                                        (50, -41.2),
+                                                                                        (64, -23.4),
+                                                                                        (72, -17.0),
+                                                                                        (80, -11.3),
+                                                                                        (86, -6.6),
+                                                                                        (90, -3.4),
+                                                                                        (100, -4.2),
+                                                                                        (110, -0.7),
+                                                                                        (115, -0.2),
+                                                                                        (120, 0.0),
+                                                                                        (127, 0.0)],
+                                                                               'melodic': [(0, -90.0),
+                                                                                           (40, -48.6),
+                                                                                           (50, -41.2),
+                                                                                           (64, -24.1),
+                                                                                           (72, -18.0),
+                                                                                           (80, -12.0),
+                                                                                           (86, -7.2),
+                                                                                           (90, -4.3),
+                                                                                           (100, -6.0),
+                                                                                           (110, -1.9),
+                                                                                           (115, -0.6),
+                                                                                           (120, 0.0),
+                                                                                           (127, 0.0)]}}},
+    # The other converted Saturn songs (README item 10; calibrated against the Saturn in Mednafen, then by part and
+    # whole song on the offline renderer): banks with the same music, the calibration set key, rounds and score, the tune.
+    'ST06A.PAC': {'set': '2584cbcbf454', 'banks': ['ST06A.PAC'], 'rounds': 9, 'score': 0.77, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 6.56,
+                           'time_scale': 1.00333,
+                           'gain_db': {1: 0.23, 2: -0.39, 3: -3.98, 4: 0.24, 5: -0.14, 6: 1.7, 7: 1.32, 8: -4.81,
+                                       (9, 47): -2.3, (9, 77): 2.49, (9, 75): -2.69, (9, 67): -0.26, (3, 60): -3.61},
+                           'decay_dbps': {1: -2.31, 2: -8.08, 3: -32.38, 4: -16.19, 5: -16.09, 6: -8.2, 7: -8.19,
+                                          8: -6.09},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2},
+                           'peg': {4: None, 5: None}, 'adsr': {(3, 60): (208, 52935)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -46.34), (50, -39.11), (64, -23.08), (72, -16.88),
+                                                  (80, -11.35), (86, -7.04), (90, -3.83), (100, -5.67), (110, -1.72),
+                                                  (115, -0.42), (120, -0.06), (122, 0.04), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -46.77), (50, -39.54), (64, -23.33), (72, -17.53),
+                                               (80, -11.56), (86, -7.03), (90, -4.25), (100, -5.76), (110, -1.85),
+                                               (115, -0.39), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'key_split': {3: [(0, 59, {'layer_upsample': [[0, 8], [1, 4]]}),
+                                             (60, 127, {'layer_upsample': [[0, 4], [1, 2]]})]},
+                           'loop_repeats': 1, 'loop_dual': 1, 'interp_comp': [1, 2, 3, 6, 7, 8, 9], 'up_wrap': True,
+                           'pan_route': True}},
+    'ST05A.PAC': {'set': '64b588c6479c', 'banks': ['ST05A.PAC', 'ST05B.PAC'], 'rounds': 12, 'score': 0.81, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': -3.33,
+                           'time_scale': 1.00399,
+                           'gain_db': {1: -1.28, 2: -1.7, 3: 1.17, 4: -0.24, 5: -0.01, 6: 1.12, 7: -1.84, 8: 1.34,
+                                       9: 0.05, (10, 47): -1.91, (10, 84): -1.71, (10, 51): -2.1, (10, 75): 5.36,
+                                       (10, 76): 4.27, (10, 24): 1.22, (5, 0): 1.03},
+                           'decay_dbps': {3: -14.46, 8: -14.46, 2: -0.78, 4: -70.14, 5: -70.14, 7: -0.78, 9: -70.14},
+                           'upsample': {1: 2, 2: 2, 3: 2, 6: 2, 7: 2, 8: 2, 10: 2}, 'peg': {},
+                           'adsr': {(10, 75): (160, 52516), (10, 76): (112, 51172), (5, 0): (178, 52256)},
+                           'decay_rate': {4: 46, 5: 46, 9: 46, 2: 72, 3: 56, 7: 72, 8: 56},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -25.73), (50, -18.12), (64, -7.96), (72, -1.81),
+                                                  (80, -0.15), (86, 0.01), (90, -1.81), (100, -1.57), (110, -0.38),
+                                                  (115, -0.02), (120, -0.05), (122, -0.07), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -25.68), (50, -18.53), (64, -7.94), (72, -1.78),
+                                               (80, -0.09), (86, -0.02), (90, -1.76), (100, -1.18), (110, -0.57),
+                                               (115, -0.04), (120, 0.0), (122, -0.0), (127, 0.0)]},
+                           'key_split': {2: [(0, 127, {'layer_upsample': [[0, 4]]})],
+                                         7: [(0, 127, {'layer_upsample': [[0, 4]]})]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'up_wrap': True, 'pan_route': True}},
+    'ST02A.PAC': {'set': '85417314c4bb', 'banks': ['ST02A.PAC'], 'rounds': 14, 'score': 0.68, 'treble': True, 'version': 1,
+                  'tune': {'spu_low': True, 'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94,
+                           'level_db': 12.88, 'time_scale': 1.00199,
+                           'gain_db': {2: -7.4, 3: 2.5, 4: -1.14, 5: -2.09, 6: -1.83, 7: -0.15, 9: 2.24,
+                                       (1, 47): -0.86, (1, 62): 0.38, (1, 36): 2.69},
+                           'decay_dbps': {2: -3.16, 4: -46.76, 5: -31.5, 6: -41.6, 9: -1.01},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 9: 2}, 'peg': {},
+                           'adsr': {(1, 47): (220, 19720)}, 'decay_rate': {4: 48, 2: 64, 5: 54, 6: 52, 9: 71},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -34.53), (50, -26.67), (64, -16.83), (72, -10.69),
+                                                  (80, -9.36), (86, -8.62), (90, -7.8), (100, -5.6), (110, -4.03),
+                                                  (115, -2.59), (120, -1.81), (122, -1.99), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -32.6), (50, -26.55), (64, -16.42), (72, -10.67),
+                                               (80, -9.38), (86, -8.71), (90, -8.04), (100, -5.67), (110, -3.98),
+                                               (115, -2.71), (120, -2.05), (122, -2.05), (127, 0.0)]},
+                           'key_split': {5: [(0, 59, {'layer_upsample': [[0, 16], [1, 4]]}),
+                                             (60, 71, {'layer_upsample': [[0, 8], [1, 4]]}),
+                                             (72, 127, {'layer_upsample': [[0, 4], [1, 3]]})],
+                                         7: [(0, 59, {'layer_upsample': [[0, 16]]}),
+                                             (60, 71, {'layer_upsample': [[0, 8]]}),
+                                             (72, 127, {'layer_upsample': [[0, 4]]})]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'interp_comp': [2, 3, 4],
+                           'detune_exact': True, 'keyoff_clamp': True, 'up_wrap': True, 'chan_prog': [8],
+                           'pan_route': True}},
+    'ST08A.PAC': {'set': 'e3b2276b1d7a', 'banks': ['ST08A.PAC'], 'rounds': 3, 'score': 0.57, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 10.38,
+                           'time_scale': 1.005,
+                           'gain_db': {1: -6.05, 2: -5.53, 3: -4.77, 4: 3.64, 5: -2.87, 6: 3.43, 7: 3.65, 8: 2.11,
+                                       9: 2.29, 10: -4.36, (11, 47): -7.75, (11, 67): -2.16, (11, 77): 3.6,
+                                       (2, 0): -4.62, (3, 0): -3.81},
+                           'decay_dbps': {2: -27.0, 3: -27.0, 4: -27.0, 5: -27.0},
+                           'upsample': {1: 2, 2: 2, 3: 2, 10: 2, 11: 2}, 'peg': {},
+                           'adsr': {(11, 77): (4728, 51299), (2, 0): (208, 53000), (3, 0): (210, 52772)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -33.76), (50, -27.09), (64, -17.84), (72, -12.27),
+                                                  (80, -6.9), (86, -2.77), (90, -0.0), (100, 0.16), (110, -1.16),
+                                                  (115, -0.37), (120, 0.04), (122, 0.07), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -34.95), (50, -27.79), (64, -18.62), (72, -12.96),
+                                               (80, -7.08), (86, -2.53), (90, 0.03), (100, -0.01), (110, -1.45),
+                                               (115, -0.61), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'decay_rate': {2: 55, 3: 55, 4: 55, 5: 55}, 'loop_repeats': 1, 'pitch_grid': True,
+                           'loop_dual': 1, 'interp_comp': True, 'up_wrap': True, 'pan_route': True}},
+    'CLR00.PAC': {'set': '3ac1febcb2c3', 'banks': ['CLR00.PAC', 'CLR01.PAC', 'CLR02.PAC', 'CLR03.PAC', 'CLR04.PAC', 'CLR05.PAC', 'CLR06.PAC', 'CLR07.PAC'], 'rounds': 2, 'score': 0.81, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 3.41,
+                           'time_scale': 1.00399,
+                           'gain_db': {1: -0.37, 2: -0.53, 3: -0.2, 4: 0.02, 5: -0.12, 6: 0.34, 7: 0.18, 8: 0.53,
+                                       9: -0.21, 10: 0.68, 11: 0.14, 12: -0.02, (13, 60): -0.04, (13, 61): -0.04,
+                                       (13, 62): 2.09, (13, 63): 0.24, (12, 0): 1.07},
+                           'decay_dbps': {},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 12: 2, 13: 2},
+                           'peg': {}, 'adsr': {(12, 0): (232, 53006)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -45.7), (50, -38.45), (64, -22.37), (72, -16.68),
+                                                  (80, -11.17), (86, -6.99), (90, -3.85), (100, -5.66), (110, -1.87),
+                                                  (115, -0.44), (120, -0.01), (122, 0.0), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -45.74), (50, -38.61), (64, -22.43), (72, -16.67),
+                                               (80, -11.2), (86, -6.89), (90, -3.84), (100, -5.56), (110, -1.86),
+                                               (115, -0.52), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'interp_comp': True,
+                           'up_wrap': True, 'pan_route': True}},
+    'ST01A.PAC': {'set': '9f8b2b2e40a4', 'banks': ['ST01A.PAC'], 'rounds': 3, 'score': 0.72, 'version': 1,
+                  'tune': {'spu_low': True, 'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94,
+                           'level_db': 4.08, 'time_scale': 1.00348,
+                           'gain_db': {1: -1.99, 2: -1.92, 3: 2.78, 4: 0.18, 5: -0.01, 6: -2.08, 7: 2.27, 8: 2.34,
+                                       9: 1.7, (10, 47): 1.53, (10, 51): 1.1, (10, 76): 2.87, (10, 84): -0.56,
+                                       (2, 0): -0.36},
+                           'decay_dbps': {6: -12.6, 7: -9.05, 8: -9.05, 9: -9.05},
+                           'upsample': {1: 2, 2: 2, 3: 3, 4: 3, 5: 3, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2}, 'peg': {},
+                           'adsr': {(2, 0): (233, 53032)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -30.62), (50, -24.13), (64, -13.92), (72, -7.95),
+                                                  (80, -11.5), (86, -9.13), (90, -7.23), (100, -4.09), (110, -0.4),
+                                                  (115, 0.01), (120, -0.13), (122, -0.02), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -30.99), (50, -24.06), (64, -13.88), (72, -8.03),
+                                               (80, -11.17), (86, -8.75), (90, -7.42), (100, -3.82), (110, -0.49),
+                                               (115, -0.04), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'decay_rate': {6: 57, 7: 59, 8: 59, 9: 59}, 'loop_repeats': 1, 'pitch_grid': True,
+                           'loop_dual': 1, 'cents': {8: -2.5, 9: -5.6}, 'interp_comp': True, 'up_wrap': True,
+                           'pan_route': True}},
+    'ST04A.PAC': {'set': 'edde2a7bf0c0', 'banks': ['ST04A.PAC'], 'rounds': 4, 'score': 0.99, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 0.4,
+                           'time_scale': 1.00199,
+                           'gain_db': {1: 1.35, 2: -0.35, 4: -0.59, 5: -0.39, 6: -0.4, 7: -0.44, 8: 0.69, 9: 0.05,
+                                       10: 0.82, 11: 0.55, (12, 60): -1.03, (12, 61): -0.93, (12, 62): 8.38,
+                                       (12, 63): 7.32, (12, 64): 1.09, (6, 0): 1.16, (7, 0): 0.89},
+                           'decay_dbps': {2: -40.92, 4: -40.92, 5: -40.92, 8: -1.01, 9: -1.01, 10: -27.0, 11: -27.0},
+                           'upsample': {1: 2, 2: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2, 11: 2, 12: 2},
+                           'peg': {},
+                           'adsr': {(12, 62): (123, 51171), (12, 63): (176, 52515), (6, 0): (7400, 52992),
+                                    (7, 0): (7401, 52992)},
+                           'decay_rate': {2: 49, 4: 49, 5: 49, 8: 71, 9: 71, 10: 55, 11: 55},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -38.77), (50, -27.98), (64, -16.58), (72, -10.8),
+                                                  (80, -5.37), (86, -0.75), (90, -6.37), (100, -5.24), (110, -2.95),
+                                                  (115, -2.14), (120, -1.4), (122, -0.72), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -38.95), (50, -28.42), (64, -16.92), (72, -11.11),
+                                               (80, -5.26), (86, -0.94), (90, -6.92), (100, -5.2), (110, -3.09),
+                                               (115, -2.5), (120, -1.87), (122, -0.93), (127, 0.0)]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1,
+                           'interp_comp': [1, 2, 4, 5, 6, 7, 10, 11, 12], 'up_wrap': True, 'pan_route': True}},
+    'ST07A.PAC': {'set': '388642f4b936', 'banks': ['ST07A.PAC'], 'rounds': 5, 'score': 0.86, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 7.34,
+                           'time_scale': 1.01299,
+                           'gain_db': {1: 0.34, 2: 1.33, 3: 0.49, 4: 1.32, 5: 2.82, 6: 1.8, 7: -1.98, 8: 3.9, 9: 3.82,
+                                       10: 0.56, 11: -0.75, (12, 60): 4.21, (12, 65): 4.64, (12, 66): 6.51,
+                                       (12, 67): 11.21, (4, 0): 2.27},
+                           'decay_dbps': {2: -27.0, 3: -27.0, 4: -27.0, 5: -2.43, 6: -2.04, 7: -27.0},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 4, 5: 2, 6: 2, 7: 4, 8: 2, 9: 2, 12: 4}, 'peg': {},
+                           'adsr': {(4, 0): (217, 52553)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -46.66), (50, -39.59), (64, -23.04), (72, -17.27),
+                                                  (80, -11.71), (86, -7.09), (90, -4.05), (100, -5.71), (110, -1.86),
+                                                  (115, -0.3), (120, 0.11), (122, -0.14), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -44.94), (50, -38.04), (64, -22.37), (72, -16.58),
+                                               (80, -11.11), (86, -6.82), (90, -3.83), (100, -5.46), (110, -1.85),
+                                               (115, -0.51), (120, 0.0), (122, -0.01), (127, 0.0)]},
+                           'decay_rate': {2: 55, 3: 55, 4: 55, 5: 66, 6: 67, 7: 55},
+                           'key_split': {1: [(0, 46, {'layer_upsample': [[0, 8]]}),
+                                             (47, 127, {'layer_upsample': [[0, 4]]})]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'interp_comp': True,
+                           'up_wrap': True, 'pan_route': True}},
+    'BS01C.PAC': {'set': 'f53ee3dba3e4', 'banks': ['BS01C.PAC', 'BS02C.PAC', 'BS03C.PAC', 'BS04C.PAC', 'BS05C.PAC', 'BS07C.PAC', 'BS08C.PAC', 'BS09C.PAC', 'BS10C.PAC', 'BS11C.PAC'], 'rounds': 9, 'score': 0.42, 'version': 1,
+                  'tune': {'keyoff_clamp': True, 'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94,
+                           'level_db': -1.99, 'time_scale': 1.0,
+                           'gain_db': {1: -0.11, 2: -0.17, 3: -0.27, 4: 1.6, 5: 0.11, (7, 45): -1.35, (7, 51): -1.35,
+                                       (7, 77): 1.13, (7, 81): -0.86, (7, 88): -0.95, (7, 87): -0.82, (7, 84): -0.9,
+                                       (4, 0): 0.24},
+                           'decay_dbps': {2: -9.05, 3: -9.05, 4: -31.5},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 3, 7: 2}, 'peg': {},
+                           'adsr': {(7, 77): (139, 51427), (4, 0): (255, 20743)}, 'decay_rate': {2: 59, 3: 59, 4: 54},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -39.75), (50, -32.16), (64, -22.14), (72, -15.98),
+                                                  (80, -10.37), (86, -5.62), (90, -7.15), (100, -3.68), (110, 0.03),
+                                                  (115, -0.04), (120, 0.02), (122, -0.02), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -39.94), (50, -32.1), (64, -22.35), (72, -16.21),
+                                               (80, -10.59), (86, -5.71), (90, -7.06), (100, -3.75), (110, -0.02),
+                                               (115, -0.04), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'interp_comp': True,
+                           'up_wrap': True, 'pan_route': True}},
+    'BS00A.PAC': {'set': '8b3b303f0a5d', 'banks': ['BS00A.PAC', 'BS02A.PAC', 'BS04A.PAC', 'BS05A.PAC', 'BS06A.PAC'], 'rounds': 2, 'score': 1.0, 'version': 1,
+                  'tune': {'keyoff_clamp': True, 'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94,
+                           'level_db': 7.22, 'time_scale': 1.0,
+                           'gain_db': {1: -2.41, 2: 3.1, 3: 0.04, 4: -0.04, 5: 0.12, 6: 0.54, 7: -0.12, 8: -0.26,
+                                       (9, 47): -1.78, (9, 54): -2.14, (9, 76): 1.42, (9, 75): 1.1, (9, 88): -7.3,
+                                       (9, 87): -7.3, (9, 86): -7.29, (2, 0): 4.65},
+                           'decay_dbps': {1: -2.23, 2: -23.72, 5: -49.5, 6: -49.49, 7: -4.43, 8: -4.37},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2}, 'peg': {},
+                           'adsr': {(2, 0): (211, 52746)}, 'decay_rate': {5: 49, 6: 49},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -40.83), (50, -30.08), (64, -16.35), (72, -10.03),
+                                                  (80, -4.33), (86, 0.05), (90, -6.46), (100, -4.96), (110, -2.63),
+                                                  (115, -1.82), (120, -1.15), (122, -0.52), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -40.89), (50, -29.88), (64, -16.26), (72, -10.08),
+                                               (80, -4.21), (86, -0.01), (90, -6.49), (100, -5.04), (110, -2.54),
+                                               (115, -1.87), (120, -1.17), (122, -0.5), (127, 0.0)]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'cc7_mid': {7: 'cut', 8: 'cut'},
+                           'interp_comp': [1, 9], 'detune_exact': True, 'up_wrap': True, 'pan_route': True}},
+    'BS01B.PAC': {'set': 'b62f8b3b494a', 'banks': ['BS01B.PAC', 'BS02B.PAC', 'BS03B.PAC', 'BS04B.PAC', 'BS05B.PAC', 'BS06B.PAC', 'BS07B.PAC', 'BS08B.PAC', 'BS09B.PAC', 'BS10B.PAC', 'BS11B.PAC', 'DUO00.PAC', 'FORTE1.PAC'], 'rounds': 3, 'score': 0.82, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 0.91,
+                           'time_scale': 1.01197, 'gain_db': {1: 0.01, 2: -0.01, (3, 76): 3.54, (3, 77): 3.58},
+                           'decay_dbps': {}, 'upsample': {1: 2, 2: 2, 3: 2}, 'peg': {}, 'adsr': {},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -48.9), (50, -41.03), (64, -24.22), (72, -17.91),
+                                                  (80, -12.12), (86, -7.07), (90, -6.47), (100, -5.89), (110, -1.85),
+                                                  (115, -0.46), (120, 0.01), (122, 0.13), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -46.13), (50, -38.81), (64, -22.29), (72, -16.89),
+                                               (80, -11.02), (86, -7.26), (90, -3.91), (100, -5.54), (110, -1.99),
+                                               (115, -0.44), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'loop_repeats': 1, 'loop_dual': 1, 'interp_comp': [1, 2, 3], 'up_wrap': True,
+                           'pan_route': True}},
+    'ST00A.PAC': {'set': '3a0fbf238deb', 'banks': ['ST00A.PAC', 'STCHU.PAC'], 'rounds': 2, 'score': 0.94, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 7.4,
+                           'time_scale': 0.99452,
+                           'gain_db': {1: -3.87, 2: -3.89, 3: 0.06, 4: 5.11, 5: -0.06, 6: 4.55, 7: -4.05, 8: -4.09,
+                                       9: 5.44, 10: 4.71, (11, 47): -0.64, (11, 51): -0.64, (11, 60): -0.05,
+                                       (11, 61): 0.18},
+                           'decay_dbps': {4: -0.8, 6: -0.98},
+                           'upsample': {3: 2, 4: 2, 5: 2, 6: 2, 9: 3, 10: 3, 11: 2}, 'peg': {},
+                           'adsr': {(11, 60): (128, 51491), (11, 61): (4248, 51747)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -31.5), (50, -24.18), (64, -14.56), (72, -8.4),
+                                                  (80, -11.72), (86, -9.26), (90, -7.64), (100, -4.07), (110, -0.39),
+                                                  (115, 0.02), (120, 0.03), (122, 0.02), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -32.83), (50, -25.25), (64, -14.83), (72, -8.66),
+                                               (80, -12.13), (86, -9.39), (90, -8.03), (100, -4.35), (110, -0.59),
+                                               (115, -0.04), (120, 0.0), (122, -0.0), (127, 0.0)]},
+                           'loop_repeats': 1, 'layer_gain_db': {(5, 1): 5.5}, 'pitch_grid': True, 'loop_dual': 1,
+                           'up_wrap': True, 'pan_route': True}},
+    'ST00B.PAC': {'set': '9aa04c4f750a', 'banks': ['ST00B.PAC'], 'rounds': 2, 'score': 0.32, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 6.0,
+                           'time_scale': 1.01147,
+                           'gain_db': {1: -0.19, 2: 5.32, 3: 5.26, 4: 0.0, 5: -0.23, (6, 12): 5.98, (6, 60): 5.84,
+                                       (6, 61): 5.92, (6, 62): 6.63, (6, 63): 6.7, (6, 64): 6.28},
+                           'decay_dbps': {1: -0.6, 2: -8.19, 3: -8.19, 4: -0.57, 5: -0.5},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2}, 'peg': {}, 'adsr': {}, 'loop_repeats': 1,
+                           'pitch_grid': True, 'loop_dual': 1, 'interp_comp': [1, 2, 4, 5, 6], 'up_wrap': True,
+                           'pan_route': True}},
+    'ST00C.PAC': {'set': '85958f37caed', 'banks': ['ST00C.PAC'], 'rounds': 6, 'score': 1.65, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 3.28,
+                           'time_scale': 1.0,
+                           'gain_db': {1: 3.44, 2: 2.71, 3: 2.79, 4: 2.7, 5: 2.54, 6: -2.36, 8: 0.1, 9: 0.11,
+                                       10: 3.66, (7, 60): 0.1, (7, 61): 1.16, (7, 62): 2.36},
+                           'decay_dbps': {1: -2.04, 2: -9.05, 4: -9.05, 5: -9.05, 6: -0.37, 10: -3.16},
+                           'upsample': {1: 2, 6: 2, 10: 2}, 'peg': {}, 'adsr': {},
+                           'decay_rate': {1: 67, 2: 59, 4: 59, 5: 59, 6: 76, 10: 64},
+                           'key_split': {6: [(0, 127, {'layer_upsample': [[0, 2]]})]},
+                           'layer_upsample': {(7, 0): 2, (7, 1): 1, (7, 2): 2}, 'loop_repeats': 1,
+                           'shelf_db': {(7, 60): (7000, 6.0), (7, 61): (8000, 8.0), (7, 62): (8000, 10.0)},
+                           'loop_dual': 1, 'interp_comp': True, 'up_wrap': True, 'pan_route': True}},
+    'TITLE_.PAC': {'set': 'd03ffb17202c', 'banks': ['TITLE_.PAC'], 'rounds': 3, 'score': 0.3, 'treble': True, 'version': 1,
+                   'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': -1.55,
+                            'time_scale': 1.00597,
+                            'gain_db': {1: -0.38, 2: 0.23, 3: -0.1, 4: 1.2, 5: 1.21, 6: -0.22, 7: -1.07, 8: -0.17,
+                                        11: -0.03, 12: -0.14, 13: 0.0, (14, 60): 1.21, (14, 65): 0.52, (14, 66): 2.54},
+                            'decay_dbps': {2: -12.6, 3: -12.6, 6: -3.16, 7: -2.78, 8: -2.78},
+                            'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 11: 2, 12: 2, 13: 2, 14: 2},
+                            'peg': {}, 'adsr': {},
+                            'vel_db': {'melodic': [(0, -90.0), (40, -46.06), (50, -38.44), (64, -21.64), (72, -15.37),
+                                                   (80, -9.43), (86, -5.12), (90, -1.82), (100, -3.47), (110, -0.03),
+                                                   (115, 0.03), (120, -0.11), (122, -0.06), (127, 0.0)],
+                                       'drum': [(0, -90.0), (40, -46.28), (50, -38.8), (64, -21.88), (72, -15.91),
+                                                (80, -10.02), (86, -5.8), (90, -2.31), (100, -3.92), (110, -0.45),
+                                                (115, -0.04), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                            'decay_rate': {2: 57, 3: 57, 6: 64, 7: 65, 8: 65},
+                            'key_split': {1: [(0, 47, {'layer_upsample': [[0, 8]]}),
+                                              (48, 127, {'layer_upsample': [[0, 4]]})]},
+                            'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'cc7_mid': {2: 'cut', 3: 'cut'},
+                            'interp_comp': [1, 2, 3, 6, 7, 8, 11, 12, 13, 14], 'up_wrap': True, 'pan_route': True}},
+    'STSEL.PAC': {'set': '1bbff3842f1a', 'banks': ['STSEL.PAC'], 'rounds': 2, 'score': 0.44, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': -1.35,
+                           'time_scale': 0.997,
+                           'gain_db': {1: 0.53, 2: 0.47, 3: -0.15, 4: 2.08, 5: 2.12, 6: 0.08, (7, 47): -0.14,
+                                       (7, 60): -0.23, (7, 62): 0.74},
+                           'decay_dbps': {1: -1.02, 2: -0.99, 3: -11.31}, 'upsample': {3: 2, 6: 2, 7: 2}, 'peg': {},
+                           'adsr': {},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -34.19), (50, -26.95), (64, -16.81), (72, -11.05),
+                                                  (80, -5.57), (86, -1.33), (90, 0.04), (100, 0.0), (110, -1.23),
+                                                  (115, -0.5), (120, -0.46), (122, -0.0), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -34.38), (50, -27.23), (64, -16.97), (72, -11.17),
+                                               (80, -5.68), (86, -1.45), (90, 0.03), (100, -0.02), (110, -1.45),
+                                               (115, -0.49), (120, -0.45), (122, 0.0), (127, 0.0)]},
+                           'key_split': {3: [(0, 54, {'layer_upsample': [[0, 4], [1, 4]]}),
+                                             (55, 127, {'layer_upsample': [[0, 2], [1, 2]]})]},
+                           'loop_repeats': 1, 'loop_dual': 1, 'interp_comp': [1, 2, 4, 5, 6, 7], 'pitch_grid': True,
+                           'detune_exact': True, 'up_wrap': True, 'pan_route': True}},
+    'LABO_.PAC': {'set': '4cd9cba7d963', 'banks': ['LABO_.PAC'], 'rounds': 6, 'score': 0.99, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 1.0,
+                           'time_scale': 0.9985,
+                           'gain_db': {1: 0.21, 2: 0.24, 3: 0.09, 4: -0.93, 5: -1.12, (6, 47): 0.22, (6, 51): 0.45,
+                                       (6, 74): 12.78},
+                           'decay_dbps': {4: -35.07}, 'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2}, 'peg': {},
+                           'adsr': {(6, 74): (134, 51491)}, 'decay_rate': {4: 50},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -47.12), (50, -40.49), (64, -23.22), (72, -17.4),
+                                                  (80, -11.63), (86, -7.18), (90, -4.19), (100, -5.76), (110, -2.15),
+                                                  (115, -0.53), (120, -0.17), (122, 0.05), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -45.98), (50, -39.35), (64, -23.46), (72, -17.4),
+                                               (80, -11.54), (86, -7.22), (90, -4.36), (100, -5.74), (110, -2.1),
+                                               (115, -0.38), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'interp_comp': [1, 2, 3, 4, 5, 6],
+                           'up_wrap': True, 'pan_route': True}},
+    'DUO01.PAC': {'set': '83b087bfb110', 'banks': ['DUO01.PAC'], 'rounds': 3, 'score': 0.73, 'treble': True, 'version': 1,
+                  'tune': {'keyoff_clamp': True, 'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94,
+                           'level_db': 2.15, 'time_scale': 1.0,
+                           'gain_db': {1: -3.08, 2: -0.05, 3: 0.29, 4: 1.61, 5: -1.23, 6: -0.43, 7: 1.28,
+                                       (8, 47): 3.34, (8, 75): 2.22, (8, 84): 1.87},
+                           'decay_dbps': {1: -0.78, 2: -2.43, 3: -2.78, 4: -5.73, 6: -1.38, 7: -5.73},
+                           'upsample': {1: 2, 2: 3, 3: 3, 4: 2, 5: 2, 6: 2, 7: 2}, 'peg': {}, 'adsr': {},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -46.62), (50, -39.45), (64, -22.94), (72, -17.23),
+                                                  (80, -11.33), (86, -7.44), (90, -4.06), (100, -5.65), (110, -2.05),
+                                                  (115, -0.56), (120, -0.01), (122, -0.01), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -48.48), (50, -40.65), (64, -24.08), (72, -18.0),
+                                               (80, -11.99), (86, -7.23), (90, -4.27), (100, -6.07), (110, -1.82),
+                                               (115, -0.57), (120, -0.01), (122, -0.01), (127, 0.0)]},
+                           'decay_rate': {1: 72, 2: 66, 3: 65, 4: 61, 6: 69, 7: 61},
+                           'key_split': {1: [(0, 47, {'layer_upsample': [[0, 8]]}),
+                                             (48, 127, {'layer_upsample': [[0, 4]]})]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'cents': {2: 1.2}, 'up_wrap': True,
+                           'pan_route': True}},
+    'ST09A.PAC': {'set': 'cf86e4d1a785', 'banks': ['ST09A.PAC'], 'rounds': 2, 'score': 0.9, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 8.92,
+                           'time_scale': 1.00149,
+                           'gain_db': {1: -2.99, 2: 0.59, 3: -1.28, 4: -1.35, 5: -1.08, 6: 3.76, 7: 3.09, 8: 1.86,
+                                       9: -1.12, (8, 0): 0.6},
+                           'decay_dbps': {4: -16.2, 8: -24.27}, 'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 9: 2},
+                           'peg': {}, 'adsr': {(8, 0): (208, 52807)}, 'loop_repeats': 1, 'pitch_grid': True,
+                           'loop_dual': 1, 'interp_comp': True, 'up_wrap': True, 'pan_route': True}},
+    'ST10A.PAC': {'set': '510d67d1ed3b', 'banks': ['ST10A.PAC'], 'rounds': 5, 'score': 0.38, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 2.95,
+                           'time_scale': 0.99801,
+                           'gain_db': {1: -1.35, 2: 0.12, 3: 0.12, 4: 1.92, 5: -0.24, 6: 1.18, 7: 1.32, 8: 0.27,
+                                       9: 0.43, 10: 0.27, 11: 0.17, (12, 60): -1.73, (12, 61): 3.99, (12, 62): 4.64,
+                                       (12, 63): -2.26, (5, 0): 1.48},
+                           'decay_dbps': {2: -1.21, 3: -1.21, 4: -32.4, 5: -27.0, 6: -0.64, 7: -0.64, 8: -12.6,
+                                          9: -12.6, 10: -4.16, 11: -4.16},
+                           'upsample': {1: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2, 11: 2, 12: 2}, 'peg': {},
+                           'adsr': {(5, 0): (210, 52750)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -48.6), (50, -41.2), (64, -24.1), (72, -18.0),
+                                                  (80, -12.0), (86, -7.2), (90, -4.3), (100, -6.0), (110, -1.9),
+                                                  (115, -0.6), (120, 0.0), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -46.93), (50, -39.89), (64, -23.27), (72, -17.29),
+                                               (80, -11.57), (86, -7.26), (90, -4.26), (100, -5.66), (110, -2.18),
+                                               (115, -0.43), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                           'decay_rate': {2: 70, 3: 70, 4: 53, 5: 55, 6: 73, 7: 73, 8: 57, 9: 57, 10: 63, 11: 63},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1,
+                           'interp_comp': [1, 2, 3, 6, 7, 8, 9, 10, 11, 12], 'up_wrap': True, 'pan_route': True}},
+    'ST11A.PAC': {'set': '870ac684bbda', 'banks': ['ST11A.PAC'], 'rounds': 3, 'score': 0.69, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 2.49,
+                           'time_scale': 1.00648,
+                           'gain_db': {1: 1.92, 2: 3.64, 3: -0.02, 4: -0.07, 5: 1.94, 6: 1.92, (7, 60): 1.36,
+                                       (7, 61): -0.05, (7, 62): 0.64, (7, 64): 8.22},
+                           'decay_dbps': {1: -0.3}, 'upsample': {1: 2, 2: 2, 3: 4, 4: 4, 5: 2, 6: 2, 7: 2}, 'peg': {},
+                           'adsr': {}, 'decay_rate': {1: 127},
+                           'key_split': {2: [(0, 42, {'layer_upsample': [[0, 4]]}),
+                                             (43, 127, {'layer_upsample': [[0, 2]]})]},
+                           'loop_repeats': 1, 'layer_gain_db': {(1, 1): 4.0, (1, 0): -2.0}, 'loop_dual': 1,
+                           'interp_comp': [1, 2, 3, 4, 5, 6, 7], 'up_wrap': True, 'pan_route': True}},
+    'ST12A.PAC': {'set': '8802236a8568', 'banks': ['ST12A.PAC'], 'rounds': 2, 'score': 0.69, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 10.5,
+                           'time_scale': 1.01147,
+                           'gain_db': {1: -0.09, 2: 1.41, 3: 1.5, 4: 0.32, 5: 0.22, 6: -5.05, 7: -5.22, (8, 47): 0.01,
+                                       (8, 76): 0.43, (8, 77): -0.34},
+                           'decay_dbps': {6: -16.14, 7: -16.07},
+                           'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2}, 'peg': {}, 'adsr': {},
+                           'key_split': {2: [(0, 54, {'layer_upsample': [[0, 8]]}),
+                                             (55, 66, {'layer_upsample': [[0, 4]]}),
+                                             (67, 127, {'layer_upsample': [[0, 2]]})],
+                                         3: [(0, 54, {'layer_upsample': [[0, 8]]}),
+                                             (55, 66, {'layer_upsample': [[0, 4]]}),
+                                             (67, 127, {'layer_upsample': [[0, 2]]})]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'interp_comp': True,
+                           'up_wrap': True, 'pan_route': True}},
+    'STBOS.PAC': {'set': '317971628191', 'banks': ['STBOS.PAC'], 'rounds': 6, 'score': 1.23, 'treble': True, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 4.64,
+                           'time_scale': 1.00199,
+                           'gain_db': {1: -0.52, 2: 0.32, 3: -0.26, 4: -0.27, 5: 6.83, 6: -2.03, 7: -1.78,
+                                       (8, 47): -0.31, (8, 60): -0.39, (8, 61): -0.5, (8, 62): -80.0},
+                           'decay_dbps': {4: -0.32}, 'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2},
+                           'peg': {}, 'adsr': {},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -36.21), (50, -28.11), (64, -18.1), (72, -11.91),
+                                                  (80, -5.99), (86, -1.19), (90, 0.03), (100, -0.01), (110, -1.24),
+                                                  (115, -0.54), (120, -0.49), (122, -0.01), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -36.37), (50, -28.45), (64, -18.19), (72, -11.99),
+                                               (80, -6.11), (86, -1.24), (90, 0.02), (100, -0.03), (110, -1.23),
+                                               (115, -0.66), (120, -0.59), (122, 0.0), (127, 0.0)]},
+                           'decay_rate': {4: 77},
+                           'key_split': {4: [(0, 48, {'layer_upsample': [[0, 4]]}),
+                                             (49, 127, {'layer_upsample': [[0, 2]]})]},
+                           'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1,
+                           'cc7_mid': {1: ('hold', [[10, -0.5], [35, -1.0], [65, -2.6], [100, -4.1], [120, -5.6]]),
+                                       2: ('hold', [[10, 1.0], [35, -0.6], [65, -2.6], [95, -4.4], [120, -5.7]]),
+                                       3: 'cut',
+                                       4: ('hold', [[10, 4.6], [35, 3.8], [65, 3.5], [90, 3.4], [108, 3.2]]),
+                                       5: 'cut', (4, 55): 'cut'},
+                           'interp_comp': True, 'up_wrap': True, 'pan_route': True}},
+    'FORTE2.PAC': {'set': '0945db1569a6', 'banks': ['FORTE2.PAC'], 'rounds': 4, 'score': 0.83, 'treble': True, 'version': 1,
+                   'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 6.74,
+                            'time_scale': 1.00697,
+                            'gain_db': {1: -3.92, 2: 1.71, 3: -0.96, 4: 4.96, 5: -0.33, 6: -0.24, 7: 1.48, 8: -4.18,
+                                        (9, 60): 1.72, (9, 61): 1.22, (9, 62): 1.56, (9, 63): 1.71, (1, 0): -4.48,
+                                        (1, 66): -4.48, (2, 0): 0.78, (4, 0): 3.89, (7, 0): 2.71, (8, 0): -5.01},
+                            'decay_dbps': {1: -10.84, 5: -4.16, 6: -4.16}, 'upsample': {2: 2, 3: 2, 7: 2, 8: 2, 9: 2},
+                            'peg': {}, 'adsr': {},
+                            'vel_db': {'melodic': [(0, -90.0), (40, -46.26), (50, -39.94), (64, -23.55), (72, -17.4),
+                                                   (80, -11.78), (86, -7.39), (90, -4.4), (100, -5.82), (110, -2.22),
+                                                   (115, -0.49), (120, 0.02), (122, -0.01), (127, 0.0)],
+                                       'drum': [(0, -90.0), (40, -48.4), (50, -41.1), (64, -24.21), (72, -17.93),
+                                                (80, -12.07), (86, -7.21), (90, -4.11), (100, -6.03), (110, -1.77),
+                                                (115, -0.59), (120, -0.06), (122, -0.02), (127, 0.0)]},
+                            'decay_rate': {1: 58, 5: 63, 6: 63},
+                            'key_split': {1: [(0, 65, {'layer_upsample': [[0, 2], [1, 1], [2, 2], [3, 1]]}),
+                                              (66, 127, {'layer_upsample': [[0, 1], [1, 1], [2, 1], [3, 1]]})],
+                                          3: [(0, 47, {'layer_upsample': [[0, 8]]}),
+                                              (48, 127, {'layer_upsample': [[0, 4]]})]},
+                            'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'cents': {1: 4.4, 4: 1.3},
+                            'interp_comp': True, 'up_wrap': True, 'pan_route': True}},
+    'WILY1.PAC': {'set': '9c36a13d4bd0', 'banks': ['WILY1.PAC', 'WILY2B.PAC'], 'rounds': 6, 'score': 1.62, 'version': 1,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 3.44,
+                           'time_scale': 1.0,
+                           'gain_db': {1: 3.36, 2: 2.57, 3: 2.77, 4: 2.51, 5: 2.42, 6: -2.39, 8: 0.07, 9: 0.15,
+                                       10: 3.55, (7, 60): -0.0, (7, 61): 0.76, (7, 62): 2.32},
+                           'decay_dbps': {1: -2.04, 2: -9.05, 4: -9.05, 5: -9.05, 6: -0.37, 10: -3.16},
+                           'upsample': {1: 2, 6: 2, 7: 2, 10: 2}, 'peg': {}, 'adsr': {},
+                           'decay_rate': {1: 67, 2: 59, 4: 59, 5: 59, 6: 76, 10: 64}, 'loop_repeats': 1,
+                           'pitch_grid': True, 'loop_dual': 1, 'interp_comp': True, 'layer_upsample': {(7, 2): 4},
+                           'spu_low': True, 'up_wrap': True, 'pan_route': True}},
+    'WILY2C.PAC': {'set': '0038848621b1', 'banks': ['WILY2C.PAC'], 'rounds': 6, 'score': 1.45, 'treble': True, 'version': 1,
+                   'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 6.32,
+                            'time_scale': 1.00149,
+                            'gain_db': {1: -1.28, 2: -2.71, 3: 0.49, 4: 0.0, 5: -1.25, 6: 1.42, 7: 1.12,
+                                        (8, 47): 0.62, (8, 81): 0.76, (8, 84): -0.33, (8, 74): -0.41, (8, 75): -0.22,
+                                        (8, 86): -4.15, (8, 87): -4.13, (8, 88): -4.15, (4, 0): 2.39, (5, 0): -0.06},
+                            'decay_dbps': {2: -15.09, 6: -0.96, 7: -12.11},
+                            'upsample': {2: 2, 3: 2, 4: 2, 5: 2, 7: 2}, 'peg': {},
+                            'adsr': {(4, 0): (201, 53216), (5, 0): (218, 52768), (8, 81): (194, 52524)},
+                            'layer_upsample': {(8, 0): 1, (8, 1): 1, (8, 2): 2, (8, 3): 2, (8, 4): 2, (8, 5): 2,
+                                               (8, 6): 2, (8, 7): 2},
+                            'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1, 'cents': {3: 1.6, 4: 1.1},
+                            'interp_comp': True, 'spu_low': True, 'up_wrap': True, 'pan_route': True}},
+    'WILY3C.PAC': {'set': '53af15dd4505', 'banks': ['WILY3C.PAC'], 'rounds': 2, 'score': 0.95, 'version': 1,
+                   'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 3.8,
+                            'time_scale': 1.00549,
+                            'gain_db': {1: -1.43, 2: -1.84, 3: 1.56, 4: 1.43, 5: 1.51, 6: -1.88, (7, 60): -1.84,
+                                        (7, 61): 2.5, (7, 62): -2.17, (7, 63): -1.84},
+                            'decay_dbps': {1: -0.79, 2: -24.16, 6: -24.17},
+                            'upsample': {1: 2, 2: 2, 3: 2, 6: 2, 7: 2}, 'peg': {}, 'adsr': {},
+                            'vel_db': {'melodic': [(0, -90.0), (40, -47.4), (50, -40.44), (64, -23.79), (72, -17.61),
+                                                   (80, -11.89), (86, -7.2), (90, -4.33), (100, -5.69), (110, -2.09),
+                                                   (115, -0.42), (120, 0.01), (122, 0.02), (127, 0.0)],
+                                       'drum': [(0, -90.0), (40, -47.58), (50, -40.2), (64, -23.53), (72, -17.61),
+                                                (80, -11.74), (86, -7.11), (90, -3.96), (100, -5.86), (110, -1.75),
+                                                (115, -0.56), (120, 0.0), (122, 0.0), (127, 0.0)]},
+                            'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1,
+                            'interp_comp': [1, 2, 3, 4, 5, 6, 7], 'up_wrap': True, 'pan_route': True}},
+    'BS06C.PAC': {'set': '4c063f20cc11', 'banks': ['BS06C.PAC'], 'rounds': 5, 'score': 0.47, 'version': 1,
+                  'tune': {'keyoff_clamp': True, 'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94,
+                           'level_db': -2.08, 'time_scale': 1.0,
+                           'gain_db': {1: -0.04, 2: -0.24, 3: -0.23, 4: 1.84, 5: 0.08, (7, 45): -1.18, (7, 51): -1.32,
+                                       (7, 77): 1.47, (7, 81): 8.41, (7, 88): -0.88, (7, 87): -0.58, (7, 84): -0.74},
+                           'decay_dbps': {2: -9.05, 3: -9.05, 4: -31.5}, 'upsample': {1: 2, 2: 2, 3: 2, 7: 2},
+                           'peg': {}, 'adsr': {(7, 77): (139, 51427), (7, 81): (220, 52451)},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -39.85), (50, -32.16), (64, -22.17), (72, -16.01),
+                                                  (80, -10.41), (86, -5.64), (90, -7.2), (100, -3.63), (110, 0.04),
+                                                  (115, -0.0), (120, 0.02), (122, 0.02), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -39.69), (50, -32.1), (64, -22.26), (72, -16.19),
+                                               (80, -10.58), (86, -5.71), (90, -7.06), (100, -3.75), (110, -0.02),
+                                               (115, -0.04), (120, -0.0), (122, -0.0), (127, 0.0)]},
+                           'decay_rate': {2: 59, 3: 59, 4: 54}, 'loop_repeats': 1,
+                           'key_split': {4: [(0, 53, {'layer_upsample': [[0, 4]]}),
+                                             (54, 56, {'layer_upsample': [[0, 4]]}),
+                                             (57, 59, {'layer_upsample': [[0, 4]]}),
+                                             (60, 63, {'layer_upsample': [[0, 2]]}),
+                                             (64, 127, {'layer_upsample': [[0, 2]], 'gain_db': 0.53})],
+                                         5: [(0, 61, {'layer_upsample': [[0, 8]]}),
+                                             (62, 71, {'layer_upsample': [[0, 8]]}),
+                                             (72, 82, {'layer_upsample': [[0, 4]]}),
+                                             (83, 92, {'layer_upsample': [[0, 2]]}),
+                                             (93, 127, {'layer_upsample': [[0, 3]]})]},
+                           'pitch_grid': True, 'loop_dual': 1, 'interp_comp': True, 'up_wrap': True,
+                           'pan_route': True}},
+    'BSCLR.PAC': {'set': 'd943388f10c5', 'banks': ['BSCLR.PAC'], 'rounds': 2, 'score': 0.9, 'treble': True, 'version': 2,
+                  'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 0.72,
+                           'time_scale': 1.00399,
+                           'gain_db': {1: 0.17, 2: -1.12, 3: -0.92, 4: -0.12, 5: 1.17, 6: 1.46, 7: 1.2,
+                                       (8, 60): -0.26, (8, 61): -0.56, (8, 64): -0.4, (8, 62): -0.34, (8, 63): -0.41,
+                                       (2, 0): -0.14, (3, 0): 1.47},
+                           'decay_dbps': {}, 'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2}, 'peg': {},
+                           'adsr': {(1, 0): (218, 52771), (1, 55): (218, 52771), (2, 0): (209, 52899),
+                                    (2, 56): (210, 20643), (2, 60): (210, 52771), (2, 65): (209, 52899),
+                                    (2, 69): (209, 52899), (3, 0): (209, 52899), (3, 56): (209, 52899),
+                                    (3, 60): (209, 52899), (3, 64): (209, 52899), (3, 68): (209, 52899),
+                                    (4, 0): (209, 52899), (4, 46): (209, 20771)},
+                           'key_split': {1: [(0, 127, {'layer_upsample': [[0, 8]]})],
+                                         4: [(0, 127, {'layer_upsample': [[0, 4], [1, 4]]})]},
+                           'cents': {1: 4.3, 2: 4.3, 3: 4.3, 4: 4.3, 5: 4.3, 6: 4.3, 7: 4.3, (1, 55): 3.0,
+                                     (3, 60): 0.7, (3, 64): 0.8, (3, 68): 4.9, (2, 0): 1.5, (2, 60): 1.6,
+                                     (2, 69): 1.9, (4, 0): 2.7},
+                           'cc10_map': {6: [(0, 0), (32, 19), (64, 64), (96, 111), (127, 127)],
+                                        7: [(0, 0), (32, 19), (64, 64), (96, 111), (127, 127)]},
+                           'vel_db': {'melodic': [(0, -90.0), (40, -48.19), (50, -41.55), (64, -24.03), (72, -18.21),
+                                                  (80, -11.94), (86, -7.22), (90, -4.72), (100, -6.33), (110, -1.87),
+                                                  (115, -0.7), (120, -0.28), (122, 0.19), (127, 0.0)],
+                                      3: [(0, -90.0), (40, -49.43), (50, -41.46), (64, -24.37), (72, -18.69),
+                                          (80, -12.79), (86, -8.49), (90, -5.28), (100, -7.05), (110, -3.05),
+                                          (115, -0.91), (120, -0.82), (122, -0.71), (127, 0.0)],
+                                      'drum': [(0, -90.0), (40, -47.04), (50, -41.22), (64, -23.79), (72, -17.74),
+                                               (80, -12.09), (86, -7.06), (90, -3.78), (100, -5.61), (110, -1.75),
+                                               (115, -0.41), (120, 0.29), (122, 0.0), (127, 0.0)]},
+                           'loop_repeats': 1, 'loop_dual': 1, 'interp_comp': True, 'up_wrap': True, 'pan_route': True}},
+    'WILY3B.PAC': {'set': '8d078bf42a6f', 'banks': ['WILY3B.PAC'], 'rounds': 3, 'score': 0.77, 'version': 2,
+                   'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': -1.02,
+                            'time_scale': 1.0215, 'gain_db': {1: 1.44, 2: 0.03, 3: 0.06, 4: 0.17, 5: 0.2, 6: -1.76},
+                            'decay_dbps': {}, 'upsample': {1: 2, 2: 2, 3: 2, 4: 4, 5: 4, 6: 2}, 'peg': {},
+                            'adsr': {(1, 0): (247, 20899), (1, 47): (233, 20771), (2, 0): (230, 53091),
+                                     (2, 72): (230, 53091), (2, 77): (230, 53091), (3, 0): (230, 53091),
+                                     (3, 72): (230, 53091), (3, 77): (230, 53091), (6, 0): (251, 53283),
+                                     (6, 47): (252, 20707)},
+                            'vel_db': {'melodic': [(0, -90.0), (40, -46.97), (50, -40.19), (64, -23.5), (72, -17.25),
+                                                   (80, -11.73), (86, -7.33), (90, -4.27), (100, -5.56), (110, -2.19),
+                                                   (115, -0.42), (120, 0.01), (122, 0.03), (127, 0.0)]},
+                            'cents': {2: -1.1, 3: -1.0}, 'loop_repeats': 1, 'pitch_grid': True, 'loop_dual': 1,
+                            'interp_comp': [1, 4, 5, 6], 'spu_low': True, 'up_wrap': True, 'pan_route': True}},
+    'WILYMAP.PAC': {'set': 'cd360fe138af', 'banks': ['WILYMAP.PAC'], 'rounds': 6, 'score': 1.3, 'version': 1,
+                    'tune': {'reverb': False, 'seq_res_scale': 10, 'gate_frames': 59.94, 'level_db': 6.98,
+                             'time_scale': 1.005,
+                             'gain_db': {1: 1.29, 2: 0.49, 3: 0.48, 4: 0.51, 5: -5.4, (3, 0): -0.46},
+                             'decay_dbps': {1: -4.94, 2: -4.16, 3: -9.05, 4: -9.05, 5: -14.46},
+                             'upsample': {1: 2, 2: 2, 3: 2, 4: 2, 5: 2}, 'peg': {}, 'adsr': {},
+                             'vel_db': {'melodic': [(0, -90.0), (40, -47.25), (50, -40.59), (64, -24.01),
+                                                    (72, -17.97), (80, -11.99), (86, -7.36), (90, -4.04),
+                                                    (100, -6.15), (110, -1.91), (115, -0.56), (120, -0.1),
+                                                    (122, -0.16), (127, 0.0)]},
+                             'decay_rate': {1: 62, 2: 63, 3: 59, 4: 59, 5: 56}, 'loop_repeats': 1, 'pitch_grid': True,
+                             'loop_dual': 1, 'cents': {2: -2.0}, 'detune_exact': True, 'pan_route': True}},
 }
+# Every bank's tune (banks of one set share their set's dict); a bank without an entry gets the general laws above.
+MUSIC_TUNE = {b: v['tune'] for v in SAT_TUNES.values() for b in v['banks']}
 
 def _interp_db(curve, v):
     xs, ys = zip(*curve)
@@ -3887,7 +4487,7 @@ def _interp_comp(pcm, L, up=1):
         y = np.concatenate([e[:n0], e[n0 + 2 * len(lp):n0 + 3 * len(lp)]])
     pk = float(np.max(np.abs(y))) if len(y) else 0.0; db = 0.0
     if pk > 32767: db = 20 * math.log10(pk / 32767); y = y * (32767 / pk)
-    return [int(max(-32768, min(32767, round(x)))) for x in y], db
+    return _pcm16(y), db
 
 @_memo
 def scsp_noise_loop(emph=True, n=SCSP_NOISE_LOOP):
@@ -3914,7 +4514,7 @@ def _decimate(pcm, d):
     import numpy as np
     n = np.arange(-63, 64); h = np.sinc(n / d) / d * np.blackman(127)
     y = np.convolve(np.asarray(pcm, float), h)[63:63 + len(pcm)][::d]
-    return [int(max(-32768, min(32767, round(x)))) for x in y]
+    return _pcm16(y)
 
 SPU_PITCH_CAP = 3.97              # highest SPU pitch the converter lets a note ask for (the SPU clips at 4.0; margin)
 
@@ -4050,9 +4650,9 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
                 else:                    # loop kept seamless: filter attack + 4 loop passes, keep a steady pass
                     n0, n1 = L['lsa'], L['lea']; lp = list(pcm[n0:n1]); e = lift(list(pcm[:n0]) + lp * 4)
                     y = np.concatenate([e[:n0], e[n0 + 2 * len(lp):n0 + 3 * len(lp)]])
-                pcm = [int(max(-32768, min(32767, round(x)))) for x in y]
+                pcm = _pcm16(y)
             S = 0.0 if noise else S_of.get((L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up if lu_ is None else tune.get('upsample', {}).get(v, 1)), 0.0)
-            if S: pcm = [max(-32768, min(32767, round(x * 10 ** (S / 20)))) for x in pcm]
+            if S: pcm = _pcm16([x * 10 ** (S / 20) for x in pcm])
             down = 1.0
             if up < 1:
                 # stored at a lower rate (looped voices through the loop resampler, one-shots by _decimate): the SPU's pitch is capped at
@@ -4338,7 +4938,7 @@ def patch_music_hook(disc, vf0):
     0x801376D4 has only 0x40 entries; n >= 0x46 would read file-number bytes). n < 0x46 behaves exactly as before."""
     rd = lambda a: disc.exe_words(a, 1)[0]
     wr = disc.exe_write_words
-    V0, V1, A0, A1, A2, AT, S0 = 2, 3, 4, 5, 6, 1, 16
+    V0, A0, A1, A2, AT, S0 = 2, 4, 5, 6, 1, 16
     assert 0 <= vf0 <= 0xFFFF
     for a in PSX_BGM_FILE_SITES:
         old = [rd(a + 4 * i) for i in range(10)]
@@ -4381,7 +4981,7 @@ def patch_music_spu_low(disc):
     """Load the music bank right after the common sound bank (PCOMMON, load record 0) instead of at record 1's own SPU
     address: the sound memory between them is never used (no other bank or transfer writes it), so every music bank
     gets SPU_MUSIC_BODY_MAX_LOW bytes below the reverb work area. The new address = record 0's address + PCOMMON's VAB
-    body rounded up to SPU_DMA_BLOCK; everything is read from the disc. Not part of the current release build."""
+    body rounded up to SPU_DMA_BLOCK; everything is read from the disc. On in the release build (with the Saturn songs)."""
     r0, r1 = disc.exe_words(PSX_BGM_LOAD_RECS, 4), disc.exe_words(PSX_BGM_LOAD_RECS + 16, 4)
     assert r0[0] == 0 and r1[0] == 1 and r0[2] < r1[2] and r0[3] < r1[3], 'unexpected music load records'
     _, _, ext, size = disc.iso_record('SOUND/PCOMMON.PAC')
@@ -4683,14 +5283,14 @@ def m8k_demo_tail(demo_len, ent_ps, bank, workdir=None):
     return out + ovl, dict(tk_frame=base, tk_ovl_size=len(ovl))
 
 def patch_m8_ticker(disc, lba, bank, workdir=None):
-    """M8t4: the ticker code appended to DEMO.BIN (after the M7 code; bank = (LBA, size) of the converted Tengu Man
-    bank), DEMO.BIN moved to a PSX_DEMO_SLOT_M8K-sector slot at the free sectors at `lba` (file-table entry 8 and its
+    """M8t4: the ticker code appended to DEMO.BIN (patch_m7a's, disc.m7_demo; after the M7 code; bank = (LBA, size) of
+    the converted Tengu Man bank), DEMO.BIN written to a PSX_DEMO_SLOT_M8K-sector slot at the free sectors at `lba` (file-table entry 8 and its
     ISO record), the stage-select render call repointed to tk_frame. The init's stream of file 0x72 stays the game's."""
     rd = lambda a: disc.exe_words(a, 1)[0]
     assert fp(rd(M8K_INIT_CALL)) == M8K_INIT_FP and fp(rd(M8K_RENDER_CALL)) == M8K_RENDER_FP, 'stage-select calls'
     e28 = disc.file_entry(PSX_TENGU_FILE)
     e = disc.file_entry(PSX_DEMO_FILE)
-    demo = disc.read(e[0], e[1])
+    demo = disc.m7_demo                          # DEMO.BIN as patch_m7a built it (not written to the original slot)
     tail, info = m8k_demo_tail(len(demo), e28[:2], bank, workdir)
     demo = demo + tail
     slot = PSX_DEMO_SLOT_M8K * 2048
@@ -4918,11 +5518,13 @@ def patch_title_menu(disc, title_hook, title_confirm):
     return dict(title_cursor=cur, title_recs=recs)
 
 def patch_m7a(disc, lba, workdir=None, vf0=None, tengu=None, sat_music=None):
-    """M7a: DEMO.BIN rebuilt in its own slot (file-table entry 8 + ISO record: new size), the bonus overlay written to
-    the free sectors at `lba` (reached through the virtual entry in DEMO.BIN), title-menu EXE patches. Returns info."""
+    """M7a: DEMO.BIN rebuilt (title hook, bonus entry, virtual file entry; left in disc.m7_demo for patch_m8_ticker,
+    which appends the ticker code and writes it to its own slot, so the original slot stays as on the disc), the bonus
+    overlay written to the free sectors at `lba` (reached through the virtual entry in DEMO.BIN), title-menu EXE
+    patches. Returns info."""
     e = disc.file_entry(PSX_DEMO_FILE)
     demo = disc.read(e[0], e[1])
-    pairs = tuple(sorted(sat_music)) if sat_music is not None else None
+    pairs = tuple(sorted(sat_music))
     new, bonus, info = build_m7_overlays(demo, workdir, pairs)
     slabo = m7b_slabo_pac(pairs); slabo_lba = lba + (len(bonus) + 2047) // 2048
     bonus = bytearray(bonus); bonus[info['slabo_vf_off']:info['slabo_vf_off'] + 12] = struct.pack('<3I', slabo_lba, len(slabo), 0x14)
@@ -4943,16 +5545,10 @@ def patch_m7a(disc, lba, workdir=None, vf0=None, tengu=None, sat_music=None):
     assert len(o9) == 48 and all(struct.unpack_from('<3I', o9, 12 * k)[2] == 4 for k in range(4))
     bonus[info['music_vf_off']:info['music_vf_off'] + 48] = o9
     if tengu is None: tengu = find_m8_tengu_bank(disc)       # M8t5: music 5's file entry, PSX then the Saturn bank
-    bonus[info['e28_off']:info['e28_off'] + 16] = struct.pack('<4I', *disc.file_entry(PSX_TENGU_FILE)[:2], *tengu)
-    if pairs is not None: bonus[info['st_off']:info['st_off'] + 12 * info['st_entries']] = m8s_sttab(disc, pairs, {**sat_music, PSX_TENGU_MUSIC: tengu})
+    bonus[info['st_off']:info['st_off'] + 12 * info['st_entries']] = m8s_sttab(disc, pairs, {**sat_music, PSX_TENGU_MUSIC: tengu})
     bonus = bytes(bonus)
     new[info['vf_off']:info['vf_off'] + 12] = struct.pack('<3I', lba, len(bonus), 5)
-    assert disc.read(e[0] + 0, PSX_DEMO_SLOT * 2048)[e[1]:] == bytes(PSX_DEMO_SLOT * 2048 - e[1])
-    disc.write(e[0], 0, bytes(new))
-    disc.set_file_entry(PSX_DEMO_FILE, e[0], len(new))
-    rl, ro, ext, sz = disc.iso_record('OVL/DEMO.BIN')
-    assert ext == e[0]
-    disc.write(rl, ro + 10, struct.pack('<I', len(new)) + struct.pack('>I', len(new)))
+    disc.m7_demo = bytes(new)
     info['bonus_lba'] = lba; info['bonus_sectors'] = place_file(disc, lba, bonus)
     assert lba + info['bonus_sectors'] == slabo_lba
     info['slabo_lba'] = slabo_lba; info['slabo_size'] = len(slabo); info['slabo_sectors'] = place_file(disc, slabo_lba, slabo)
@@ -5136,25 +5732,25 @@ extern void psx_task_exit(void);                    /* 0x800F7F00: end the calli
 #define SND_BUSY   (*(volatile u8 *)0x801CF53C)
 static u16 st_pending __attribute__((section(".data"))) = 0;   /* Saturn 0x060733C8: the sound to play once the bank is in */
 __attribute__((noinline, noipa)) u32 h_0027b0f8(u32 st, u32 b, u32 c, u32 d) { bonus_st(st); return 0; }
-/* M8t5: the sound test has one more entry than the Saturn's: Tengu Man's stage twice, the PSX's song (TENGU_ST_) and the
-   Saturn's (TENGU_ST_ + 1). Both play music 5 (the Saturn table's entry); before playing, music 5's file-table entry is
-   set to the chosen version's file (bonus_e28: PSX LBA / size from the user's disc, then the converted bank's), and a
-   loaded music 5 is marked unloaded so play_bgm reads the other file. Later entries play the Saturn table's entry n - 1.
-   bonus_main puts back the entry it found when Bonus Mode is left. */
-extern char bonus_e28[];                            /* linker symbol: address of the 4 words (filled in by the build) */
-#define TENGU_ENTRY ((volatile u32 *)TENGU_FILE_ENTRY_)
+/* The sound test with both versions of every song that has a Saturn bank: entry n plays the Saturn table's
+   entry st_sat[n]; before that, music st_mus[n]'s file-table entry is set to the entry's version (bonus_sttab: entry
+   address, LBA, size; address 0 = one version only) and a loaded copy of that music is marked unloaded. Every switched
+   entry is put back when Bonus Mode is left (bonus_main). */
+extern char bonus_sttab[];
+static const u8 st_sat[ST_N_] = ST_SAT_;
+static const u8 st_mus[ST_N_] = ST_MUS_;
 __attribute__((noinline, noipa)) u32 h_00209088(u32 n, u32 v, u32 c, u32 d)
 {
   n &= 0xFF;
-  if (v == 0 && n >= TENGU_ST_) {
-    if (n <= TENGU_ST_ + 1) {
-      const volatile u32 *e = (const volatile u32 *)bonus_e28 + 2 * (n - TENGU_ST_);
-      if (!SND_BUSY && TENGU_ENTRY[0] != e[0]) {
-        TENGU_ENTRY[0] = e[0]; TENGU_ENTRY[1] = e[1];
-        if (BANK_NUM == TENGU_MUSIC_) BANK_NUM = 0xFF;   /* play_bgm reloads only when the music number changes */
-      }
-      n = TENGU_ST_;
-    } else n--;
+  if (v == 0) {
+    const volatile u32 *t;
+    if (n >= ST_N_) n = 0;
+    t = (const volatile u32 *)bonus_sttab + 3 * n;
+    if (t[0] && !SND_BUSY) {
+      volatile u32 *e = (volatile u32 *)t[0];
+      if (e[0] != t[1]) { e[0] = t[1]; e[1] = t[2]; if (BANK_NUM == st_mus[n]) BANK_NUM = 0xFF; }
+    }
+    n = st_sat[n];
   }
   bonus_sndplay(n, v); return 0;
 }
@@ -5421,40 +6017,6 @@ void bonus_main(void)
      hook reads them, for the sound test's CUTMAN STAGE / WOODMAN STAGE (music 0x49 / 0x47) */
   for (k = 0; k < 12; k++) ((volatile u32 *)0x801E4658)[k] = ((volatile u32 *)bonus_music_vf)[k];
   {
-    /* M8t5: the sound-test names play as steps of set 0xAD's animation 0; the 33-step list (Tengu Man's stage twice)
-       replaces the EXE's 32-step one while Bonus Mode runs, and music 5's file-table entry is put back afterwards */
-    volatile u32 *anim = (volatile u32 *)ST_ANIM_PTR_;
-    u32 a0 = *anim, e0 = TENGU_ENTRY[0], e1 = TENGU_ENTRY[1];
-    *anim = (u32)st_anim;
-    bonus_menu(0);                             /* Saturn 0x27AAD0: runs until its state 5 (EXIT) */
-    *anim = a0; TENGU_ENTRY[0] = e0; TENGU_ENTRY[1] = e1;
-  }
-}
-'''
-M8S_PAIRS_PLAYER = r'''/* The sound test with both versions of every song that has a Saturn bank: entry n plays the Saturn table's
-   entry st_sat[n]; before that, music st_mus[n]'s file-table entry is set to the entry's version (bonus_sttab: entry
-   address, LBA, size; address 0 = one version only) and a loaded copy of that music is marked unloaded. Every switched
-   entry is put back when Bonus Mode is left (bonus_main). */
-extern char bonus_sttab[];
-static const u8 st_sat[ST_N_] = ST_SAT_;
-static const u8 st_mus[ST_N_] = ST_MUS_;
-__attribute__((noinline, noipa)) u32 h_00209088(u32 n, u32 v, u32 c, u32 d)
-{
-  n &= 0xFF;
-  if (v == 0) {
-    const volatile u32 *t;
-    if (n >= ST_N_) n = 0;
-    t = (const volatile u32 *)bonus_sttab + 3 * n;
-    if (t[0] && !SND_BUSY) {
-      volatile u32 *e = (volatile u32 *)t[0];
-      if (e[0] != t[1]) { e[0] = t[1]; e[1] = t[2]; if (BANK_NUM == st_mus[n]) BANK_NUM = 0xFF; }
-    }
-    n = st_sat[n];
-  }
-  bonus_sndplay(n, v); return 0;
-}
-'''
-M8S_PAIRS_MAIN = r'''  {
     /* the sound-test names play as steps of set 0xAD's animation 0 (the generated list replaces the EXE's while Bonus
        Mode runs); every music file-table entry the sound test can switch is put back afterwards */
     static u32 st_save[2 * ST_NSW_] __attribute__((section(".data"))) = {1};
@@ -5476,12 +6038,10 @@ M8S_PAIRS_MAIN = r'''  {
 }
 '''
 
+
 def m8s_glue_pairs(glue, sn):
-    """M7B_GLUE_C with the pairs player and bonus_main's save / restore of every switched music entry."""
-    a = glue.index('/* M8t5: the sound test has one more entry'); b = glue.index('/* Saturn CD-DA status', a)
-    glue = glue[:a] + M8S_PAIRS_PLAYER + glue[b:]
-    a = glue.index('  {\n    /* M8t5: the sound-test names'); b = glue.index('\n}\n', a) + 3
-    glue = glue[:a] + M8S_PAIRS_MAIN + glue[b:]
+    """M7B_GLUE_C's sound-test player and bonus_main's save / restore of every switched music entry, filled in for
+    the entries of m8s_names."""
     ents = sn['entries']; fes = sorted({m for i, m, v in ents if v < 2})
     fe = lambda m: PSX_FILETAB + 12 * (0x17 + m)
     for k, v in dict(ST_N_=str(len(ents)), ST_SAT_='{' + ','.join(str(i) for i, m, v in ents) + '}',
@@ -5638,30 +6198,25 @@ def m7b_lift(pairs=None):
             .replace('LETTER_OFFS', '{' + ', '.join(f'{sp[0] << 24 | sp[1]:#x}' for sp in lspans) + '}').replace('LETTER_NFILES', str(len(lfiles)))
             .replace('BONUS_RAM_SIZE', str(port.ram_len)).replace('PAD_OFF', str(pad_off)).replace('VDP_OFF', str(vdp_off)).replace('ILL_CARDS', cards)
             .replace('PAD_MAP', '{' + ', '.join(f'{{{p:#x}, {s:#x}}}' for p, s in M7B_PAD_MAP) + '}'))
-    sn = m8s_names(pairs)                           # M8t5: sound test with both Tengu Man stage songs
-    if pairs is not None: glue = m8s_glue_pairs(glue, sn)
-    glue = (glue.replace('TENGU_ST_', str(sn['entry'])).replace('TENGU_FILE_ENTRY_', f'{PSX_FILETAB + 12 * PSX_TENGU_FILE:#x}')
-            .replace('TENGU_MUSIC_', str(PSX_TENGU_MUSIC)).replace('ST_ANIM_PTR_', f"{sn['anim_ptr']:#x}"))
+    sn = m8s_names(pairs)                           # the sound test with both versions of every song
+    glue = m8s_glue_pairs(glue, sn)
+    glue = glue.replace('ST_ANIM_PTR_', f"{sn['anim_ptr']:#x}")
     glue += ('\nu32 st_anim[%d] __attribute__((section(".data"))) = {' % len(sn['steps'])) + ', '.join(f'{w:#x}' for w in sn['steps']) + '};\n'
     return '\n'.join(out) + '\n' + glue + '\n' + m7b_p4_loop_asm() + '\n' + '\n'.join(bodies), port
 
 
 
-# ---- M8t5: the sound test gets both Tengu Man stage songs (README item 7). The test screen (0x27B0F8, lifted) keeps the
-# entry in its state block +6 (mirrored to 0x801B29A2); the name is P4 0x41 variant 7 = set 0xAD playing animation 0 at
-# step = entry (0x801048DC); that animation's 32 steps show frames 0x74-0x93 (one name each), from the EXE's animation
-# lists (0x8014FF74[set] -> 4 animation pointers; set 0xAD's are there although the PSX has no Bonus Mode). The
-# Saturn's music table 0x27CDAC gives the song of each entry; Tengu Man's stage = the entry with music 5.
-# Changes: entry `entry` is renamed "TENGUMAN STAGE (PSX)" (frame 0x74 + entry), a new entry right after it
-# "TENGUMAN STAGE (SAT)" (frame M8S_FRAME_SAT, the last frame of the voice test's animation 1, whose steps beyond the US
-# list's 100 entries are never shown), every later entry moves up one: a 33-step animation in the bonus overlay
-# replaces the EXE's while Bonus Mode runs; the test screen's last entry 0x1F becomes 0x20 (lifted code); the player
-# wrapper maps entries to the Saturn table and sets music 5's file entry (M7B_GLUE_C). "(", ")" are the tool's own
-# glyphs in blank tiles of the bonus font page, and so is "X" (the font has none); the other letters are the font's
-# (frames 0x74-0x93).
-M8S_SET, M8S_FIRST_FRAME, M8S_FRAME_SAT = 0xAD, 0x74, 0x73
+# ---- The sound test with both versions of every song (M8t5 for Tengu Man's stage, README item 10 for every Saturn song).
+# The test screen (0x27B0F8, lifted) keeps the entry in its state block +6 (mirrored to 0x801B29A2); the name is P4 0x41
+# variant 7 = set 0xAD playing animation 0 at step = entry (0x801048DC); that animation's 32 steps show frames 0x74-0x93
+# (one name each), from the EXE's animation lists (0x8014FF74[set] -> 4 animation pointers; set 0xAD's are there although
+# the PSX has no Bonus Mode). The Saturn's music table 0x27CDAC gives the song of each entry. Every entry with a Saturn
+# version becomes "... (PSX)" and "... (SAT)" (m8s_names_pairs): a generated animation in the bonus overlay replaces the
+# EXE's while Bonus Mode runs, the test screen's last entry follows (lifted code), the player sets the entry's music
+# file-table entry (M7B_GLUE_C). "(", ")" are the tool's own glyphs in blank tiles of the bonus font page, and so is "X"
+# (the font has none); the other letters are the font's (frames 0x74-0x93).
+M8S_SET, M8S_FIRST_FRAME = 0xAD, 0x74
 M8S_GLYPH_TILES = {'(': 139, ')': 140, 'X': 141}     # blank tiles of the bonus font page (not in a page's last tile row: its last line is not drawn)
-M8S_NAMES = ('TENGUMAN STAGE (PSX)', 'TENGUMAN STAGE (SAT)')
 M8S_GLYPHS = {'(': ('....77..', '...77...', '..77....', '..77....', '..77....', '..77....', '..77....', '..77....', '..77....',
                     '...77...', '....77..'),
               ')': ('..77....', '...77...', '....77..', '....77..', '....77..', '....77..', '....77..', '....77..', '....77..',
@@ -5671,29 +6226,14 @@ M8S_GLYPHS = {'(': ('....77..', '...77...', '..77....', '..77....', '..77....', 
                                                    # (7 white, 2-6 its edge shades); X = the font's Y diagonals mirrored
 M8S_WORD_GAP, M8S_STEP = 14, 8                      # piece x step between words / letters in the existing names
 
-@_memo
+def m8s_pairs():
+    """Music numbers with a converted Saturn bank (the sound test lists both versions of each)."""
+    return tuple(sorted(sat_music_numbers()))
+
 def m8s_names(pairs=None):
-    """Sound-test layout facts read from the discs: Tengu Man's entry, the EXE's name animation (pointer slot and
-    steps) and the new 33-step list. Returns a dict. pairs (music numbers with a converted Saturn bank; not in the
-    release build): every song with a Saturn version gets two entries, "(PSX)" and "(SAT)"."""
-    if pairs is not None: return m8s_names_pairs(tuple(pairs))
-    sat, ps = Sat(), Psx()
-    table = list(sat.raw(0x27CDAC, 32))
-    entry = table.index(PSX_TENGU_MUSIC); assert table.count(PSX_TENGU_MUSIC) == 1
-    anims = ps.exe.u32(0x8014FF74 + 4 * M8S_SET)
-    a0 = ps.exe.u32(anims)
-    steps = []
-    while True:
-        w = ps.exe.u32(a0 + 4 * len(steps)); steps.append(w)
-        if w & 0x8000: break
-    assert len(steps) == 32 and [w & 0x7FFF for w in steps] == list(range(M8S_FIRST_FRAME, M8S_FIRST_FRAME + 32))
-    a1 = ps.exe.u32(anims + 4); last = 0
-    while not ps.exe.u32(a1 + 4 * last) & 0x8000: last += 1
-    assert ps.exe.u32(a1 + 4 * last) & 0x7FFF == M8S_FRAME_SAT and last >= 100   # beyond the US voice list (0-99)
-    new = [w & ~0x8000 for w in steps]
-    new.insert(entry + 1, (new[entry] & ~0x7FFF) | M8S_FRAME_SAT)
-    new[-1] |= 0x8000
-    return dict(entry=entry, anim_ptr=anims, steps=new, music=table)
+    """Sound-test layout facts read from the discs (m8s_names_pairs) for the music numbers `pairs` with a Saturn
+    version (None = m8s_pairs(), every converted song)."""
+    return m8s_names_pairs(tuple(pairs) if pairs is not None else m8s_pairs())
 
 M8S_PAIR_FRAME0 = 0x94                 # new frames of set 0xAD (the "(SAT)" names) after the 148 the set has
 
@@ -5701,7 +6241,8 @@ M8S_PAIR_FRAME0 = 0x94                 # new frames of set 0xAD (the "(SAT)" nam
 def m8s_names_pairs(pairs):
     """The sound test with both versions of every song that has a Saturn bank (music 5 always): entries
     [(Saturn table index, music, version 0 PSX / 1 SAT / 2 one version)], the animation steps (the PSX entry keeps its
-    frame 0x74 + index, renamed "... (PSX)"; the SAT entry gets a new frame), frames {index: new frame}."""
+    frame 0x74 + index, renamed "... (PSX)"; the SAT entry gets a new frame), frames {index: new frame}, entry = Tengu Man's
+    stage's index in the Saturn table."""
     sat, ps = Sat(), Psx()
     table = list(sat.raw(0x27CDAC, 32))
     anims = ps.exe.u32(0x8014FF74 + 4 * M8S_SET); a0 = ps.exe.u32(anims); steps = []
@@ -5710,6 +6251,7 @@ def m8s_names_pairs(pairs):
         if w & 0x8000: break
     assert len(steps) == 32 and [w & 0x7FFF for w in steps] == list(range(M8S_FIRST_FRAME, M8S_FIRST_FRAME + 32))
     both = set(pairs) | {PSX_TENGU_MUSIC}
+    entry = table.index(PSX_TENGU_MUSIC); assert table.count(PSX_TENGU_MUSIC) == 1
     entries, new, frames = [], [], {}
     for i, m in enumerate(table):
         w = steps[i] & ~0x8000
@@ -5719,7 +6261,7 @@ def m8s_names_pairs(pairs):
         else:
             entries.append((i, m, 2)); new.append(w)
     new[-1] |= 0x8000
-    return dict(entry=None, anim_ptr=anims, steps=new, music=table, entries=entries, frames=frames)
+    return dict(entry=entry, anim_ptr=anims, steps=new, music=table, entries=entries, frames=frames)
 
 def m8s_suffix_pieces(base, suffix):
     """Pieces of a name frame `base` followed by a word gap and `suffix` (font letters, the tool's glyphs)."""
@@ -5731,12 +6273,8 @@ def m8s_suffix_pieces(base, suffix):
     assert x - M8S_STEP < 128
     return out
 
-def m8s_slabo_pairs(c5, c6, g, sn):
-    """The pairs variant of m8s_slabo_edit: set 0xAD's frame table is rebuilt at the end of chunk 5 with room for the
-    new frames (chunk 6 points at it); every frame's pieces are copied after it, the paired names get their suffixes."""
-    fo = struct.unpack_from('<I', c6, 4 * M8S_SET)[0]
-    fr = m8s_frames((bytes(c5), bytes(c6)))
-    assert len(fr) == M8S_PAIR_FRAME0
+def m8s_put_glyphs(g):
+    """The tool's own glyphs (parentheses, X) drawn into their free tiles of the font page g (4 bpp, 8 x 8)."""
     for ch, tl in M8S_GLYPH_TILES.items():
         assert not any(psx_tile(g, tl))
         rows = ['........'] * 5 + list(M8S_GLYPHS[ch])
@@ -5746,6 +6284,13 @@ def m8s_slabo_pairs(c5, c6, g, sn):
                 v = int(c) if c != '.' else 0
                 img[8 * y + x // 2] |= v << (4 * (x & 1))
         psx_put_tile(g, tl, bytes(img))
+
+def m8s_slabo_pairs(c5, c6, g, sn):
+    """The sound test's names in the converted SLABO chunks (5 = frames, 0x101 = font page `g`): set 0xAD's frame table is rebuilt at the end of chunk 5 with room for the
+    new frames (chunk 6 points at it); every frame's pieces are copied after it, the paired names get their suffixes."""
+    fr = m8s_frames((bytes(c5), bytes(c6)))
+    assert len(fr) == M8S_PAIR_FRAME0
+    m8s_put_glyphs(g)
     for i, f in sn['frames'].items():
         base = fr[M8S_FIRST_FRAME + i]
         fr[M8S_FIRST_FRAME + i] = m8s_suffix_pieces(base, '(PSX)')
@@ -5760,20 +6305,7 @@ def m8s_slabo_pairs(c5, c6, g, sn):
     c5 += tab + body
     struct.pack_into('<I', c6, 4 * M8S_SET, nfo)
 
-def m8s_name_pieces(base, text):
-    """Pieces (tile, byte 1, x, y) of `text`: the existing 'TENGUMAN STAGE' pieces `base`, then the rest of `text` in the
-    font's letters (tiles taken from the other names) and the tool's own glyphs (parentheses, X)."""
-    known = 'TENGUMAN STAGE'
-    assert text.startswith(known + ' ')
-    out = list(base); x = max(p[2] for p in base) + M8S_STEP; y = base[0][3]; b1 = base[0][1] & 0xFC
-    tiles = m8s_font_tiles()
-    x += M8S_WORD_GAP - M8S_STEP
-    for ch in text[len(known) + 1:]:
-        t = M8S_GLYPH_TILES[ch] if ch in M8S_GLYPH_TILES else tiles[ch]
-        out.append((t, b1 | t >> 8, x, y)); x += M8S_STEP
-    assert x - M8S_STEP < 128
-    return out
-
+@_memo
 def m8s_font_tiles():
     """Tiles of the name font for the letters the new names need, read from frames whose text is known: TITLE (frame
     0x74), TENGUMAN STAGE (frame 0x74 + Tengu Man's entry), plus P from OPENING and 1 from OPENING STAGE 1 (frame 0x77)."""
@@ -5789,9 +6321,9 @@ def m8s_font_tiles():
     m.update(word(M8S_FIRST_FRAME + 3, 'OPENING STAGE 1'))
     return m
 
-def m8s_patch_st(csrc, last=0x1F + 1):
+def m8s_patch_st(csrc, last):
     """The lifted test screen 0x27B0F8: the sound test's last entry (the Saturn's r6 = 0x1F before the shared
-    up/down routine 0x27B2BE; the voice test's is 0x63) becomes 0x20 (`last` with the pairs variant)."""
+    up/down routine 0x27B2BE; the voice test's is 0x63) becomes `last`."""
     s = csrc.index('void bonus_st(u32 obj)'); e = csrc.index('\nvoid ', s + 10)
     body = csrc[s:e]; old = 'L_27b1aa:\n  r6 = 0x1f;'
     assert body.count(old) == 1 and body.count('r6 = 0x63;') == 1 and last < 0x63
@@ -5811,29 +6343,6 @@ def m7b_slabo_base():
     """Chunks 5 and 6 of SLABO.PAC converted, before the PSX edits (for reading the name frames)."""
     ch = {t: front_pac_sat_to_psx(t, b) for t, o, b in unpac(os.path.join(SAT_FILES, 'SLABO.PAC'))}
     return ch[5], ch[6]
-
-def m8s_slabo_edit(c5, c6, g):
-    """M8t5 edits of the converted SLABO chunks (5 = frames, 0x101 = font page `g`): the two names, the tool's glyphs."""
-    fo = struct.unpack_from('<I', c6, 4 * M8S_SET)[0]
-    fr = m8s_frames((bytes(c5), bytes(c6))); e = m8s_names()['entry']
-    base = [(t, b1, x, y) for t, b1, x, y in fr[M8S_FIRST_FRAME + e]]
-    assert fr[M8S_FRAME_SAT] and len(fr[M8S_FRAME_SAT]) == 1
-    for ch, tl in M8S_GLYPH_TILES.items():
-        assert not any(psx_tile(g, tl))
-        rows = ['........'] * 5 + list(M8S_GLYPHS[ch])
-        img = bytearray(128)
-        for y, r in enumerate(rows):
-            for x, c in enumerate(r):
-                v = int(c) if c != '.' else 0
-                img[8 * y + x // 2] |= v << (4 * (x & 1))
-        psx_put_tile(g, tl, bytes(img))
-    while len(c5) % 4: c5.append(0)
-    for f, text in ((M8S_FIRST_FRAME + e, M8S_NAMES[0]), (M8S_FRAME_SAT, M8S_NAMES[1])):
-        pcs = m8s_name_pieces(base, text)
-        at = len(c5)
-        c5 += b''.join(bytes([t & 0xFF, b1, x & 0xFF, y & 0xFF]) for t, b1, x, y in pcs)
-        assert at - fo < 0x10000
-        struct.pack_into('<HH', c5, fo + 4 * f, len(pcs), at - fo)
 
 # ---- M7b build: converted SLABO.PAC and the bonus overlay
 M7B_BONUS_MAGIC = b'MM8R-B7b'
@@ -5924,8 +6433,7 @@ def m7b_slabo_pac(pairs=None):
     assert not any(psx_tile(g, M7C_TRI_TILE))
     tri = lambda v: M7C_TRI_MAP.get(v, v)
     psx_put_tile(g, M7C_TRI_TILE, bytes(tri(b & 15) | tri(b >> 4) << 4 for b in psx_tile(g, M7C_TRI_SRC)))
-    if pairs is None: m8s_slabo_edit(c5, c6, g)    # M8t5: both Tengu Man stage songs in the sound test
-    else: m8s_slabo_pairs(c5, c6, g, m8s_names(pairs))
+    m8s_slabo_pairs(c5, c6, g, m8s_names(pairs))   # the sound test's names, both versions of every song
     return pac_build([(t, bytes(b)) for t, b in ch])
 
 def build_m7b_bonus(workdir=None, pairs=None):
@@ -5936,8 +6444,8 @@ def build_m7b_bonus(workdir=None, pairs=None):
     wd = workdir and os.path.join(workdir, 'm7b_bonus') or tempfile.mkdtemp(prefix='mm8m7b_')
     os.makedirs(wd, exist_ok=True)
     csrc, port = m7b_lift(pairs)
-    nst = len(m8s_names(pairs)['entries']) if pairs is not None else 0
-    csrc = m8s_patch_st(csrc) if pairs is None else m8s_patch_st(csrc, nst - 1)   # M8t5: 33 sound-test entries
+    nst = len(m8s_names(pairs)['entries'])
+    csrc = m8s_patch_st(csrc, nst - 1)                 # the sound test's last entry
     nletter = len(m7d_letter()[0])
     syms = dict(helper_symbols(), **M7B_GLUE_SYMS, **{f'h_{k:08x}': v for k, v in M7B_FRONTEND_HELPERS.items()})
     for k in M7B_CUSTOM: syms.pop(f'h_{k:08x}', None)  # defined in the glue
@@ -5946,8 +6454,8 @@ def build_m7b_bonus(workdir=None, pairs=None):
         mvf = M7_BONUS_BASE + 12 * (vf + 1 + M7C_ILL_COUNT + nletter) - (M7_BONUS_BASE - PSX_FILETAB) if vf else 0
         data, sy = m7_compile([('m7b_bonus.c', csrc)], 'bonus', M7_BONUS_BASE, dict(syms, bonus_slabo_vf=vf, bonus_ill_vf=vf + 1,
                                                                                     bonus_letter_vf=vf + 1 + M7C_ILL_COUNT,
-                                                                                    bonus_music_vf=mvf, bonus_e28=mvf + 48 if vf else 0,
-                                                                                    **({'bonus_sttab': mvf + 64 if vf else 0} if pairs is not None else {})),
+                                                                                    bonus_music_vf=mvf,
+                                                                                    bonus_sttab=mvf + 48 if vf else 0),
                               'bonus_main', wd)
         assert sy['bonus_main'] == M7_BONUS_BASE
         out = bytearray(data)
@@ -5957,15 +6465,14 @@ def build_m7b_bonus(workdir=None, pairs=None):
         vf_off = len(out); new_vf = (M7_BONUS_BASE + vf_off - PSX_FILETAB) // 12
         out += bytes(12 * (1 + M7C_ILL_COUNT + nletter))   # SLABO, then ILL00-29 (M7c), then the LETTER files (M7d)
         music_off = len(out); out += bytes(12 * 4)          # M7e: copies of the music 0x46-0x49 entries (bonus_main moves them)
-        e28_off = len(out); out += bytes(16)                # M8t5: music 5's file entry, PSX (LBA, size) then the Saturn bank's
-        st_off = len(out); out += bytes(12 * nst)           # pairs: (file entry address, LBA, size) per sound-test entry
+        st_off = len(out); out += bytes(12 * nst)           # (file entry address, LBA, size) per sound-test entry
         if new_vf == vf: break
         vf = new_vf
     assert vf == new_vf and M7_BONUS_BASE + len(out) <= M7B_BONUS_LIMIT, hex(M7_BONUS_BASE + len(out))
     assert M7_BONUS_BASE + music_off == mvf and M7_BONUS_BASE >= M7E_MUSIC_VF + 48
     return bytes(out), dict(slabo_vf=vf, slabo_vf_off=vf_off, ill_vf=vf + 1, ill_vf_off=vf_off + 12, bonus_size=len(out),
                             letter_vf=vf + 1 + M7C_ILL_COUNT, letter_vf_off=vf_off + 12 * (1 + M7C_ILL_COUNT), letter_files=nletter,
-                            music_vf_off=music_off, e28_off=e28_off, st_off=st_off, st_entries=nst,
+                            music_vf_off=music_off, st_off=st_off, st_entries=nst,
                             csrc=os.path.join(wd, 'm7b_bonus.c'), bonus_menu=sy['bonus_menu'], bonus_ill=sy['bonus_ill'],
                             sat_data=sy['sat_data'], bonus_ram=sy['bonus_ram'])
 
@@ -6242,9 +6749,10 @@ def release_build(discs, out_dir, keep_work=False):
         out_t1 = os.path.join(out_dir, t1_name)
         tempfile.tempdir = tmp             # the compiler's scratch folders go into tmp and are removed with it
         with build_cache():
-            build_image(psx_t1, out_t1)
+            banks = sat_music_banks()
+            build_image(psx_t1, out_t1, saturn_music=banks)
             print('[3/4] Checking the new image ...', flush=True)
-            check_build(psx_t1, out_t1)
+            check_build(psx_t1, out_t1, saturn_music=banks)
         print('[4/4] Writing the other tracks and the .cue ...', flush=True)
         lines = [f'FILE "{t1_name}" BINARY', f'  TRACK 01 {ptr[0]["mode"]}', '    INDEX 01 00:00:00']
         tf = lambda b: '%02d:%02d:%02d' % (b // 2352 // 75 // 60, b // 2352 // 75 % 60, b // 2352 % 75)
