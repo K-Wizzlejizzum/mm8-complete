@@ -1805,6 +1805,37 @@ def patch_m8_name_color(disc):
     disc.write(ext, 0, m8n_select_pac(old))
     return dict(select_lba=ext, select_size=sz)
 
+# ---- Proto Man's whistle (sound 0x198): one sample (a 4x upsample of the Saturn's 11,025-Hz whistle, so 1x = as
+# recorded) in two banks: PBGM3E (Wily 4's scene) plays it at 1x (tone key = center), PBGM35 (BLS00; the voice test and
+# whatever else loads music 0x35) gives its tone a center 4 semitones under its key, so it plays 4 semitones high and
+# a second short. The Saturn plays it at 1x everywhere. PBGM35 is rewritten in place: the tone's center = its key.
+M8W_PAC, M8W_SOUND = 'SOUND/PBGM35.PAC', 0x198
+M8W_ENTRY_FP, M8W_TONE_FP = 'e229754f5b72', '081fb96f4789'    # sound 0x198's ID entry, its 32-byte tone
+
+def m8w_pbgm35(pac):
+    """PBGM35.PAC with the whistle's tone center set to its key (same size; only that byte changes)."""
+    n = struct.unpack('<I', pac[:4])[0]; off = 0x800; ch = {}
+    for i in range(n):
+        ty, s = struct.unpack('<II', pac[8 + 8 * i:16 + 8 * i]); ch[ty] = (off, s); off += (s + 0x7FF) & ~0x7FF
+    io, isz = ch[5]; ho, hsz = ch[4]
+    e = pac[io + 4 * M8W_SOUND:io + 4 * M8W_SOUND + 4]
+    assert fp(bytes(e)) == M8W_ENTRY_FP, 'unexpected PBGM35 sound entry'
+    prog, tone = e[1] & 0x7F, e[2] >> 4
+    hdr = pac[ho:ho + hsz]; assert hdr[:4] == b'pBAV'
+    blk = sum(1 for i in range(prog) if hdr[0x20 + 16 * i] > 0)    # libsnd counts only programs with tones
+    to = ho + 0x820 + 512 * blk + 32 * tone
+    assert fp(bytes(pac[to:to + 32])) == M8W_TONE_FP, 'unexpected PBGM35 whistle tone'
+    out = bytearray(pac); out[to + 4] = pac[to + 6]               # center = min key
+    return bytes(out)
+
+def patch_m8_whistle(disc):
+    """Proto Man's whistle at 1x in PBGM35 (in place). Returns info."""
+    ext, sz, _ = pac_locate(disc, M8W_PAC)
+    old = disc.read(ext, sz)
+    assert old == _file(os.path.join(PSX_FILES, *M8W_PAC.split('/'))), 'PBGM35.PAC already patched?'
+    disc.write(ext, 0, m8w_pbgm35(old))
+    return dict(whistle_lba=ext, whistle_size=sz)
+
 # ---- README item 5 (Phase 3): the HUD's Mega Man head icon at the Saturn's position. The life-bar panel is drawn from a
 # list of 8-byte sprite records (u16 x, u16 y, then tile and palette bytes; terminator byte 7 = 0xFF): PSX EXE
 # 0x80136DB0 (drawn by 0x800FADD8 from the life-bar code 0x800FA6AC), Saturn 1STREAD 0x0602B284 (drawn by the HUD
@@ -2388,7 +2419,7 @@ def patch_m8_water(disc, lba, workdir=None):
     info['m8w_sectors'] = used
     return info
 
-def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
+def build_image(src_bin, out_bin, workdir=None, extra_patches=(), music_spu_low=False, saturn_music=None):
     """The current patch on a raw PSX track 1 (all in place, sector EDC/ECC fixed):
       - track 1 extended by PSX_EXTEND_SECTORS empty sectors (extend_track1);
       - STAGE08 overlay with the relocated enemy table + lifted Wood Man / leaf code (build_m2_overlay) in the free
@@ -2405,6 +2436,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
         STAGE05 overlay with the lifted Saturn bat (P2 0x22), moved to the free sectors;
       - the last credits page gets "BONUS MODE (L1+R1+START BUTTON)" (ENDING.PAC in place, patch_m8_credits);
       - the boss-intro name as on the Saturn: orange-gold, the Saturn's letters (SELECT.PAC in place, patch_m8_name_color);
+      - Proto Man's whistle at its recorded speed in PBGM35, as in PBGM3E and on the Saturn (in place, patch_m8_whistle);
       - the HUD's head icon and lives digit at the Saturn's positions, each moved 1 px (EXE, patch_m8_hud_head);
       - the attract demos = the Saturn's: placement lists and converted demo records (PDEMO00-04.PAC in place, patch_m8_demos);
       - the intro's caustic backdrop (layer 1 below the water line) from the Saturn (STAGE00 / PDEMO00.PAC in place,
@@ -2412,10 +2444,19 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
       - the stage-select ticker (patch_m8_ticker);
       - the Saturn's water effects: STAGE00 / 06 / 07 / 0D overlays with the lifted P5 0x29 handler, moved to the free
         sectors (patch_m8_water);
+      - music_spu_low: the music bank loaded right after the common sound bank (patch_music_spu_low; off in the
+        release build until the converted Saturn songs that need the room ship);
       - extra_patches: callables f(disc, next_free_lba, workdir) -> (sectors used, info dict), applied last, after
-        every port (none in the release build)."""
+        every port (none in the release build);
+      - saturn_music ({music number: converted bank bytes}; None in the release build): every bank placed after the
+        Tengu Man bank (track 1 extended by enough more sectors), the sound test with both versions of every song,
+        music_spu_low and the SEQ room (patch_music_seq_room) on; disc.sat_music = {music: (LBA, size)} incl. music 5."""
     disc = RawDisc(src_bin)
-    extend_track1(disc)
+    ext = PSX_EXTEND_SECTORS
+    if saturn_music is not None:
+        assert all(0 <= m < PSX_BGM_FIRST_NEW and m != PSX_TENGU_MUSIC for m in saturn_music)
+        ext += -(-(sum(sectors(len(b)) for b in saturn_music.values()) + SAT_MUSIC_SPARE) // 1024) * 1024
+    extend_track1(disc, ext)
     assert disc.file_entry(PSX_STAGE08_FILE) == PSX_STAGE08_ENTRY, 'unexpected STAGE08 table entry (already patched?)'
     nxt = disc.free[0]
     pbgm46, binfo = build_boss_intro_bank('WOOD1.PAC')
@@ -2451,7 +2492,13 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update({k if k.startswith('pac09') else 'm4_' + k: v for k, v in m4.items()})
     m8t = patch_m8_tengu_bank(disc, nxt); nxt += m8t['tengu_sectors']               # M8t3: the Saturn Tengu Man bank
     info.update(m8t)
-    m7 = patch_m7a(disc, nxt, workdir, info['vf0'], (m8t['tengu_lba'], m8t['tengu_size'])); nxt += m7['m7_sectors']          # M7a/M7b: title BONUS MODE, bonus overlay, SLABO
+    sat = None
+    if saturn_music is not None:                                                    # every converted Saturn bank
+        sat = {}
+        for m in sorted(saturn_music):
+            sat[m] = (nxt, len(saturn_music[m])); nxt += place_file(disc, nxt, saturn_music[m])
+        info['sat_music_sectors'] = sum(sectors(v[1]) for v in sat.values())
+    m7 = patch_m7a(disc, nxt, workdir, info['vf0'], (m8t['tengu_lba'], m8t['tengu_size']), sat); nxt += m7['m7_sectors']          # M7a/M7b: title BONUS MODE, bonus overlay, SLABO
     info.update({'m7_' + k: v for k, v in m7.items()})
     patch_music_hook(disc, info['vf0'])
     patch_sound_guard(disc)
@@ -2460,6 +2507,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update({'m8p_' + k: v for k, v in m8p.items()})
     info.update(patch_m8_credits(disc))
     info.update(patch_m8_name_color(disc))
+    info.update(patch_m8_whistle(disc))
     info.update(patch_m8_hud_head(disc))
     info.update(patch_m8_demos(disc))
     info.update(patch_m8_caustics(disc))                                        # item 8: the intro's caustic backdrop
@@ -2467,13 +2515,23 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=()):
     info.update({'m8k_' + k: v for k, v in m8k.items()})
     m8w = patch_m8_water(disc, nxt, workdir); nxt += m8w['m8w_sectors']                # item 8: water effects
     info.update({'m8w_' + k if not k.startswith('m8w') else k: v for k, v in m8w.items()})
+    if music_spu_low or saturn_music is not None: info.update(patch_music_spu_low(disc))
+    if saturn_music is not None:
+        info.update(patch_music_seq_room(disc))
+        for m, b in saturn_music.items():
+            ch = {t: c for t, o, c in unpac_bytes(b)}
+            assert len(ch[1]) <= info['seq_room'] and len(ch[0x201]) <= SPU_MUSIC_BODY_MAX_LOW, (hex(m), len(ch[1]), len(ch[0x201]))
+        disc.sat_music = {**sat, PSX_TENGU_MUSIC: (m8t['tengu_lba'], m8t['tengu_size'])}
+        info['sat_music'] = disc.sat_music
     for f in extra_patches:
         used, more = f(disc, nxt, workdir); nxt += used; info.update(more)
     disc.save(out_bin)
     info.update(sectors_changed=len(disc.touched), free_lba=nxt, free_sectors_left=disc.free[1] - nxt)
     return info
 
-def check_build(orig_bin, new_bin, demo_tail=None):
+SAT_MUSIC_SPARE = 256                 # sectors kept free past the banks for the overlays that follow (saturn_music)
+
+def check_build(orig_bin, new_bin, demo_tail=None, saturn_music=None):
     """Independent check of a build: every sector that differs from the original (after the track-1 insertion) has a
     valid MSF header for its position, Mode 2 Form 1 and valid EDC/ECC (inserted sectors included; track 1's moved last
     sector unchanged apart from its header);
@@ -2482,6 +2540,7 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     AssertionError on a failure)."""
     o = open(orig_bin, 'rb').read(); n = open(new_bin, 'rb').read(); S = 2352
     last = len(o) // S - 1; ins = PSX_EXTEND_SECTORS
+    if saturn_music is not None: ins = (len(n) - len(o)) // S; assert ins > PSX_EXTEND_SECTORS and ins % 1024 == 0
     assert len(n) == len(o) + ins * S
     bcd = lambda v: (v // 10) << 4 | v % 10
     changed = 0; to_fix = []
@@ -2558,21 +2617,21 @@ def check_build(orig_bin, new_bin, demo_tail=None):
         assert disc.read(e[0], e[1]) == build_m8w_overlay(od, name, idx, lui)[0] and disc.iso_record(f'OVL/{name}.BIN')[2:] == (e[0], e[1]), name
     assert disc.exe_words(M8W_RR, M8W_RR_LEN // 4) == od.exe_words(M8W_RR, M8W_RR_LEN // 4), 'layer renderer'
     out['m8_water'] = [disc.file_entry(idx)[:2] for _, idx, _ in M8W_STAGES]
-    # M7a: DEMO.BIN rebuilt in its own slot; its virtual entry points at the bonus overlay
+    # M7a: DEMO.BIN rebuilt; its virtual entry points at the bonus overlay. M8t4: the ticker code follows the M7 code and
+    # DEMO.BIN sits in a PSX_DEMO_SLOT_M8K-sector slot in the free area (the rest of the slot zero but a test image's own tail)
     e8, o8 = disc.file_entry(PSX_DEMO_FILE), od.file_entry(PSX_DEMO_FILE)
-    assert e8[0] == o8[0] and e8[2] == o8[2] and e8[1] <= PSX_DEMO_SLOT * 2048, 'DEMO.BIN entry'
+    assert e8[0] >= PSX_FREE_LBA[0] and e8[2] == o8[2] and e8[1] <= PSX_DEMO_SLOT_M8K * 2048, 'DEMO.BIN entry'
     assert disc.iso_record('OVL/DEMO.BIN')[2:] == (e8[0], e8[1]), 'DEMO.BIN ISO record'
-    want_demo, want_bonus, i7 = build_m7_overlays(od.read(*o8[:2]))
+    assert disc.read(e8[0], PSX_DEMO_SLOT_M8K * 2048)[e8[1]:] == bytes(PSX_DEMO_SLOT_M8K * 2048 - e8[1]), 'DEMO.BIN slot'
+    pairs = tuple(sorted(saturn_music)) if saturn_music is not None else None
+    want_demo, want_bonus, i7 = build_m7_overlays(od.read(*o8[:2]), None, pairs)
     demo = disc.read(*e8[:2])
-    m7len = len(want_demo)                               # M8t4: tk_load + the ticker overlay's entry follow the M7 code
-    _, ti = m8k_demo_tail(m7len, 0, 0)
-    tl, ts, tt = struct.unpack('<3I', demo[ti['tk_vf_off']:ti['tk_vf_off'] + 12])
-    tail, ti = m8k_demo_tail(m7len, tl, ts)
-    assert demo[m7len:m7len + len(tail)] == tail, 'DEMO.BIN: M8t4 tk_load'
-    assert disc.read(tl, ts) == m8k_overlay(od.file_entry(PSX_TENGU_FILE)[:2], tg)[0], 'M8t4 ticker overlay'
-    assert disc.exe_words(M8K_INIT_CALL, 1)[0] == 3 << 26 | (ti['tk_load'] >> 2) & 0x3FFFFFF, 'stage-select init call (tk_load)'
-    assert disc.exe_words(M8K_RENDER_CALL, 1)[0] == 3 << 26 | (M8K_BASE >> 2) & 0x3FFFFFF, 'stage-select render call (tk_frame)'
-    out['m8_ticker'] = (tl, ts)
+    m7len = len(want_demo)
+    tail, ti = m8k_demo_tail(m7len, od.file_entry(PSX_TENGU_FILE)[:2], tg)
+    assert demo[m7len:m7len + len(tail)] == tail, 'DEMO.BIN: M8t4 ticker code'
+    assert disc.exe_words(M8K_INIT_CALL, 1) == od.exe_words(M8K_INIT_CALL, 1), 'stage-select init call (the game\'s stream of file 0x72)'
+    assert disc.exe_words(M8K_RENDER_CALL, 1)[0] == 3 << 26 | (ti['tk_frame'] >> 2) & 0x3FFFFFF, 'stage-select render call (tk_frame)'
+    out['m8_ticker'] = (e8[0], ti['tk_frame'], ti['tk_ovl_size'])
     full = m7len + len(tail)
     if demo_tail is not None and len(demo) > full: out.update(demo_tail(disc, full, demo))
     else: assert len(demo) == full, 'DEMO.BIN size'
@@ -2592,8 +2651,20 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     eo = i7['e28_off']                            # M8t5: the sound test's two music-5 entries
     assert bonus[eo:eo + 16] == struct.pack('<4I', *od.file_entry(PSX_TENGU_FILE)[:2], *tg), 'bonus music 5 entries'
     want_bonus[eo:eo + 16] = bonus[eo:eo + 16]
+    if pairs is not None:                         # the pairs sound test's table = the placed banks / the user's PSX entries
+        so_, ne = i7['st_off'], i7['st_entries']; satm = {}
+        for k, (i, m, v) in enumerate(m8s_names(pairs)['entries']):
+            a, l, z = struct.unpack_from('<3I', bonus, so_ + 12 * k)
+            if v == 2: assert (a, l, z) == (0, 0, 0); continue
+            assert a == PSX_FILETAB + 12 * (0x17 + m)
+            if v == 0: assert (l, z) == od.file_entry(0x17 + m)[:2], hex(m)
+            else: satm[m] = (l, z)
+        assert satm.pop(PSX_TENGU_MUSIC) == tg and set(satm) <= set(pairs)
+        for m, (l, z) in satm.items(): assert disc.read(l, z) == saturn_music[m], hex(m)
+        want_bonus[so_:so_ + 12 * ne] = bonus[so_:so_ + 12 * ne]
+        out['sat_music'] = satm
     assert demo == bytes(want_demo) and bonus == bytes(want_bonus), 'DEMO.BIN / bonus overlay'
-    assert sl == vl + (vs + 2047) // 2048 and disc.read(sl, ss) == m7b_slabo_pac(), 'converted SLABO.PAC'
+    assert sl == vl + (vs + 2047) // 2048 and disc.read(sl, ss) == m7b_slabo_pac(pairs), 'converted SLABO.PAC'
     il0 = sl + (ss + 2047) // 2048                       # M7c: ILL00-29 follow SLABO, 33 sectors each
     for k, (l, sz, t) in enumerate(ill):
         assert (l, sz) == (il0 + 33 * k, M7C_ILL_BYTES) and disc.read(l, sz) == m7c_ill_file(k), f'ILL{k:02d}'
@@ -2609,6 +2680,9 @@ def check_build(orig_bin, new_bin, demo_tail=None):
     ext, sz, _ = pac_locate(disc, 'STDATA/SELECT.PAC'); oe, osz, _ = pac_locate(od, 'STDATA/SELECT.PAC')
     assert (ext, sz) == (oe, osz) and disc.read(ext, sz) == m8n_select_pac(od.read(oe, osz)), 'SELECT.PAC (boss-intro name)'
     out['m8_name_color'] = (ext, sz)
+    ext, sz, _ = pac_locate(disc, M8W_PAC); oe, osz, _ = pac_locate(od, M8W_PAC)
+    assert (ext, sz) == (oe, osz) and disc.read(ext, sz) == m8w_pbgm35(od.read(oe, osz)), 'PBGM35.PAC (whistle)'
+    out['m8_whistle'] = (ext, sz)
     hx = M8H_PSX_LIST + 8 * M8H_PSX_HEAD                  # README item 5: the head icon's x = the Saturn's, the rest of the list as on the disc
     assert struct.unpack('<H', disc.exe_read(hx, 2))[0] == m8h_head_x() and disc.exe_read(M8H_PSX_LIST, 72)[2:] == od.exe_read(M8H_PSX_LIST, 72)[2:], 'HUD head icon'
     ow, nw = od.exe_words(M8H_PSX_DIGIT, 1)[0], disc.exe_words(M8H_PSX_DIGIT, 1)[0]
@@ -2831,22 +2905,26 @@ def sat_layer_raw(name, voice, note):
 def sega_seq_decode(s):
     """-> dict(res, tempos [(steps, usec)], loop_t, end_t, ev [(t, kind, ch, a, b, c)]); kind note (key, vel, gate),
     cc (ctl, val), prog (p), press (v), bend (v), mark (step byte of an 82 event).
-    Note status 0x00-0x7F (as the Saturn sound driver reads it): channel = bits 0-4 (16-31 not handled), bit 0x40 =
+    Note status 0x00-0x7F (as the Saturn sound driver reads it): channel = bits 0-4 (16-31: STBOS only), bit 0x40 =
     gate + 0x100, bit 0x20 = step + 0x100. One-byte prefixes 0x88-0x8B add 0x200 / 0x800 / 0x1000 / 0x2000 to the
-    next note's gate, 0x8C-0x8F add 0x100 / 0x200 / 0x800 / 0x1000 to the step (they accumulate)."""
+    next note's gate, 0x8C-0x8F add 0x100 / 0x200 / 0x800 / 0x1000 to the step (they accumulate).
+    Controller / program / pressure / bend events: bit 7 of the first data byte = channel + 16 (driver 0x5AF0 / 0x5AFA /
+    0x5B06), the value is the low 7 bits.
+    0x82 (sound driver 0x5AC8): the first one stores the reader position as the loop start, every later one jumps back
+    there, so the reader stops at the second 0x82; anything after it is never played (WILY3C: one note, then 0x83;
+    dead = number of events skipped)."""
     res, nt, do, lo = struct.unpack('>4H', s[:8])
     tempos = [struct.unpack('>II', s[8 + 8 * k:16 + 8 * k]) for k in range(nt)]
-    ev, T, G = [], [0], [0]
+    ev, T, G, MK = [], [0], [0], [0]
     def run(i, lim=None, depth=0):
         n = 0
-        while lim is None or n < lim:
+        while (lim is None or n < lim) and MK[0] < 2:
             b = s[i]
             if b < 0x80:
-                assert not b & 0x10, 'channels 16-31 not handled'
                 key, vel, gate, dt = s[i + 1:i + 5]
                 gate += (0x100 if b & 0x40 else 0) + G[0]; G[0] = 0
                 dt += 0x100 if b & 0x20 else 0
-                T[0] += dt; ev.append((T[0], 'note', b & 15, key, vel, gate)); i += 5
+                T[0] += dt; ev.append((T[0], 'note', b & 0x1F, key, vel, gate)); i += 5
             elif 0x88 <= b <= 0x8F:                       # gate / step prefix of the next note
                 x = (0x200, 0x800, 0x1000, 0x2000, 0x100, 0x200, 0x800, 0x1000)[b - 0x88]
                 if b < 0x8C: G[0] += x
@@ -2854,35 +2932,122 @@ def sega_seq_decode(s):
                 i += 1; continue
             elif b >> 4 in (0xA, 0xB):
                 assert b >> 4 == 0xB, 'polyphonic pressure not handled'
-                T[0] += s[i + 3]; ev.append((T[0], 'cc', b & 15, s[i + 1], s[i + 2], 0)); i += 4
+                x = s[i + 1]; T[0] += s[i + 3]; ev.append((T[0], 'cc', (b & 15) | (x >> 3 & 0x10), x & 0x7F, s[i + 2], 0)); i += 4
             elif b >> 4 in (0xC, 0xD, 0xE):
-                T[0] += s[i + 2]; ev.append((T[0], {0xC: 'prog', 0xD: 'press', 0xE: 'bend'}[b >> 4], b & 15, s[i + 1], 0, 0)); i += 3
+                x = s[i + 1]; T[0] += s[i + 2]
+                ev.append((T[0], {0xC: 'prog', 0xD: 'press', 0xE: 'bend'}[b >> 4], (b & 15) | (x >> 3 & 0x10), x & 0x7F, 0, 0)); i += 3
             elif b == 0x81:
                 assert depth == 0
                 run(do + struct.unpack('>H', s[i + 1:i + 3])[0], s[i + 3], 1); i += 4
             elif b == 0x82:
-                T[0] += s[i + 1]; ev.append((T[0], 'mark', 0, s[i + 1], 0, 0)); i += 2
+                T[0] += s[i + 1]; ev.append((T[0], 'mark', 0, s[i + 1], 0, 0)); i += 2; MK[0] += 1
             elif b == 0x83:
                 return i
             else:
                 raise NotImplementedError(f'Sega SEQ event {b:#x} at {i:#x}')
             n += 1
         return i
-    run(do)
+    j = run(do); dead = 0
+    if MK[0] >= 2:                                # count what the driver never reaches (top level only)
+        while s[j] != 0x83:
+            b = s[j]
+            if b < 0x80: j += 5
+            elif 0x88 <= b <= 0x8F: j += 1; continue
+            elif b >> 4 in (0xA, 0xB): j += 4
+            elif b >> 4 in (0xC, 0xD, 0xE): j += 3
+            elif b == 0x81: j += 4
+            elif b == 0x82: j += 2
+            else: break
+            dead += 1
     li = (lo - 8) // 8
     loop_t = sum(d for d, u in tempos[:li]); end_t = sum(d for d, u in tempos)
-    return dict(res=res, tempos=tempos, loop_t=loop_t, end_t=end_t, ev=ev, last_t=T[0])
+    return dict(res=res, tempos=tempos, loop_t=loop_t, end_t=end_t, ev=ev, last_t=T[0], dead=dead)
+
+def sega_seq_fold_channels(A):
+    """Fit a decoded Sega song (sega_seq_decode) into the 16 channels of a Sony SEQ, in place: events on channels
+    16-31 that play no notes are dropped (they reach no sounding note on the Saturn either: ST00A / STCHU / ST05A /
+    ST05B set-up, bend and pan events, single bend-0 events in FORTE2 / ST07A / ST11A / TITLE_); a channel 16-31 that
+    plays notes (STBOS: 16) moves to the lowest channel below 16 that plays none, whose own events are dropped.
+    Channels 0-15 are otherwise unchanged. Returns {old channel: new channel} for the moved ones."""
+    play = {e[2] for e in A['ev'] if e[1] == 'note'}
+    free = [c for c in range(16) if c not in play]
+    move = {}
+    for c in sorted(x for x in play if x >= 16):
+        assert free, 'more than 16 channels play notes'
+        move[c] = free.pop(0)
+    taken = set(move.values())
+    A['ev'] = [(t, k, move.get(ch, ch), a, b, c) for t, k, ch, a, b, c in A['ev']
+               if k == 'mark' or (ch < 16 and ch not in taken) or ch in move]
+    return move
 
 def _vlq(v):
     out = [v & 0x7F]; v >>= 7
     while v: out.append(0x80 | (v & 0x7F)); v >>= 7
     return bytes(out[::-1])
 
+def _cc7_mid(A, mode):
+    """The Saturn driver's handling of a CC 7 change while a note sounds on the channel (measured in the one-part
+    recordings; libsnd instead re-levels the sounding voices): mode {channel: 'cut' | 'hold'} per decoded channel.
+    'cut': the held note goes silent at the change (-43 ... -62 dB within 10 ms, until its key-off) -> its gate ends
+    there. 'hold': the held note keeps its level; only notes started later take the new volume -> the CC 7 moves to the
+    first time no note sounds on the channel. A (channel, key): 'cut' entry cuts that key's held notes on that channel
+    (applied first; the channel's own mode then acts on the rest). ('hold', law): as 'hold', but at every change under the held note
+    its level moves to law(new value) dB re its level before the first change (law = dB, or [(value, dB), ...]
+    interpolated; measured on the Saturn: a held note does not follow the volume law but a shallow per-channel one) ->
+    a CC 7 at that time with the run's first value and the dB in the event's last field (sega_to_sony_seq writes it
+    through lfo_level). Changes the event list in place; returns (notes cut, CC 7 moved)."""
+    ncut = nmov = 0
+    kcut = collections.defaultdict(set)                # (channel, key): 'cut' -> that key's held notes cut on that channel
+    for ck, m in mode.items():
+        if isinstance(ck, tuple):
+            if m != 'cut': raise ValueError(('cc7_mid', ck, m))
+            kcut[ck[0]].add(ck[1])
+    for ch, m in [(c, mm) for c, mm in mode.items() if not isinstance(c, tuple)] + [(c, None) for c in sorted(kcut) if c not in mode]:
+        notes = [(k, e) for k, e in enumerate(A['ev']) if e[1] == 'note' and e[2] == ch and e[5]]
+        prev = None; chg = []
+        for k, e in enumerate(A['ev']):
+            if e[1] == 'cc' and e[2] == ch and e[3] == 7:
+                if prev is not None and e[4] != prev: chg.append((k, e[0]))
+                prev = e[4]
+        for k, (t, kind, c, a, b, g) in notes:          # per-key cuts first: those notes then end at the change
+            if a in kcut.get(ch, ()):
+                hit = [tc for _, tc in chg if t < tc < t + g]
+                if hit: A['ev'][k] = (t, kind, c, a, b, hit[0] - t); ncut += 1
+        if kcut.get(ch):
+            notes = [(k, A['ev'][k]) for k, e in notes]
+        if m is None: continue
+        if m == 'cut':
+            for k, (t, kind, c, a, b, g) in notes:
+                hit = [tc for _, tc in chg if t < tc < t + g]
+                if hit: A['ev'][k] = (t, kind, c, a, b, hit[0] - t); ncut += 1
+        elif m == 'hold' or isinstance(m, tuple) and len(m) == 2 and m[0] == 'hold':
+            law = None if m == 'hold' else (lambda v, L=m[1]: float(L) if isinstance(L, (int, float)) else _interp_db(sorted(L), v))
+            run_end = run_pre = None; add_ev = []
+            cc_k = [k for k, e in enumerate(A['ev']) if e[1] == 'cc' and e[2] == ch and e[3] == 7]
+            for k, tc in chg:
+                t2 = tc
+                while True:
+                    ends = [t + g for _, (t, kind, c, a, b, g) in notes if t < t2 < t + g]
+                    if not ends: break
+                    t2 = max(ends)
+                if t2 != tc:
+                    if law:                                   # the held note follows the measured law, re the run's start
+                        if run_end is None or tc >= run_end:
+                            run_pre = A['ev'][max(kk for kk in cc_k if kk < k)][4]; run_end = t2
+                        add_ev.append((tc, 'cc', ch, 7, run_pre, law(A['ev'][k][4])))   # 0 dB -> cc7_map
+                    e = A['ev'][k]; A['ev'][k] = (t2,) + tuple(e[1:]); nmov += 1
+            A['ev'] += add_ev
+            A['ev'].sort(key=lambda e: e[0])
+        else: raise ValueError(('cc7_mid', ch, m))
+    return ncut, nmov
+
 def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=None, key_map=None, tempo_scale=1.0,
-                     lfo=None, lfo_level=None, res_scale=1, gate_frames=None, time_scale=1.0):
+                     lfo=None, lfo_level=None, res_scale=1, gate_frames=None, time_scale=1.0, pan_route=None, cc10_map=None, gate_add=0.0,
+                     keyoff_clamp=False, cc7_mid=None, chan_prog=None):
     """Convert one Sega SEQ song to a Sony SEQ (libsnd): same resolution, times and channels; notes become note-on /
     note-on velocity 0 after the gate (clipped at the loop end); program numbers through prog_map (default: same);
-    pitch bend 7-bit -> MSB; bank select (CC 0x20) dropped; velocity / CC 7 through vel_map / cc7_map when given
+    pitch bend 7-bit -> MSB (chan_prog = {(channel, program): new program}: that channel's program changes written as
+    the new program, a copy with the same tones); bank select (CC 0x20) dropped; velocity / CC 7 through vel_map / cc7_map when given
     (build_music_bank passes the measured Saturn laws); tempo changes as FF 51; loop = CC 99 = 20 + CC 6 = 127 at the
     loop point and CC 99 = 30 at the end (Capcom's markers).
     lfo = {Saturn program: scsp_lfo(...)} imitates the SCSP's LFO on channels playing those programs (the SPU has none):
@@ -2895,12 +3060,46 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
     res_scale: the Sony SEQ's resolution and every time are multiplied by it (libsnd rounds its playback rate in coarse
     steps; a finer resolution brings a song's tempo closer). time_scale stretches every event time by that factor at
     the finer resolution (an exact tempo correction where libsnd's own tempo steps miss; libsnd keeps a whole number of
-    beats per minute). Returns (bytes, info)."""
-    A = sega_seq_decode(s)
+    beats per minute).
+    pan_route = {program: (channel pan, [(new program, pan), ...])}: libsnd (measured in Mednafen) keeps a VAB tone's pan
+    only until the channel's next CC 7: any volume change re-pans the channel's sounding voices by the channel pan alone
+    (ST00A voice 3's left-only layer came out in both speakers). A channel playing such a program gets the pan as CC 10
+    (it survives CC 7); a layer with another pan plays on a free channel (the channel's events copied, its own program
+    and CC 10). Channels that play no notes are emptied first (their events reach no note). Returns (bytes, info)."""
+    A = sega_seq_decode(s); c7cut, c7mov = _cc7_mid(A, cc7_mid) if cc7_mid else (0, 0)   # cc7_mid: _cc7_mid
+    sega_seq_fold_channels(A)
+    routed = {}
+    if pan_route:
+        play = {e[2] for e in A['ev'] if e[1] == 'note'}
+        A['ev'] = [e for e in A['ev'] if e[1] == 'mark' or e[2] in play]
+        free = [c for c in range(16) if c not in play]
+        pr_ch = collections.defaultdict(set)
+        for e in A['ev']:
+            if e[1] == 'prog': pr_ch[e[2]].add(e[3])
+        new = []
+        for ch in sorted(play):
+            hit = pr_ch[ch] & set(pan_route)
+            if not hit: continue
+            if any(e[1] == 'cc' and e[2] == ch and e[3] == 10 for e in A['ev']): continue   # the song pans this channel itself
+            assert pr_ch[ch] == hit and len(hit) == 1, ('pan_route: channel plays other programs too', ch, pr_ch[ch])
+            p = next(iter(hit)); main, extra = pan_route[p]
+            t0 = min(e[0] for e in A['ev'] if e[2] == ch and e[1] != 'mark')
+            if main != 64: new.append((t0, 'cc', ch, 10, main, 0))
+            routed[ch] = (p, main, [])
+            for q, pan in extra:
+                assert free, 'pan_route: no free channel'
+                c2 = free.pop(0); routed[ch][2].append((c2, q, pan))
+                new += [(e[0], e[1], c2, q if e[1] == 'prog' else e[3], e[4], e[5]) for e in A['ev'] if e[2] == ch and e[1] != 'mark']
+                new.append((t0, 'cc', c2, 10, pan, 0))
+        A['ev'] = sorted(A['ev'] + new, key=lambda e: e[0])
     loop_t, end_t = A['loop_t'], A['end_t']
-    assert A['last_t'] == end_t, ('song length != tempo track', A['last_t'], end_t)
     marks = [e[0] for e in A['ev'] if e[1] == 'mark']
     looped = len(A['tempos']) > 1 or loop_t > 0
+    # a one-shot song (jingle) may end its events before the tempo track: its last notes sound up to the track's end
+    # (BSCLR: last note-on 234, note end = track end 494; WILYMAP 628 / 676)
+    n_end = max([e[0] + e[5] for e in A['ev'] if e[1] == 'note'] + [A['last_t']])
+    assert A['last_t'] == end_t or not looped and A['last_t'] < end_t and n_end <= end_t, \
+        ('song length != tempo track', A['last_t'], end_t)
     out = []                                  # (t, order, bytes-without-status..., status)
     def add(t, order, st, data): out.append((t, order, len(out), st, bytes(data)))
     # tempo changes (the header carries the first)
@@ -2915,7 +3114,7 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
             add(loop_t, 0, 0xFF, b'\x51\x03' + A['tempos'][li][1].to_bytes(3, 'big'))
         add(loop_t, 1, 0xB0, (99, 20)); add(loop_t, 2, 0xB0, (6, 127))
         add(end_t, 9, 0xB0, (99, 30))
-    nnotes = clipped = 0; cprog = {}
+    nnotes = clipped = nclamp = 0; cprog = {}
     lfo_ch = set()
     if lfo:
         step_at = []                                    # (first step, seconds per step) per tempo segment
@@ -2966,25 +3165,39 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
                     if L['cents'] and (last is None or bend != last[0]): add(x, 5, 0xE0 | ch, (0, bend))
                     if L['db'] and (last is None or lev != last[1]): add(x, 5, 0xB0 | ch, (7, lev))
                     last = (bend, lev)
+    nxt_on = {}                                          # keyoff_clamp: next note-on time per (channel, written key)
+    if keyoff_clamp:
+        kp, seen = {}, {}
+        for t, kind, ch, a, b, c in A['ev']:
+            if kind == 'prog': kp[ch] = a
+            elif kind == 'note' and c:
+                k2 = key_map(kp.get(ch, 0), a) if key_map else a; seen.setdefault((ch, k2), []).append(t)
+        nxt_on = {k2: sorted(v) for k2, v in seen.items()}
     for t, kind, ch, a, b, c in A['ev']:
         if kind == 'note':
             off = t + c
             if gate_frames and c:
                 fr = 1.0 / gate_frames / (A['tempos'][0][1] / 1e6 / A['res'])          # one frame in steps
-                off = t + max(1, round(c / fr)) * fr
+                off = t + max(1, round(c / fr + gate_add)) * fr      # gate_add: frames (measured key-off timing)
             if looped and off > end_t: off = end_t; clipped += 1
             if c == 0: continue
             if vel_map: b = vel_map(cprog.get(ch, 0), b)
             if key_map: a = key_map(cprog.get(ch, 0), a)
+            if keyoff_clamp:                             # a rounded gate must not reach past the next note on the same key:
+                import bisect                            # libsnd's key-off would end that new note
+                v = nxt_on.get((ch, a), []); i = bisect.bisect_right(v, t)
+                if i < len(v) and off > v[i]: off = v[i]; nclamp += 1
             add(t, 6, 0x90 | ch, (a, b)); add(off, 4 if off > t else 7, 0x90 | ch, (a, 0)); nnotes += 1
         elif kind == 'cc':
             if a in drop_cc: continue
             if a == 7 and ch in lfo_ch: continue        # written with the LFO above
-            if a == 7 and cc7_map: b = cc7_map(b)
+            if a == 7 and c and lfo_level: b = lfo_level(b, c)   # cc7_mid ('hold', law): the held note's measured level
+            elif a == 7 and cc7_map: b = cc7_map(b)
+            if a == 10 and cc10_map: b = cc10_map(cprog.get(ch, 0), b)   # song pan through the measured per-voice map
             add(t, 5, 0xB0 | ch, (a, b))
         elif kind == 'prog':
             cprog[ch] = a
-            add(t, 3, 0xC0 | ch, ((prog_map or {}).get(a, a),))
+            add(t, 3, 0xC0 | ch, ((chan_prog or {}).get((ch, a), (prog_map or {}).get(a, a)),))
         elif kind == 'press':
             add(t, 5, 0xD0 | ch, (a,))
         elif kind == 'bend':
@@ -3001,7 +3214,8 @@ def sega_to_sony_seq(s, prog_map=None, drop_cc=(0x20,), vel_map=None, cc7_map=No
             body += data
     body += _vlq(max(0, round(end_t * res_scale * time_scale) - round(t * res_scale * time_scale))) + b'\xff\x2f\x00'
     info = dict(res=A['res'], tempo=u0, loop_t=loop_t, end_t=end_t, marks=marks, notes=nnotes, clipped=clipped,
-                channels=sorted({e[2] for e in A['ev'] if e[1] == 'note'}), size=len(body), lfo_channels=sorted(lfo_ch))
+                channels=sorted({e[2] for e in A['ev'] if e[1] == 'note'}), size=len(body), lfo_channels=sorted(lfo_ch),
+                pan_routed=routed, keyoff_clamped=nclamp, **({'cc7_cut': c7cut, 'cc7_moved': c7mov} if cc7_mid else {}))
     return bytes(body), info
 
 # ----------------------------------------------------------------- Saturn TON -> PSX VAB
@@ -3090,7 +3304,13 @@ SPU_SR_MEASURED_DBPS = {52: -41.6, 53: -32.4, 54: -31.5, 55: -27.0, 56: -14.46, 
                         68: -1.57, 69: -1.38, 70: -1.21, 71: -1.01, 72: -0.78}
 SPU_SR_BEST = [(r, SPU_SR_MEASURED_DBPS[r] / 44100 if r in SPU_SR_MEASURED_DBPS else d) for r, d in SPU_SR]
 
-def scsp_to_spu_adsr(lay, octave):
+# eg_fix (tune): the SCSP decay / release rate model above runs fast against Mednafen's Saturn (D1R 16 / 20 / 22
+# measured at 0.83 / 0.92 / 0.90 of the model; the mean is used for D1R, D2R and RR), and the SPU decay rates are taken
+# from the measured sustain-decrease table where it covers them (decay shift d = sustain rate 4 d, step 8)
+SCSP_RATE_MEASURED_FACTOR = 0.88
+SPU_DR_BEST = [(d, SPU_SR_MEASURED_DBPS[4 * d] / 44100 if 4 * d in SPU_SR_MEASURED_DBPS else x) for d, x in SPU_DR]
+
+def scsp_to_spu_adsr(lay, octave, eg_fix=False):
     """SCSP EG (AR, D1R, DL, D2R, RR, key scaling at `octave`) -> PSX (adsr1, adsr2). Attack: AR 0x1F = instant (all
     WOOD2 / CUT2 layers); a slower AR -> the SPU linear attack rate whose rise time is nearest the SCSP's (MAME's
     table). Decay 1 -> SPU decay at the same dB rate down to Sl (DL in 3 dB steps; the SPU's lowest sustain level is
@@ -3106,18 +3326,19 @@ def scsp_to_spu_adsr(lay, octave):
             n = ms * 44.1                                # samples to full level
             rise = lambda r: 32767 / ((7 - (r & 3)) << max(0, 11 - (r >> 2))) * (1 << max(0, (r >> 2) - 11))
             Ar = min(range(128), key=lambda r: abs(math.log(rise(r) / n)))
-    d1 = scsp_rate_db_per_sample(lay['d1r'], base)
-    d2 = scsp_rate_db_per_sample(lay['d2r'], base)
-    rr = scsp_rate_db_per_sample(lay['rr'], base)
+    k_ = SCSP_RATE_MEASURED_FACTOR if eg_fix else 1.0
+    d1 = scsp_rate_db_per_sample(lay['d1r'], base) * k_
+    d2 = scsp_rate_db_per_sample(lay['d2r'], base) * k_
+    rr = scsp_rate_db_per_sample(lay['rr'], base) * k_
     if lay['dl'] == 0 or lay['d1r'] == 0:          # never leaves decay 1 (or no decay at all): hold, then D2R
         Dr, Sl = 15, 15        # Dr 15, not 0: the SPU applies one decay step before testing Sl (Dr 0 = -6 dB at once)
         sus = d2 if lay['dl'] == 0 else 0.0
     else:
-        Dr = _best(SPU_DR, d1)
+        Dr = _best(SPU_DR_BEST if eg_fix else SPU_DR, d1)
         a = 10 ** (-3 * lay['dl'] / 20)
         Sl = max(0, min(15, round(a * 16) - 1))
         sus = d1 if (Sl + 1) / 16 > a else d2       # SPU can't go as deep as DL: keep the D1R slope below -24 dB
-    Sr = 0x7F if sus == 0 else _best(SPU_SR, sus)
+    Sr = 0x7F if sus == 0 else _best(SPU_SR_BEST if eg_fix else SPU_SR, sus)
     Rr = _best(SPU_RR, rr) if rr < 0 else 31
     adsr1 = 0x0000 | (Ar << 8) | (Dr << 4) | Sl          # linear attack (rate 0 = instant)
     adsr2 = 0x8000 | 0x4000 | (Sr << 6) | 0x20 | Rr       # exponential sustain decrease, exponential release
@@ -3142,6 +3363,18 @@ def resample_loop(pcm, lsa, lea, new_len, taps=24):
         val = np.where((src >= 0) & (src < lea), x[np.clip(src, 0, lea - 1)], 0.0)
         out += w * val
     return [int(max(-32768, min(32767, round(v)))) for v in out], n_ls
+
+def resample_oneshot(pcm, q, taps=24):
+    """Windowed-sinc resample of a one-shot sample by q (output length ~ len * q); used for the tiny pitch corrections
+    that put a tone on libsnd's 1/16-semitone grid (|q - 1| < 0.2 %)."""
+    import numpy as np
+    x = np.asarray(pcm, float); n = np.arange(int(round(len(x) * q)))
+    tau = n / q; k0 = np.floor(tau).astype(int); out = np.zeros(len(n)); fc = min(1.0, q)
+    for j in range(-taps + 1, taps + 1):
+        idx = k0 + j; d = tau - idx
+        w = fc * np.sinc(fc * d) * (0.5 + 0.5 * np.cos(np.pi * d / taps))
+        out += w * np.where((idx >= 0) & (idx < len(x)), x[np.clip(idx, 0, len(x) - 1)], 0.0)
+    return [int(max(-32768, min(32767, round(v)))) for v in out]
 
 def _vag_block_py(x, s1, s2, filters=range(5)):
     """Best (err, filter, shift, nibbles, s1, s2) for one 28-sample block: the first (filter, shift) in search order
@@ -3225,7 +3458,59 @@ def _vag_block(x, s1, s2, filters=range(5)):
     lib.vag_block(xa, s1, s2, 5, ct.byref(err), res)
     return (err.value, res[0], res[1], list(res[32:60]), res[2], res[3])
 
-def vag_encode_loop(pcm, loop_start):
+LOOP_REPEATS = (1, 2, 3, 4, 6, 8)   # a short loop is stored this many times over when that encodes it more cleanly
+LOOP_REPEAT_MAX = 1024              # ... up to this many samples of loop
+SPU_MUSIC_BODY_MAX = 170240         # the stage music bank's VAB body below the reverb work area of the SPU's sound memory
+SPU_MUSIC_BODY_MAX_LOW = 181216     # the same with the music bank loaded right after the common sound bank (patch_music_spu_low)
+
+def _loop_snr(vb, pcm, loop_start, passes=1):
+    """Decoded quality (dB) of a looping VAG against its source over the attack, the first pass into the loop and a
+    second pass (the first pass decodes with the pre-loop history, the encoder assumes the loop end's)."""
+    import numpy as np
+    out = []; s1 = s2 = 0
+    for i in range(16, len(vb) - 15, 16):
+        sh, f = vb[i] & 15, vb[i] >> 4
+        f0, f1 = VAG_FILTERS[f] if f < 5 else (0, 0)
+        for j in range(28):
+            n = (vb[i + 2 + j // 2] >> (4 * (j & 1))) & 15
+            if n >= 8: n -= 16
+            v = max(-32768, min(32767, ((n << 12) >> sh if sh <= 12 else 0) + ((s1 * f0 + s2 * f1 + 32) >> 6))); out.append(v); s2, s1 = s1, v
+    for _ in range(passes):                         # further passes: the loop decoded again from the loop end's history
+        for i in range(16 + 16 * (loop_start // 28), len(vb) - 15, 16):
+            sh, f = vb[i] & 15, vb[i] >> 4
+            f0, f1 = VAG_FILTERS[f] if f < 5 else (0, 0)
+            for j in range(28):
+                n = (vb[i + 2 + j // 2] >> (4 * (j & 1))) & 15
+                if n >= 8: n -= 16
+                v = max(-32768, min(32767, ((n << 12) >> sh if sh <= 12 else 0) + ((s1 * f0 + s2 * f1 + 32) >> 6))); out.append(v); s2, s1 = s1, v
+    ref = np.asarray(list(pcm) + list(pcm[loop_start:]) * passes, float); d = np.asarray(out[:len(ref)], float)
+    return float(10 * np.log10((ref ** 2).sum() / max(1e-9, ((d - ref[:len(d)]) ** 2).sum())))
+
+def _vag_block_dual(x, ha, hb, filters=range(5)):
+    """One ADPCM block decoded from two predictor histories (the loop's first blocks: the first pass comes from the
+    pre-loop samples, every repeat from the loop end): per (filter, shift) the nibbles are chosen sample by sample for
+    the smallest summed squared error of both decodings. -> (err, f, sh, nib, ha', hb')."""
+    import math
+    best = None
+    for f in filters:
+        f0, f1 = VAG_FILTERS[f]
+        for sh in range(13):
+            a1, a2 = ha; b1, b2 = hb; err = 0; nib = []
+            for v in x:
+                pa = (a1 * f0 + a2 * f1 + 32) >> 6; pb = (b1 * f0 + b2 * f1 + 32) >> 6
+                c0 = ((v - (pa + pb) / 2) * (1 << sh)) / 4096.0
+                bn = None
+                for n in {max(-8, min(7, int(math.floor(c0)) + d)) for d in (-1, 0, 1, 2)}:
+                    da = max(-32768, min(32767, ((n << 12) >> sh) + pa)); db = max(-32768, min(32767, ((n << 12) >> sh) + pb))
+                    e = (v - da) ** 2 + (v - db) ** 2
+                    if bn is None or e < bn[0]: bn = (e, n, da, db)
+                err += bn[0]; nib.append(bn[1]); a2, a1 = a1, bn[2]; b2, b1 = b1, bn[3]
+                if best is not None and err >= best[0]: break
+            else:
+                if best is None or err < best[0]: best = (err, f, sh, nib, (a1, a2), (b1, b2))
+    return best
+
+def vag_encode_loop(pcm, loop_start, ret_err=False, dual=0):
     """Looping PSX ADPCM in Capcom's layout: zero block (flag 0), data blocks flagged 2, the loop-start block 6 (encoded
     with filter 0 so the seam doesn't depend on predictor history), the last block 3 (= jump to the loop start).
     len(pcm) and loop_start must be multiples of 28."""
@@ -3235,33 +3520,54 @@ def vag_encode_loop(pcm, loop_start):
     # sine loop measured 40 dB more energy above 4 kHz than the Saturn). Now the loop body is encoded with the predictor
     # history it really has on every repeat (the end of the loop; iterated until stable); only the first pass into the
     # loop (history = the pre-loop samples) can differ slightly.
+    E = [0.0]
     def blocks(b0, b1, s1, s2):
-        out = bytearray()
+        out = bytearray(); E[0] = 0.0
         for b in range(b0, b1):
-            err, f, sh, nib, s1, s2 = _vag_block(pcm[28 * b:28 * b + 28], s1, s2)
+            err, f, sh, nib, s1, s2 = _vag_block(pcm[28 * b:28 * b + 28], s1, s2); E[0] += err
             flag = 6 if b == lb else (3 if b == nblk - 1 else 2)
             if b == lb == nblk - 1: flag = 7
             out += bytes([(f << 4) | sh, flag]) + bytes(((nib[2 * k] & 15) | ((nib[2 * k + 1] & 15) << 4)) for k in range(14))
         return bytes(out), (s1, s2)
-    pre = bytes(16) + blocks(0, lb, 0, 0)[0]          # the blocks before the loop don't depend on the loop history
+    pre, h_pre = blocks(0, lb, 0, 0); pre = bytes(16) + pre   # the blocks before the loop don't depend on the loop history
     def enc(h_loop):
-        body, h = blocks(lb, nblk, *h_loop)
-        return pre + body, h
+        if not dual:
+            body, h = blocks(lb, nblk, *h_loop)
+            return pre + body, h
+        # dual: the first `dual` loop blocks are chosen for both histories (pre-loop and loop end), then as usual
+        out = bytearray(); ha, hb = h_loop, h_pre; e0 = 0.0; k = min(dual, nblk - lb)
+        for b in range(lb, lb + k):
+            err, f, sh, nib, ha, hb = _vag_block_dual(pcm[28 * b:28 * b + 28], ha, hb); e0 += err / 2
+            flag = 6 if b == lb else (3 if b == nblk - 1 else 2)
+            if b == lb == nblk - 1: flag = 7
+            out += bytes([(f << 4) | sh, flag]) + bytes(((nib[2 * j] & 15) | ((nib[2 * j + 1] & 15) << 4)) for j in range(14))
+        if lb + k < nblk:
+            rest, h = blocks(lb + k, nblk, *ha); E[0] += e0; out += rest
+        else: h = ha; E[0] = e0
+        return pre + bytes(out), h
     h = (0, 0)
     for _ in range(6):
         out, h2 = enc(h)
         if h2 == h: break
         h = h2
+    if ret_err:                                   # (bytes, squared error of the loop body, its energy)
+        return out, E[0], float(sum(float(x) * x for x in pcm[loop_start:]))
     return out
 
-def _center_shift(key_at_44k):
+def _center_shift(key_at_44k, grid=1):
     """VAB centre note + fine shift (1/128 semitone, raises pitch) so that key `key_at_44k` (may be fractional) plays the
-    sample at 44.1 kHz."""
+    sample at 44.1 kHz. libsnd's note -> pitch step uses (fine + shift) >> 3, i.e. 1/16-semitone steps, truncated: with
+    grid=8 the shift is rounded to the nearest step libsnd plays (else a tone sounds up to 7/128 semitone flat)."""
     import math
     c = math.ceil(key_at_44k - 1e-9)
-    sh = round((c - key_at_44k) * 128)
-    if sh == 128: c, sh = c - 1, 0       # a full semitone of shift = the note below, unshifted
+    sh = math.ceil((c - key_at_44k) * 128 / grid - 0.5 - 1e-9) * grid   # halfway: the lower step (as libsnd's truncation)
+    if sh >= 128: c, sh = c - 1, sh - 128   # a full semitone of shift = the note below
     return c, sh
+
+def _grid_err(key_at_44k, grid):
+    """Pitch error (semitones) left by _center_shift on libsnd's 1/16-semitone grid (grid=8) or the old rounding."""
+    c, sh = _center_shift(key_at_44k, grid)
+    return abs((c - (sh // 8 * 8 if grid == 8 else sh) / 128) - key_at_44k)
 
 def scsp_pan_db(dipan):
     """SCSP DIPAN -> (left dB, right dB). Measured in Mednafen (calibration): bits 0-3 = n x 3 dB on one side
@@ -3287,60 +3593,246 @@ SAT_CC7_DB_PER_STEP = 0.735
 # Per-bank tuning from `calibrate`: gain_db / decay_dbps per voice (or (voice, key) for drum keys), upsampling factors.
 # A bank without an entry gets the general laws above and no per-voice corrections.
 MUSIC_TUNE = {
-    'WOOD2.PAC': dict(
-        gain_db={0: -0.8, 1: -3.7, 2: -2.7, 3: 0.6, 4: -0.9, 5: -0.8, 6: 0.0, 7: -1.1,
-                 (8, 45): -1.3, (8, 67): 1.7, (8, 51): -0.3, (8, 75): 0.3, (8, 78): 0.2, (8, 77): 1.4},
-        decay_dbps={3: -9.2, 4: -2.93, 5: -2.93, 6: -8.19, 7: -8.19},  # envelope slope to set (sample's own change removed)
-        upsample={0: 2, 1: 4, 2: 4, 3: 4, 4: 0.5, 5: 0.5, 6: 2, 7: 2, 8: 2},   # voice 0 = the one-shot sounds;
-        # 4/5 at half rate: keys 80-88 asked the SPU for 4.2-6.7x and were capped at 4x (up to 9 semitones flat)
-        shelf_db={6: (9000, 3.0), 7: (9000, 3.0)},   # treble the SPU's interpolation dulls (calibration band shares)
-        seq_res_scale=10, time_scale=1.008,   # tempo: the Saturn's exact speed (libsnd alone played it 0.35 % fast)
-        key_split={1: [(0, 52, {'upsample': 8}), (53, 127, {})],      # low bass notes: the Saturn's images need 8x
-                   3: [(0, 77, {}), (78, 127, {'gain_db': -1.8})]},      # its top notes 1.8 dB loud
-        gate_frames=59.94, level_db=5.6),     # whole-frame note lengths; +3.5 dB over the Saturn, like Capcom's
-                                              # own conversions (PSX PBGM2A = Saturn BS08C + 3.6 dB)
-    'CUT2.PAC': dict(       # calibration rounds in Mednafen (02 §Sound "PBGM49")
-        gain_db={0: -0.4, 1: 1.1, 2: -0.7, 3: 3.8, 4: 1.0, 5: -0.3, 6: -0.1, 7: 4.0, 8: 4.7, 9: 1.5, 10: 1.5,
-                 (11, 47): 0.3, (11, 51): 1.7, (11, 77): 4.4, (11, 78): 6.5},
-        decay_dbps={2: -12.2, 3: -16.2, 4: -16.2, 5: -24.25, 6: -24.25, 7: -8.1, 8: -8.1, 9: -64.8, 10: -64.8},
-        decay_rate={9: 49, 10: 49},   # chosen by test (rates 47-50): the SPU's fast rates aren't in the measured table
-        upsample={0: 2, 1: 4, 2: 4, 3: 0.5, 4: 0.5, 5: 2, 6: 2, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4},   # 0.5: stored at half rate (SPU 4x pitch cap)
-        seq_res_scale=10, time_scale=1.002,   # tempo: the Saturn's exact speed (libsnd's 150 BPM step played it 0.2 % fast)
-        key_split={1: [(0, 48, {}), (49, 127, {'upsample': 2})],      # bass: 4x only where its low notes need it
-                   3: [(0, 71, {'decay_dbps': -11.6}), (72, 127, {'decay_dbps': -17.4})],   # the Saturn's decay is
-                   4: [(0, 71, {'decay_dbps': -14.8}), (72, 127, {'decay_dbps': -23.0})],   # faster from key 72 up
-                   7: [(0, 61, {'upsample': 4}), (62, 127, {})], 8: [(0, 61, {'upsample': 4}), (62, 127, {})]},
-        gate_frames=59.94, level_db=6.5),     # whole-frame note lengths; +4.1 dB over the Saturn (see WOOD2)
-    'ST03A.PAC': dict(      # Tengu Man stage (Saturn); 3 calibration rounds in Mednafen (reference 02b, ST03A)
-        gain_db={1: 3.8, 2: 5.6, 3: -0.4, 4: -0.4, 5: -6.0, 6: -5.1, 7: 0.2, 8: -0.4, 9: 0.0, 10: 0.0, 11: 0.7, 12: 1.3,
-                 13: -6.6, 14: -6.9, 15: -6.6, (16, 45): -0.6, (16, 67): -2.4, (16, 77): -4.9, (16, 79): 1.1,
-                 (16, 86): -0.5, (16, 87): -0.7, (16, 88): -0.4},
-        decay_dbps={2: -4.1, 3: -4.1, 4: -4.1, 5: -1.9, 6: -25.1, 7: -17.5, 8: -17.5, 9: -12.4, 10: -12.4, 11: -1.8,
-                    12: -1.8, 13: -97.0, 14: -97.0, 15: -97.0},
-        upsample={1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 11: 2, 12: 2, 16: 2},   # within the SPU room (reference 02b)
-        shelf_db={2: (8000, 2.5), 3: (8000, 2.5), 4: (8000, 2.5), 5: (10000, 6.0), 6: (9000, 4.0), 7: (9000, 5.0),
-                  8: (9000, 5.0), 9: (10000, 6.0), 10: (10000, 6.0), 11: (6000, 1.0), 12: (6000, 1.0), 13: (8000, 2.0),
-                  14: (8000, 2.0), 15: (8000, 2.0), 16: (3000, 5.0), (16, 45): None, (16, 79): None,
-                  (16, 86): (5000, 3.0), (16, 87): (5000, 3.0), (16, 88): (5000, 3.0)},
-        # treble lifts (Hz, dB) at the played pitch for what the SPU's interpolation dulls; set from the calibration's
-        # band shares, no SPU room needed (voice 1: its sample has no top end to lift; the Saturn's comes from
-        # interpolation images, which only a higher stored rate gives)
-        reverb=False,       # the Saturn's DSP effect on voices 13-15 is inaudible (tail 56 dB down); the PSX Room
-                            # reverb made them 17 dB brighter
-        seq_res_scale=10,   # libsnd's rate steps: resolution 48 played 1.6 % fast, 96 0.45 % slow, 480 = the Saturn's speed
-        gate_frames=59.94,  # note lengths in whole frames (libsnd's step): short bass notes kept their length
-        key_split={**{v: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})] for v in (13, 14, 15)},
-                   11: [(0, 69, {}), (70, 127, {'gain_db': 1.4})]},
-        # 13-15: the Saturn decays them at -98 dB/s, -129 from key 77; SPU rates 47 / 46 measure -92 / -135 (the
-        # rate model's choice, 44, decayed at -490); 11: its top notes 1.4 dB quiet
-        release_rate={2: 7, 3: 7, 4: 7},   # their note-end fade: 20 ms on the Saturn, 10 ms with rate 6
-        level_db=11.0,      # as loud as the PSX's own Tengu Man music (PBGM05; a straight conversion was 11.8 dB
-                            # quieter); the most the samples allow without changing the balance between voices
-        vel_db={'melodic': SAT_VEL_DB,   # drum kit: libsnd fell 0.4-1.8 dB short of the Saturn at velocities 64-115
-                'drum': [(0, -90.0), (40, -48.6), (50, -41.2), (64, -23.4), (72, -17.0), (80, -11.3), (86, -6.6),
-                         (90, -3.4), (100, -4.2), (110, -0.7), (115, -0.2), (120, 0.0), (127, 0.0)]}),
-    # Tempo: the Saturn plays 1.25 % below the SEQ's nominal tempo, libsnd 0.90 %; libsnd's tempo is quantised (a 0.35 %
-    # change of the SEQ tempo didn't change its speed), so the 0.35 % difference stays.
+    # The shipped Saturn banks: WOOD2 and ST03A keep the v1 calibration (loop_repeats 1 and pan_route False rebuild
+    # the v1 bank exactly); CUT2 uses the calibration v2 settings with the v1 sample storage and pan routing, which
+    # bring the whole song and its parts closer to the Saturn.
+    'WOOD2.PAC': {'pitch_grid': True, 'loop_dual': 1, 'cents': {3: 1.2}, 'up_wrap': True,
+                  'decay_dbps': {3: -9.2, 4: -2.93, 5: -2.93, 6: -8.19, 7: -8.19},
+                  'gain_db': {0: -0.8,
+                              1: -3.7,
+                              2: -2.7,
+                              3: 0.6,
+                              4: -0.9,
+                              5: -0.8,
+                              6: 0.0,
+                              7: -1.1,
+                              (8, 45): -1.3,
+                              (8, 51): -0.3,
+                              (8, 67): 1.7,
+                              (8, 75): 0.3,
+                              (8, 77): 1.4,
+                              (8, 78): 0.2},
+                  'gate_frames': 59.94,
+                  'key_split': {1: [(0, 52, {'upsample': 8}), (53, 127, {})], 3: [(0, 77, {}), (78, 127, {'gain_db': -1.8})]},
+                  'level_db': 3.59,
+                  'loop_repeats': 1,
+                  'pan_route': False,
+                  'seq_res_scale': 10,
+                  'interp_comp': [1, 2, 3, 6, 7],      # the Saturn's treble after the SPU's interpolation (whole song)
+                  'time_scale': 1.008,
+                  'upsample': {0: 2, 1: 4, 2: 4, 3: 4, 4: 0.5, 5: 0.5, 6: 2, 7: 2, 8: 2}},
+    'CUT2.PAC': {'interp_comp': True,                 # the Saturn's treble after the SPU's interpolation (whole song)
+                 'up_wrap': True,                     # loops upsampled without a step at the seam
+                 'adsr': {(1, 55): (255, 57283),
+                          (2, 0): (230, 52899),
+                          (2, 74): (230, 52901),
+                          (2, 83): (231, 52872),
+                          (2, 91): (231, 52873),
+                          (2, 97): (228, 52963),
+                          (3, 0): (230, 52899),
+                          (3, 67): (230, 52899),
+                          (3, 72): (215, 52835),
+                          (3, 77): (215, 52835),
+                          (4, 0): (230, 52899),
+                          (4, 67): (230, 52873),
+                          (4, 72): (215, 52835),
+                          (4, 77): (215, 52835),
+                          (5, 0): (209, 24547),
+                          (5, 67): (209, 52899),
+                          (5, 74): (209, 52963),
+                          (5, 83): (208, 21091),
+                          (6, 0): (208, 21091),
+                          (6, 67): (209, 52899),
+                          (6, 74): (209, 52963),
+                          (6, 83): (209, 52963),
+                          (7, 0): (234, 53026),
+                          (7, 56): (235, 53027),
+                          (7, 63): (233, 53001),
+                          (7, 67): (252, 52936),
+                          (7, 73): (250, 52963),
+                          (8, 0): (236, 53028),
+                          (8, 55): (232, 53000),
+                          (8, 62): (234, 53027),
+                          (8, 67): (250, 52963),
+                          (8, 73): (249, 52963),
+                          (9, 0): (178, 52515),
+                          (9, 68): (182, 52259),
+                          (9, 72): (141, 52259),
+                          (9, 78): (141, 52259),
+                          (9, 83): (157, 52259),
+                          (10, 0): (178, 52515),
+                          (10, 68): (183, 52259),
+                          (10, 72): (157, 52259),
+                          (10, 78): (141, 52259),
+                          (10, 83): (157, 52259)},
+                 'cents': {},
+                 'pitch_grid': True,
+                 'loop_dual': 1,
+                 'cc7_mid': {6: 'cut', 7: 'cut'},     # the Saturn driver silences notes held through a CC 7 change
+                 'decay_dbps': {},
+                 'gain_db': {0: -0.4,
+                             1: 0.86,
+                             2: -1.1,
+                             3: 4.43,
+                             4: 1.4,
+                             5: 0.51,
+                             6: -0.46,
+                             7: 3.7,
+                             8: 4.37,
+                             9: 2.12,
+                             10: 2.1,
+                             (11, 47): 0.25,
+                             (11, 51): 2.35,
+                             (11, 77): 4.74,
+                             (11, 78): 6.38},
+                 'gate_frames': 59.94,
+                 'key_split': {1: [(0, 48, {}), (49, 127, {'upsample': 2})],
+                               3: [(0, 71, {'decay_dbps': -11.6}), (72, 127, {'decay_dbps': -17.4})],
+                               4: [(0, 71, {'decay_dbps': -14.8}), (72, 127, {'decay_dbps': -23.0})],
+                               7: [(0, 61, {'upsample': 4}), (62, 127, {})],
+                               8: [(0, 61, {'upsample': 4}), (62, 127, {})]},
+                 'level_db': 3.63,
+                 'loop_repeats': 1,
+                 'pan_route': True,
+                 'peg': {},
+                 'reverb': True,
+                 'seq_res_scale': 10,
+                 'time_scale': 1.002,
+                 'upsample': {0: 2, 1: 4, 2: 4, 3: 0.5, 4: 0.5, 5: 2, 6: 2, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4},
+                 'vel_db': {3: [(0, -90.0),
+                                (40, -48.6),
+                                (50, -41.2),
+                                (64, -22.39),
+                                (72, -16.69),
+                                (80, -11.25),
+                                (86, -6.66),
+                                (90, -3.85),
+                                (100, -5.67),
+                                (110, -1.59),
+                                (115, -0.35),
+                                (120, 0.03),
+                                (122, 0.02),
+                                (127, 0.0)],
+                            8: [(0, -90.0),
+                                (40, -48.6),
+                                (50, -41.2),
+                                (64, -22.5),
+                                (72, -16.74),
+                                (80, -11.32),
+                                (86, -6.74),
+                                (90, -3.82),
+                                (100, -5.74),
+                                (110, -1.61),
+                                (115, -0.41),
+                                (120, 0.01),
+                                (122, 0.01),
+                                (127, 0.0)],
+                            'drum': [(0, -90.0),
+                                     (40, -46.32),
+                                     (50, -39.52),
+                                     (64, -23.23),
+                                     (72, -17.39),
+                                     (80, -11.48),
+                                     (86, -7.08),
+                                     (90, -4.27),
+                                     (100, -5.6),
+                                     (110, -1.85),
+                                     (115, -0.34),
+                                     (120, 0.0),
+                                     (122, 0.0),
+                                     (127, 0.0)],
+                            'melodic': [(0, -90.0),
+                                        (40, -46.43),
+                                        (50, -40.04),
+                                        (64, -23.58),
+                                        (72, -17.4),
+                                        (80, -11.7),
+                                        (86, -7.2),
+                                        (90, -4.28),
+                                        (100, -5.5),
+                                        (110, -1.76),
+                                        (115, -0.37),
+                                        (120, 0.16),
+                                        (122, 0.06),
+                                        (127, 0.0)]}},
+    'ST03A.PAC': {'adsr': {(6, 0): (4587, 20296)},     # note envelope fitted to the Saturn's (one-part recordings)
+                  'up_wrap': True,                    # loops upsampled without a step at the seam
+                  'pitch_grid': True, 'loop_dual': 1, 'cents': {2: -1.3, 3: -2.1},
+                  'decay_dbps': {2: -4.1,
+                                 3: -4.1,
+                                 4: -4.1,
+                                 5: -1.9,
+                                 6: -25.1,
+                                 7: -17.5,
+                                 8: -17.5,
+                                 9: -12.4,
+                                 10: -12.4,
+                                 11: -1.8,
+                                 12: -1.8,
+                                 13: -97.0,
+                                 14: -97.0,
+                                 15: -97.0},
+                  'gain_db': {1: 3.8,
+                              2: 5.6,
+                              3: -0.4,
+                              4: -0.4,
+                              5: -6.0,
+                              6: -5.1, (6, 0): -6.51,
+                              7: 0.2,
+                              8: -0.4,
+                              9: 0.0,
+                              10: 0.0,
+                              11: 0.7,
+                              12: 1.3,
+                              13: -6.6,
+                              14: -6.9,
+                              15: -6.6,
+                              (16, 45): -0.6,
+                              (16, 67): -2.4,
+                              (16, 77): -0.5,
+                              (16, 79): 1.1,
+                              (16, 86): -0.5,
+                              (16, 87): -0.7,
+                              (16, 88): -0.4},
+                  'gate_frames': 59.94,
+                  'key_split': {11: [(0, 69, {}), (70, 127, {'gain_db': 1.4})],
+                                13: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})],
+                                14: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})],
+                                15: [(0, 76, {'decay_rate': 47}), (77, 127, {'decay_rate': 46})]},
+                  'level_db': 11.71,
+                  'loop_repeats': 1,
+                  'pan_route': False,
+                  'release_rate': {2: 7, 3: 7, 4: 7},
+                  'reverb': False,
+                  'seq_res_scale': 10,
+                  'interp_comp': True,             # the Saturn's treble after the SPU's interpolation (replaces the shelves)
+                  'upsample': {1: 2, 2: 3, 3: 3, 4: 3, 5: 2, 6: 2, 11: 2, 12: 2, 16: 2},   # 2-4 at 3x: less ADPCM noise in their 27-cycle loop
+                  'vel_db': {'drum': [(0, -90.0),
+                                      (40, -48.6),
+                                      (50, -41.2),
+                                      (64, -23.4),
+                                      (72, -17.0),
+                                      (80, -11.3),
+                                      (86, -6.6),
+                                      (90, -3.4),
+                                      (100, -4.2),
+                                      (110, -0.7),
+                                      (115, -0.2),
+                                      (120, 0.0),
+                                      (127, 0.0)],
+                             'melodic': [(0, -90.0),
+                                         (40, -48.6),
+                                         (50, -41.2),
+                                         (64, -24.1),
+                                         (72, -18.0),
+                                         (80, -12.0),
+                                         (86, -7.2),
+                                         (90, -4.3),
+                                         (100, -6.0),
+                                         (110, -1.9),
+                                         (115, -0.6),
+                                         (120, 0.0),
+                                         (127, 0.0)]}},
 }
 
 def _interp_db(curve, v):
@@ -3365,6 +3857,67 @@ def _libsnd_level(db):
     """dB (<= 0) -> libsnd 0-127 value with that attenuation (libsnd: amplitude ~ (value/127)^2)."""
     return max(1, min(127, round(127 * 10 ** (db / 40))))
 
+# SCSP noise source (TON layer SSCTL = 1): the slot plays the sound chip's LFSR instead of sound RAM, at the output rate
+# whatever the pitch (Mednafen: the 17-bit LFSR is clocked once per slot, 32 times per 44.1-kHz sample, and its low byte is
+# the slot's 8-bit sample; envelope, TL, DISDL and pan apply as for any slot). PSX imitation: one looped noise sample per
+# bank, played by a tone whose center is the layer's lowest key (44.1 kHz there). At pitch 1.0 the SPU's Gaussian
+# interpolation is a fixed 3-tap filter (table entries 0x0FF / 0x1FF / 0x100 = 0x12C7 / 0x59B3 / 0x1307, -7.8 dB at 22 kHz),
+# so the loop gets its exact inverse (circular, the loop stays seamless).
+SCSP_NOISE_LOOP = 28 * 292                      # 8176 samples (0.185 s), one VAG of 4.7 KB
+SPU_GAUSS_P1 = (0x12C7 / 32768, 0x59B3 / 32768, 0x1307 / 32768)
+# Frequency response of the SPU's 4-tap Gaussian interpolation as a continuous kernel (its 256 phases), a cosine
+# series in the sample's own frequency f (cycles per sample, 0-0.5): sum c_d cos(pi d f) (fitted within 1e-6 dB;
+# computed from the interpolation table). The SCSP interpolates linearly: sinc(f)^2.
+SPU_GAUSS_FT = (0.350395, 0.485312, 0.147669, 0.012832, -0.000129)
+
+def _interp_comp(pcm, L, up=1):
+    """Layer sample -> (sample filtered by sinc(f)^2 / Gaussian(f) in its stored rate, zero phase, loops kept
+    seamless; dB the tone must add when the filtered peak had to be scaled under full scale). The same filter holds
+    after x-up linear storage: the upsampler's response cancels against the linear kernel's (sinc(u f)^2 / its own)."""
+    import math, numpy as np
+    def filt(a):
+        a = np.asarray(a, float); n = len(a)
+        if n < 4: return a
+        f = np.fft.rfftfreq(n)
+        g = sum(cd * np.cos(np.pi * d * f) for d, cd in enumerate(SPU_GAUSS_FT))
+        return np.fft.irfft(np.fft.rfft(a) * np.sinc(f) ** 2 / g, n)
+    if L['lpctl'] == 0: y = filt(pcm)
+    else:                                        # filter attack + 4 loop passes, keep a steady pass
+        n0, n1 = L['lsa'], L['lea']; lp = list(pcm[n0:n1]); e = filt(list(pcm[:n0]) + lp * 4)
+        y = np.concatenate([e[:n0], e[n0 + 2 * len(lp):n0 + 3 * len(lp)]])
+    pk = float(np.max(np.abs(y))) if len(y) else 0.0; db = 0.0
+    if pk > 32767: db = 20 * math.log10(pk / 32767); y = y * (32767 / pk)
+    return [int(max(-32768, min(32767, round(x)))) for x in y], db
+
+@_memo
+def scsp_noise_loop(emph=True, n=SCSP_NOISE_LOOP):
+    """(16-bit noise loop of n samples, dB the tone must add so the level after the SPU equals the SCSP noise's)."""
+    import math, numpy as np
+    x = np.empty(n); r = 1
+    for _ in range(32 * 64): r = (r >> 1) | (((r >> 5) ^ r) & 1) << 16      # warm-up
+    for i in range(n):                           # one value per 32 clocks (one sample of a slot)
+        for _ in range(32): r = (r >> 1) | (((r >> 5) ^ r) & 1) << 16
+        b = r & 0xFF; x[i] = (b - 256 if b > 127 else b) * 256
+    ref = float(np.sqrt(np.mean(x ** 2)))
+    a, b, c = SPU_GAUSS_P1
+    w = 2 * np.pi * np.fft.rfftfreq(n)
+    H = lambda X: X * (b + a * np.exp(-1j * w) + c * np.exp(1j * w))    # what the SPU does at pitch 1.0 (circular)
+    y = np.fft.irfft(np.fft.rfft(x) / (b + a * np.exp(-1j * w) + c * np.exp(1j * w)), n) if emph else x
+    y = y * (32000 / max(1.0, float(np.max(np.abs(y)))))
+    out = np.fft.irfft(H(np.fft.rfft(y)), n)
+    return [int(round(v)) for v in y], 20 * math.log10(ref / float(np.sqrt(np.mean(out ** 2))))
+
+def _decimate(pcm, d):
+    """One-shot sample stored at 1/d rate (d = 2 or 4): windowed-sinc low-pass at the new Nyquist (127 taps, Blackman),
+    then every d-th sample. Used where a note would ask the SPU for more than 4x 44.1 kHz; what it removes would sound
+    above the output's 22 kHz at that pitch."""
+    import numpy as np
+    n = np.arange(-63, 64); h = np.sinc(n / d) / d * np.blackman(127)
+    y = np.convolve(np.asarray(pcm, float), h)[63:63 + len(pcm)][::d]
+    return [int(max(-32768, min(32767, round(x)))) for x in y]
+
+SPU_PITCH_CAP = 3.97              # highest SPU pitch the converter lets a note ask for (the SPU clips at 4.0; margin)
+
 @_memo
 def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=None, cal_keys=False, psx_sfx=False):
     """New PSX music bank (PBGM47 from WOOD2, later PBGM49 from CUT2) converted from a whole Saturn sound bank:
@@ -3377,7 +3930,8 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
       - sound-ID table: the PSX entry rule (reference §Sound).
       psx_sfx: keep the PSX's own stage sounds instead (a bank that replaces an existing PSX song, ST03A for PBGM05):
         program 16 = that PBGM's program 16 (tones and ADPCM copied) and its sound-ID table as it is; a music voice 16
-        then goes to program 17.
+        then goes to program 17. Stage sounds the PBGM keeps on other programs (17, or a music program such as LABO's 6)
+        are copied to programs after the music's, and their ID entries point there.
     Program/tone attribute filler bytes are copied from Capcom's PBGM2A (tpl_n). Returns (pac bytes, info)."""
     import math, statistics
     bank = sat_sound_bank(sat_name)['bank']
@@ -3416,7 +3970,7 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
             if v not in keys_of: continue
             up_ = tune.get('upsample', {}).get(v, 1)
             for L in ls:
-                if L['disdl'] == 0: continue
+                if L['disdl'] == 0 or L['ssctl'] == 1: continue     # noise: no sample gain, all in the tone volume
                 g = tune.get('gain_db', {}); g = g.get((v, L['lo']), g.get(v, 0.0))
                 T = -2 * (att(L) - a_ref) + g + LV            # output dB re tone 127 (libsnd: 40 log10 of the tone value)
                 key = (L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up_)
@@ -3424,10 +3978,10 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
                 head = 20 * math.log10(32767 / peak) - 0.5
                 S_of[key] = max(0.0, min(head, max(S_of.get(key, 0.0), T - pv_up)))
     want = {}; lfo = {}
-    pp = {}; bent = set()
+    pp = {}; bent = set(); bend_up = collections.defaultdict(int)     # highest bend value above center per voice
     for e in A['ev']:
         if e[1] == 'prog': pp[e[2]] = e[3]
-        elif e[1] == 'bend' and e[2] in pp: bent.add(pp[e[2]])
+        elif e[1] == 'bend' and e[2] in pp: bent.add(pp[e[2]]); bend_up[pp[e[2]]] = max(bend_up[pp[e[2]]], e[3] - 64)
     for v, hdr, ls in music:
         if v not in keys_of: continue                     # voice not played by the song
         assert v < 17 and len(ls) <= 16
@@ -3438,22 +3992,53 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
         if lw and any(next(iter(lw))):
             pb_v = 1 if v not in bent else hdr[0]   # never bent by the song: 1 semitone, finer steps for the LFO
             lfo[v] = scsp_lfo(struct.unpack('>H', next(iter(lw)))[0], pb_v)
+            lfo[v].update(tune.get('lfo', {}).get(v, {}))      # measured rate / depths (hz, cents, db)
+            info.setdefault('lfo', {})[v] = dict(lfo[v])
         segs = []           # key_split (tune): {voice: [(lo, hi, overrides)]} -> one tone per layer and key range, with
-        for L in ls:        # its own gain_db / decay_dbps / decay_rate / upsample (the Saturn's level, decay and top end
-            sp = tune.get('key_split', {}).get(v)          # change with pitch; one PSX tone can't follow that)
+        for li_, L in enumerate(ls):   # its own gain_db / decay_dbps / decay_rate / upsample (the Saturn's level, decay
+            L = dict(L, layer=li_)     # and top end change with pitch; one PSX tone can't follow that)
+            sp = tune.get('key_split', {}).get(v)
+            # pitch cap (automatic where the tune sets neither key_split nor upsample for the voice): keys whose note
+            # (+ the song's highest bend) would ask for more than SPU_PITCH_CAP get their own tone over a copy stored
+            # at 1/2 or 1/4 rate (ST00C / WILY1 / WILY2B voices 4 / 5 up to 8x, ST08A, ST10A)
+            if not sp and v not in tune.get('upsample', {}) and (v, li_) not in tune.get('layer_upsample', {}) and L['ssctl'] == 0 and L['disdl']:
+                k44 = L['base'] - L['fine'] / 256.0; bu = bend_up[v] / 64 * hdr[0]
+                ks = [k for k in keys_of[v] if L['lo'] <= k <= L['hi']]
+                need = lambda k: max(0, math.ceil(math.log2(2 ** ((k + bu - k44) / 12) / SPU_PITCH_CAP)))
+                if ks and need(max(ks)):
+                    if L['lo'] == L['hi']: segs.append((L, {'upsample': 2.0 ** -need(L['lo'])})); continue
+                    sp = []; a_ = L['lo']
+                    for j in range(need(max(ks)) + 1):
+                        b_ = L['hi'] if j == need(max(ks)) else max(a_ - 1, max([k for k in range(L['lo'], L['hi'] + 1) if need(k) <= j]))
+                        if b_ >= a_: sp.append((a_, b_, {'upsample': 2.0 ** -j} if j else {}))
+                        a_ = b_ + 1
             if not sp or L['lo'] == L['hi']: segs.append((L, {})); continue
             for a_, b_, ov in sp:
                 lo_, hi_ = max(L['lo'], a_), min(L['hi'], b_)
                 if lo_ <= hi_: segs.append((dict(L, lo=lo_, hi=hi_), ov))
         for L, ov in segs:
             # modulation bytes: only the LFO word (0x14-0x15) and the DSP send IMXL (0x17 bits 0-2, ISEL 0) handled
-            assert L['ssctl'] == 0 and L['lpctl'] in (0, 1) and not any(L['mod'][:4]) and L['mod'][6] == 0 \
-                and not L['mod'][7] & 0xF8 and not any(L['extra']), (v, L)
+            # layer byte 0x1E (extra[3]) = the pitch-envelope (PEG) table number: accepted only where the tune says
+            # how it is imitated (tune 'peg'), any other extra byte stops the conversion
+            noise = L['ssctl'] == 1                        # SCSP noise source (scsp_noise_loop); SA / loop unused
+            assert (L['ssctl'] == 0 and L['lpctl'] in (0, 1) or noise) and not any(L['mod'][:4]) and L['mod'][6] == 0 \
+                and not L['mod'][7] & 0xF8 and not any(L['extra'][:3]) and not L['extra'][4] \
+                and (not L['extra'][3] or v in tune.get('peg', {})), (v, L)
             if L['disdl'] == 0: info['muted'].append((v, L['lo'])); continue
-            pcm = ton_pcm(t, L)
             key44 = L['base'] - L['fine'] / 256.0          # key at which the sample plays at 44.1 kHz
-            up = ov.get('upsample', tune.get('upsample', {}).get(v, 1))
-            sh_ = tune.get('shelf_db', {}); sh_ = sh_.get((v, L['lo']), sh_.get(v))   # (Hz, dB): treble lift above Hz at the played pitch (per drum key or voice; None = none)
+            ct_ = tune.get('cents', {}); key44 -= ct_.get((v, L['lo']), ct_.get(v, 0.0)) / 100   # measured pitch correction
+            key_eg = key44                                 # the slot's real pitch (octave for the envelope's key scaling)
+            if noise:
+                emph = tune.get('noise_emph', True)
+                pcm, n_db = scsp_noise_loop(emph)
+                L = dict(L, lpctl=1, lsa=0, lea=len(pcm), sa=('noise', emph), pcm8=False)
+                key44 = L['lo']                            # the noise ignores pitch: 44.1 kHz at the layer's lowest key
+            else: pcm = ton_pcm(t, L); n_db = 0.0
+            # layer_upsample: per layer ((layer, factor) pairs in a key_split range, or tune {(voice, layer): factor}); a voice's
+            # layers can need different factors (ST02A voice 5: an 8-bit attack layer 2 octaves above the tone layer)
+            lu_ = dict(ov.get('layer_upsample', ())).get(L['layer'], None if 'upsample' in ov else tune.get('layer_upsample', {}).get((v, L['layer'])))
+            up = 1 if noise else lu_ if lu_ is not None else ov.get('upsample', tune.get('upsample', {}).get(v, 1))
+            sh_ = tune.get('shelf_db', {}); sh_ = None if noise else sh_.get((v, L['lo']), sh_.get(v))   # (Hz, dB): treble lift above Hz at the played pitch (per drum key or voice; None = none)
             if sh_:
                 import numpy as np
                 kk = L['lo'] if L['lo'] == L['hi'] else mk                    # drum key, or the voice's median key
@@ -3466,56 +4051,122 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
                     n0, n1 = L['lsa'], L['lea']; lp = list(pcm[n0:n1]); e = lift(list(pcm[:n0]) + lp * 4)
                     y = np.concatenate([e[:n0], e[n0 + 2 * len(lp):n0 + 3 * len(lp)]])
                 pcm = [int(max(-32768, min(32767, round(x)))) for x in y]
-            S = S_of.get((L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up), 0.0)
+            S = 0.0 if noise else S_of.get((L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up if lu_ is None else tune.get('upsample', {}).get(v, 1)), 0.0)
             if S: pcm = [max(-32768, min(32767, round(x * 10 ** (S / 20)))) for x in pcm]
             down = 1.0
             if up < 1:
-                # stored at a lower rate (looped voices only, through the loop resampler): the SPU's pitch is capped at
+                # stored at a lower rate (looped voices through the loop resampler, one-shots by _decimate): the SPU's pitch is capped at
                 # 4x 44.1 kHz (0x4000), so a voice played higher than that sounds flat (calibration: CUT2 voices 3/4 up
                 # to 6x, -200 cents); key44 is corrected through the loop ratio below
-                assert L['lpctl'] == 1
-                down, up = up, 1
+                down, up = up, 1                              # one-shots: _decimate
             if up > 1:
                 # x up with LINEAR interpolation: keeps the images the SCSP's linear interpolation produces above the
                 # sample's Nyquist, which the SPU's Gaussian interpolation would otherwise remove (calibration: the
                 # Saturn's drums/leads had 6-11 dB more above 10 kHz)
-                pcm = _upsample_linear(pcm, up)
+                if tune.get('up_wrap') and L['lpctl'] == 1 and len(pcm) == L['lea'] and L['lea'] > L['lsa']:
+                    # up_wrap (tune): the loop's last sample interpolates toward the loop start, as the looping player
+                    # does, instead of toward itself (a step at the seam once per loop pass: a buzz at f0 / the loop's
+                    # cycle count on loops of several cycles)
+                    pcm = _upsample_linear(list(pcm) + [pcm[L['lsa']]], up)[:len(pcm) * up]
+                else: pcm = _upsample_linear(pcm, up)
                 L = dict(L, lsa=L['lsa'] * up, lea=L['lea'] * up)
                 key44 -= 12 * math.log2(up)   # more samples per period: same pitch needs a higher rate
-            vk = (L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up, down)   # (a shared sample: lifted at its first key's pitch)
+            ic_db = 0.0
+            ic_ = tune.get('interp_comp')                  # True = every voice, or a collection of voices
+            if ic_ and (ic_ is True or v in ic_) and not noise and down == 1:
+                # interp_comp (tune): the SPU's Gaussian interpolation loses more treble than the SCSP's linear one (as a
+                # function of the stored sample's own frequency, whatever the pitch: -0.9 / -2.1 / -3.8 / -6.0 dB at 0.2 /
+                # 0.3 / 0.4 / 0.5 of its rate); the stored sample gets the inverse of that difference
+                pcm, ic_db = _interp_comp(pcm, L, up)
+            vk = (L['sa'], L['lsa'], L['lea'], L['lpctl'], L['pcm8'], up, down, bool(ic_ and (ic_ is True or v in ic_)))   # (a shared sample: lifted at its first key's pitch)
+            dx_ = tune.get('detune_exact')                 # True = every voice, or a collection of voices
+            if dx_ and tune.get('pitch_grid') and not noise and (dx_ is True or v in dx_):
+                # detune_exact (tune): layers of one sample whose pitches differ by less than libsnd's 1/16-semitone step
+                # (a chorus: one layer a few cents sharp of the other) get a copy each, stored for its own pitch, so that
+                # pitch_grid lands both on their exact pitch (one shared copy carries only one of them; the other's
+                # shift is truncated to the grid: unison, or a whole step apart)
+                vk = vk + (round((key44 * 16) % 1.0, 2) % 1.0,)
             if vk not in vag_of:
-                if L['lpctl'] == 1:
-                    ln = L['lea'] - L['lsa']
-                    nl = max(28, 28 * round(ln * down / 28))
-                    rs, nls = resample_loop(pcm, L['lsa'], L['lea'], nl)
-                    pad = 28 - nls % 28 if nls % 28 else 0
-                    data = [0] * pad + rs
-                    vags.append(vag_encode_loop(data, pad + nls)); ratio = nl / ln
+                if noise: vags.append(vag_encode_loop(pcm, 0)); ratio = 1.0
+                elif L['lpctl'] == 1:
+                    # the loop stored m times over (m from LOOP_REPEATS, loop at most LOOP_REPEAT_MAX samples): the
+                    # ADPCM error of a short loop depends on where its blocks fall; the version with the smallest error
+                    # is kept (a 112-sample tone: 46.5 dB once, 58.9 dB twice); tune loop_repeats=1 turns this off
+                    ln = L['lea'] - L['lsa']; best = None
+                    for m in (LOOP_REPEATS if tune.get('loop_repeats', 0) != 1 else (1,)):
+                        if m > 1 and ln * m * down > LOOP_REPEAT_MAX: break
+                        nl = max(28, 28 * round(ln * m * down / 28))
+                        src = list(pcm[:L['lea']]) + list(pcm[L['lsa']:L['lea']]) * (m - 1)
+                        def store(nl_):
+                            rs, nls = resample_loop(src, L['lsa'], L['lsa'] + m * ln, nl_)
+                            pad = 28 - nls % 28 if nls % 28 else 0
+                            vb_, e1, en1 = vag_encode_loop([0] * pad + rs, pad + nls, ret_err=True)
+                            if tune.get('loop_dual'):
+                                # the loop's first block(s) also fitted to the first pass's history; kept where the
+                                # attack, the first pass and three repeats decode cleaner than the plain encoding and the
+                                # steady loop loses at most 0.5 dB (held notes repeat a short loop hundreds of times)
+                                vd = vag_encode_loop([0] * pad + rs, pad + nls, ret_err=True, dual=int(tune['loop_dual']))
+                                if _loop_snr(vd[0], [0] * pad + rs, pad + nls, 3) > _loop_snr(vb_, [0] * pad + rs, pad + nls, 3) + 0.1 \
+                                        and vd[1] <= e1 * 10 ** 0.05:        # and the repeating loop no noisier (0.5 dB)
+                                    vb_, e1, en1 = vd
+                            return vb_, e1, en1, [0] * pad + rs, pad + nls
+                        vb, e_, en_, _, _ = st0 = store(nl)
+                        if tune.get('pitch_grid'):
+                            # of the block-multiple loop lengths within 3 % of the ideal one, those whose pitch lands
+                            # within 1 cent of libsnd's 1/16-semitone grid (the resampler compensates the storage rate);
+                            # taken only if its decoded sample (first pass into the loop included: short notes mostly
+                            # play it) is no noisier than the plain length's
+                            ideal = ln * m * down; ge = lambda x: _grid_err(key44 - 12 * math.log2(x / (m * ln)), 8) * 100
+                            cand = {28 * j for j in range(max(1, math.ceil(ideal * 0.97 / 28)), math.floor(ideal * 1.03 / 28) + 1)}
+                            if ge(nl) > 1.0:
+                                q0 = _loop_snr(st0[0], st0[3], st0[4]); pick = None
+                                for x in sorted((x for x in cand if ge(x) <= 1.0), key=lambda x: (ge(x), abs(math.log(x / ideal))))[:6]:
+                                    sx = store(x); qx = _loop_snr(sx[0], sx[3], sx[4])
+                                    if qx >= q0 - 0.2 and (pick is None or qx > pick[0] + 0.5): pick = (qx, x, sx)
+                                if pick: nl = pick[1]; vb, e_, en_ = pick[2][:3]
+                        snr = 10 * math.log10(en_ / e_) if e_ > 0 else 200.0
+                        if best is None or snr > best[0] + 0.5: best = (snr, vb, nl / (m * ln), m)
+                    vags.append(best[1]); ratio = best[2]; info.setdefault('loop_repeats', {})[(v, L['lo'])] = (best[3], round(best[0], 1))
+                    info.setdefault('vag_repeats', {})[len(vags)] = best[3]          # VAG number -> m (music_bank_report)
+                elif down < 1:
+                    vags.append(vag_encode(_decimate(pcm, round(1 / down)))); ratio = down
+                elif tune.get('pitch_grid'):
+                    # one-shot: resampled by the small ratio that puts the tone exactly on libsnd's pitch grid
+                    c_, sh_ = _center_shift(key44, 8); ratio = 2 ** ((key44 - (c_ - sh_ / 128)) / 12)
+                    vags.append(vag_encode(resample_oneshot(pcm, ratio) if abs(ratio - 1) > 1e-6 else pcm))
                 else:
                     vags.append(vag_encode(pcm)); ratio = 1.0
                 vag_of[vk] = (len(vags), ratio)
             vi, ratio = vag_of[vk]
-            c, sh = _center_shift(key44 - 12 * math.log2(ratio))  # resampled by `ratio`: same pitch at a lower key
-            rate_at_mk = 44100 * 2 ** ((mk - key44) / 12)
+            c, sh = _center_shift(key44 - 12 * math.log2(ratio), 8 if tune.get('pitch_grid') else 1)  # resampled by `ratio`: same pitch at a lower key
+            rate_at_mk = 44100 * 2 ** ((mk - (key_eg if noise else key44)) / 12)
             octave = math.floor(math.log2(rate_at_mk / 44100))
-            a1, a2 = scsp_to_spu_adsr(L, octave)
+            eg_ = tune.get('eg_fix'); a1, a2 = scsp_to_spu_adsr(L, octave, eg_ is True or bool(eg_) and v in eg_)   # True = every voice
             dd = ov.get('decay_dbps', tune.get('decay_dbps', {}).get(v))
             if dd is not None or 'decay_rate' in ov:               # measured: one exponential slope from key-on
                 sr = ov.get('decay_rate', tune.get('decay_rate', {}).get(v) if 'decay_dbps' not in ov else None)
                 if sr is None: sr = _best(SPU_SR_BEST, dd / 44100)  # or an SPU rate chosen by test
                 a1 = (a1 & 0x7F00) | 0x00FF; a2 = 0xC000 | (sr << 6) | 0x20 | (a2 & 0x1F)   # keeps the attack
             if v in tune.get('release_rate', {}): a2 = (a2 & ~0x1F) | tune['release_rate'][v]   # measured note-end fade
+            # adsr {(voice, lo key): (adsr1, adsr2)}: a whole envelope for one layer / drum key, fitted by simulating the
+            # SPU envelope against the Saturn's recorded one (mm8dev.py cal_fit_envelopes; the fast decays of the noise
+            # hi-hats end 2-10 dB off and too early with the rate model)
+            if (v, L['lo']) in tune.get('adsr', {}): a1, a2 = tune['adsr'][(v, L['lo'])]
             tn = bytearray(empty_tone)
             tn[0] = 0; tn[1] = 4 if L['mod'][7] & 7 and tune.get('reverb', True) else 0   # DSP send -> libsnd reverb (the game's Room reverb)
             g = tune.get('gain_db', {}); g = g.get((v, L['lo']), g.get(v, 0.0)) + ov.get('gain_db', 0.0)
+            # layer_gain_db {(voice, layer): dB}: balance between a voice's layers (libsnd's amplitude-squared tone volume
+            # doubles the Saturn's level difference between layers; ST06A voice 3's bright upper layer came out 10 dB low)
+            g += tune.get('layer_gain_db', {}).get((v, L['layer']), 0.0) + n_db + ic_db
             want[(v, n_t)] = 127 * 10 ** (-(att(L) - a_ref) / 20) * 10 ** (g / 40)
             if LV is not None: want[(v, n_t)] *= 10 ** ((LV - pv_up - S) / 40)    # the rest of level_db after S
             tn[2] = max(1, min(127, round(want[(v, n_t)])))
-            tn[3] = scsp_pan(L['dipan']); tn[4] = c; tn[5] = sh; tn[6] = L['lo']; tn[7] = L['hi']
+            tn[3] = tune.get('pan', {}).get(v, scsp_pan(L['dipan']))      # pan: the measured setting, else the law
+            tn[4] = c; tn[5] = sh; tn[6] = L['lo']; tn[7] = L['hi']
             tn[8:12] = bytes(4); tn[12] = tn[13] = lfo[v]['pb'] if v in lfo else hdr[0]
             tn[16:24] = struct.pack('<2H2h', a1, a2, pv_of(v), vi)
             tones[pv_of(v)][n_t] = tn; n_t += 1
-            info['layers'].append(dict(voice=v, keys=(L['lo'], L['hi']), vag=vi, loop=L['lpctl'], vol=tn[2], pan=tn[3],
+            info['layers'].append(dict(voice=v, keys=(L['lo'], L['hi']), vag=vi, loop=L['lpctl'], noise=noise, vol=tn[2], pan=tn[3],
                                        center=c, shift=sh, adsr=(a1, a2), pb=hdr[0], median_key=mk))
         progs[pv_of(v)] = bytearray(tv['progs'][0]); progs[pv_of(v)][0] = n_t
     mx = max(want.values())
@@ -3539,6 +4190,28 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
             tn[22:24] = struct.pack('<h', new_vi[vi]); tones[16][k] = tn
         progs[16] = bytearray(ov['progs'][16])
         info['sfx'] = [('psx', bank - 1, k) for k in range(ov['progs'][16][0])]
+        ids_own = bytearray(own[5]); sfx_map = {}
+        for k in range(0x51, len(ids_own) // 4):         # the bank's own entries on programs other than 16
+            e = ids_own[4 * k:4 * k + 4]
+            if e[0] == 0x80 | bank and e[1] & 0x7F != 16: sfx_map.setdefault(e[1] & 0x7F, None)
+        for p in sorted(sfx_map):
+            q = sfx_map[p] = len(progs); progs.append(bytearray(ov['progs'][p]))
+            tones.append([bytearray(empty_tone) for _ in range(16)])
+            for k in range(16): tones[q][k][20:22] = struct.pack('<h', q)
+            for k in range(ov['progs'][p][0]):
+                tn = bytearray(ov['tones'][p][k]); vi = struct.unpack('<h', tn[22:24])[0]
+                if vi not in new_vi: vags.append(ov['vags'][vi - 1]); new_vi[vi] = len(vags)
+                tn[20:24] = struct.pack('<2h', q, new_vi[vi]); tones[q][k] = tn
+            info['sfx'] += [('psx', bank - 1, p, k) for k in range(ov['progs'][p][0])]
+        for k in range(0x51, len(ids_own) // 4):
+            e = ids_own[4 * k:4 * k + 4]
+            if e[0] == 0x80 | bank and e[1] & 0x7F in sfx_map: ids_own[4 * k + 1] = e[1] & 0x80 | sfx_map[e[1] & 0x7F]
+        info['sfx_progs'] = sfx_map; NP = len(progs)
+        if sfx_map:                                      # the game reads a sound's tone at header slot = program number
+            for p in range(NP):                          # (0x800FCEB4), so no program below them may be left out
+                if progs[p][0] == 0: progs[p][0] = 1     # of the header: one empty tone, as the spare programs
+        info['sfx_extra'] = sum(len(ov['vags'][vi - 1]) for p in sfx_map for k in range(ov['progs'][p][0])
+                                for vi in [struct.unpack('<h', ov['tones'][p][k][22:24])[0]] if new_vi[vi] > 0) if sfx_map else 0
     for r in ([] if psx_sfx else raws0):
         L = ton_layer(r); k = L['lo']
         assert L['lo'] == L['hi'] and L['lpctl'] == 0 and L['pcm8']
@@ -3559,14 +4232,69 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
         info['sfx'].append((k, key, c, sh, len(ton_pcm(t, L))))
     if not psx_sfx: progs[16] = bytearray(tv['progs'][16]); progs[16][0] = len(tone_of)
     drums = {vv for vv, hdr, ls in music if vv in keys_of and not all(L['lo'] == 0 for L in ls)}
+    # ---- tone pans that libsnd would lose (sega_to_sony_seq pan_route): voices with a panned tone whose channel gets
+    # CC 7 or pitch bends while notes sound (the song's own or the LFO imitation) are panned through CC 10; tones with
+    # another pan move to a free program played on a free channel
+    Bs = sega_seq_decode(song); sega_seq_fold_channels(Bs)     # decided by the real song (also for calibration songs)
+    moving = set(); pc = {}
+    by_ch = collections.defaultdict(list)
+    for e in Bs['ev']:
+        if e[1] == 'prog': pc[e[2]] = e[3]
+        elif e[1] == 'note' and e[2] in pc: by_ch[e[2]].append((e[0], e[0] + e[5], pc[e[2]]))
+    for e in Bs['ev']:
+        if e[1] == 'bend' or e[1] == 'cc' and e[3] == 7:
+            moving |= {p_ for a_, b_, p_ in by_ch.get(e[2], []) if a_ < e[0] < b_}
+    moving |= set(lfo)
+    if not tune.get('pan_route', True): moving = set()  # tune pan_route=False keeps the tone pans as they are
+    # a channel the song pans itself (CC 10) already pans every voice on it by that pan (libsnd: the channel pan wins)
+    moving -= {p_ for e in Bs['ev'] if e[1] == 'cc' and e[3] == 10 for a_, b_, p_ in by_ch.get(e[2], [])}
+    pan_route = {}; alias = {}
+    spare = [q for q in range(1, 16) if q not in {pv_of(x) for x in keys_of}]     # dummy programs (one empty tone)
+    for v in sorted(moving):
+        if v not in keys_of or v == 0: continue
+        p = pv_of(v); ts = [tones[p][n] for n in range(progs[p][0])]
+        if all(tn[3] == 64 for tn in ts): continue
+        grp = collections.OrderedDict()
+        for tn in ts: grp.setdefault(tn[3], []).append(tn)
+        order = sorted(grp, key=lambda pn: (-len(grp[pn]), pn != 64))
+        extra = []
+        for gi, pn in enumerate(order):
+            if gi == 0: q = p
+            else:
+                assert spare, ('no free program for a panned layer', v); q = spare.pop(0); alias[q] = v
+                progs[q] = bytearray(progs[p]); extra.append((q, pn))
+                if v in lfo: lfo[q] = lfo[v]
+            new_t = [bytearray(tn) for tn in grp[pn]]
+            for tn in new_t: tn[3] = 64; tn[20:22] = struct.pack('<h', q)
+            fill = [bytearray(empty_tone) for _ in range(16 - len(new_t))]
+            for tn in fill: tn[20:22] = struct.pack('<h', q)
+            tones[q] = new_t + fill; progs[q][0] = len(new_t)
+        pan_route[p] = (order[0], extra)
+    info['pan_route'] = pan_route
+    # ---- a channel's program on a copy (tune chan_prog = [channel, ...]): libsnd's key-off ends every voice of the
+    # note's program and key, whatever channel keyed it, so a channel whose notes overlap another channel's notes of the
+    # same program and key gets its own copy of the program (same tones and samples; no sound memory)
+    chan_prog = {}
+    for c in tune.get('chan_prog', ()):
+        for v in sorted({e[3] for e in Bs['ev'] if e[1] == 'prog' and e[2] == c}):
+            if v not in keys_of or v == 0: continue
+            p = pv_of(v); assert p not in pan_route, ('chan_prog on a pan-routed program', c, v)
+            assert spare, ('no free program for chan_prog', c, v); q = spare.pop(0)
+            progs[q] = bytearray(progs[p]); tones[q] = [bytearray(tn) for tn in tones[p]]
+            for tn in tones[q]: tn[20:22] = struct.pack('<h', q)
+            chan_prog[(c, v)] = q
+    info['chan_prog'] = chan_prog
     vel_db = tune.get('vel_db', {'melodic': SAT_VEL_DB}); k7 = tune.get('cc7_db_per_step', SAT_CC7_DB_PER_STEP)
-    vel_map = lambda p, vel: _libsnd_level(_interp_db(vel_db.get('drum' if p in drums else 'melodic', vel_db['melodic']), vel))
+    vel_map = lambda p, vel: _libsnd_level(_interp_db(vel_db.get(alias.get(p, p)) or vel_db.get('drum' if alias.get(p, p) in drums else 'melodic', vel_db.get('melodic', SAT_VEL_DB)), vel))   # a voice's own curve first
     cc7_map = lambda c: _libsnd_level(-k7 * (127 - c))
-    pm = {**({0: 16} if cal_keys else {}), **({16: 17} if NP == 18 else {})}
+    pm = {**({0: 16} if cal_keys else {}), **({16: 17} if 16 in keys_of else {})}
     seq, sinfo = sega_to_sony_seq(seq_song or song, cc7_map=cc7_map, vel_map=vel_map, tempo_scale=tune.get('tempo_factor', 1.0),
                                   prog_map=pm or None, lfo=lfo or None, res_scale=tune.get('seq_res_scale', 1),
-                                  gate_frames=tune.get('gate_frames'), time_scale=tune.get('time_scale', 1.0),
-                                  lfo_level=lambda c, db: _libsnd_level(-k7 * (127 - c) + db),
+                                  gate_frames=tune.get('gate_frames'), time_scale=tune.get('time_scale', 1.0), gate_add=tune.get('gate_add', 0.0),
+                                  keyoff_clamp=tune.get('keyoff_clamp', False), cc7_mid=tune.get('cc7_mid'), chan_prog=chan_prog or None,
+                                  lfo_level=lambda c, db: _libsnd_level(-k7 * (127 - c) + db), pan_route=pan_route or None,
+                                  cc10_map=(lambda p, c: max(0, min(127, round(_interp_db(tune['cc10_map'][alias.get(p, p)], c))))
+                                            if alias.get(p, p) in tune['cc10_map'] else c) if tune.get('cc10_map') else None,
                                   key_map=(lambda p, k: 60 + tone_of.get(k, 0) if p == 0 else k) if cal_keys else None)
     info['seq'] = sinfo
     head = bytearray(tv['head'])
@@ -3576,10 +4304,16 @@ def build_music_bank(sat_name, tpl_n=0x2A, sfx_tpl_n=0x29, seq_song=None, tune=N
     head[0x14:0x16] = struct.pack('<H', sum(pr[0] for pr in progs))
     v = dict(head=head, progs=allp, tones=tones, vags=vags)
     vhdr, body = vab_join(v)
-    ids = own[5] if psx_sfx else sound_id_table(sat_name, len(tpl[5]), tone_of)
+    ids = bytes(ids_own) if psx_sfx else sound_id_table(sat_name, len(tpl[5]), tone_of)
+    if psx_sfx:                                          # every program the bank's own IDs use sits in its own slot
+        used = {e[1] & 0x7F for e in (ids[k:k + 4] for k in range(0x51 * 4, len(ids), 4)) if e[0] == 0x80 | bank}
+        assert all(all(progs[q][0] for q in range(p + 1)) for p in used), ('sound ID program not in its header slot', sat_name)
     pac = pac_build([(5, ids), (4, vhdr), (0x201, body), (1, seq)])
     info.update(hdr=len(vhdr), body=len(body), seq_size=len(seq), size=len(pac), vags=len(vags), lfo=lfo, tones=dict(
         (p, progs[p][0]) for p in range(NP) if progs[p][0] and progs[p][1]))
+    room = SPU_MUSIC_BODY_MAX_LOW if tune.get('spu_low') else SPU_MUSIC_BODY_MAX   # spu_low: the bank needs patch_music_spu_low
+    if len(body) > room and tune.get('loop_repeats', 0) != 1:     # repeated loops don't fit: store them once
+        return build_music_bank(sat_name, tpl_n, sfx_tpl_n, seq_song, dict(tune, loop_repeats=1), cal_keys, psx_sfx)
     return pac, info
 
 
@@ -3640,6 +4374,54 @@ def m8t_tengu_bank():
     """The Saturn Tengu Man stage bank (ST03A converted, PSX stage sounds kept): (bytes, info)."""
     return build_music_bank('ST03A.PAC', psx_sfx=True)
 
+PSX_BGM_LOAD_RECS = 0x801378D4     # play_bgm's two VAB load records (16 bytes: VAB id, id word, header buffer, SPU address)
+SPU_DMA_BLOCK = 64                  # the SPU's DMA moves whole blocks of this many bytes (a body's last block spills past its end)
+
+def patch_music_spu_low(disc):
+    """Load the music bank right after the common sound bank (PCOMMON, load record 0) instead of at record 1's own SPU
+    address: the sound memory between them is never used (no other bank or transfer writes it), so every music bank
+    gets SPU_MUSIC_BODY_MAX_LOW bytes below the reverb work area. The new address = record 0's address + PCOMMON's VAB
+    body rounded up to SPU_DMA_BLOCK; everything is read from the disc. Not part of the current release build."""
+    r0, r1 = disc.exe_words(PSX_BGM_LOAD_RECS, 4), disc.exe_words(PSX_BGM_LOAD_RECS + 16, 4)
+    assert r0[0] == 0 and r1[0] == 1 and r0[2] < r1[2] and r0[3] < r1[3], 'unexpected music load records'
+    _, _, ext, size = disc.iso_record('SOUND/PCOMMON.PAC')
+    ch = {t: b for t, o, b in unpac_bytes(disc.read(ext, size))}
+    body = len(ch[0x200]); hdr = ch[4 - 1]
+    assert hdr[:4] == b'pBAV' and struct.unpack_from('<I', hdr, 12)[0] == len(hdr) + body, 'unexpected PCOMMON bank'
+    new = r0[3] + -(-body // SPU_DMA_BLOCK) * SPU_DMA_BLOCK
+    room = r1[3] + SPU_MUSIC_BODY_MAX - new
+    assert new < r1[3] and new % 8 == 0 and room == SPU_MUSIC_BODY_MAX_LOW, ('unexpected sound memory layout', new, room)
+    disc.exe_write_words(PSX_BGM_LOAD_RECS + 16 + 12, [new])
+    return dict(music_spu=new, music_spu_old=r1[3], music_body_room=room)
+
+PSX_SEQ_BUF = 0x801B29AC            # play_bgm's SEQ buffer (chunk 1 of the music dest table); PCOMMON's VAB header follows it
+PSX_BGM_DEST = 0x801378BC            # play_bgm's dest table (chunk type -> RAM; chunk 3 = PCOMMON's VAB header buffer)
+PSX_PCOMMON_HDR_SITES = (0x800FCFD0, 0x80135908)   # lui / addiu pairs: sound play's tone pointer into PCOMMON's header
+
+def patch_music_seq_room(disc):
+    """Move PCOMMON's VAB header (load record 0's header buffer, right after the 32-KB SEQ buffer) up to the end of
+    its 16-KB slot, so a music SEQ may run past 32 KB (a converted Saturn song needs up to about 35 KB). Changed: the
+    dest table's chunk-3 word, record 0's header-buffer word and the two lui / addiu pairs that address the header's
+    tone table (the only references: EXE and every overlay scanned). Everything read from the disc; returns the room."""
+    r0, r1 = disc.exe_words(PSX_BGM_LOAD_RECS, 4), disc.exe_words(PSX_BGM_LOAD_RECS + 16, 4)
+    dest = disc.exe_words(PSX_BGM_DEST, 5)
+    old, top = r0[2], r1[2]
+    assert dest[1] == PSX_SEQ_BUF and dest[3] == old and dest[4] == top and old < top, 'unexpected music dest table'
+    _, _, ext, size = disc.iso_record('SOUND/PCOMMON.PAC')
+    hdr = {t: b for t, o, b in unpac_bytes(disc.read(ext, size))}[3]
+    assert hdr[:4] == b'pBAV', 'unexpected PCOMMON header'
+    new = (top - len(hdr)) & ~15
+    assert old + len(hdr) <= new and new + len(hdr) <= top
+    for a in PSX_PCOMMON_HDR_SITES:
+        lui, addiu = disc.exe_words(a, 2)
+        assert lui >> 26 == 0x0F and addiu >> 26 == 0x09 and (lui >> 16 & 31) == (addiu >> 21 & 31)
+        assert ((lui & 0xFFFF) << 16) + (addiu & 0xFFFF) - ((addiu & 0x8000) << 1) == old, hex(a)
+        hi = (new + 0x8000) >> 16 & 0xFFFF
+        disc.exe_write_words(a, [lui & 0xFFFF0000 | hi, addiu & 0xFFFF0000 | new & 0xFFFF])
+    disc.exe_write_words(PSX_BGM_DEST + 12, [new])
+    disc.exe_write_words(PSX_BGM_LOAD_RECS + 8, [new])
+    return dict(pcommon_hdr=new, pcommon_hdr_old=old, seq_room=new - PSX_SEQ_BUF)
+
 def patch_m8_tengu_bank(disc, lba):
     """Write the converted Saturn Tengu Man bank into the free sectors at `lba` (no file-table entry of its own: the
     switch rewrites entry PSX_TENGU_FILE at run time)."""
@@ -3690,16 +4472,16 @@ TEXT_FONT = {
 # Stage select (02b §Stage select): mode function 0x800FF8C4, state struct 0x8017054C (+0 state, 1 = waiting for input;
 # +4 = stage under the cursor, Tengu Man = 3). Its init 0x800FF948 reloads DEMO.BIN (overlay 0) when another overlay
 # is loaded, then streams file 0x72 (`jal 0x800FB9C0` at 0x800FF9C8, a0 = 0x72) and waits for it; every frame after
-# that it renders through `jal 0x800F96C0` at 0x800FF92C. M8t4: the init's call reads the ticker overlay into the RAM
-# that is free at the stage select (0x801DD000-0x801E9FFF, zero in Mednafen) first (tk_load in DEMO.BIN, a virtual
-# entry there), then streams file 0x72 as before; the render call goes through tk_frame (first word of the ticker
-# overlay). With the cursor on Tengu Man, tk_frame draws the pedestal ticker ("♪ PLAYSTATION" / "♪ SATURN", from
+# that it renders through `jal 0x800F96C0` at 0x800FF92C. M8t4: the ticker overlay is part of DEMO.BIN (after the M7
+# code), so it is in RAM whenever the stage select runs and the stage select's CD reads stay the game's own (an extra
+# read of the ticker before file 0x72 froze real hardware intermittently with either CD loader); DEMO.BIN moves to a
+# larger slot in the free sectors. The render call goes through tk_frame (first word of the ticker code). With the cursor on Tengu Man, tk_frame draws the pedestal ticker ("♪ PLAYSTATION" / "♪ SATURN", from
 # entry 28's LBA) and the blinking hint under the platform ("- [SELECT] : CHANGE MUSIC -") while the stage select is on
 # screen: state 1 (waiting for input), 3 (boss chosen) and 4 up to step 1 (the banner sliding in; step 3 = the white
 # flash and the boss-intro screen, +1 = step). In state 1 Select rewrites entry 28's LBA and size (the PSX's, read from
 # the user's disc, or the converted bank's) and plays the toggle sound. Everything is drawn on the fade's OT entry with
 # 4-bpp sprites from VRAM x 960-1023, y 256-290 (unused there).
-M8K_BASE = 0x801DD000                 # ticker overlay (stage-select time: free RAM)
+M8K_BASE = 0x801DD000                 # highest link address checked for the ticker code (it now sits inside DEMO.BIN)
 M8K_PRIMS = 0x801E8000                # 2 x 0x800 bytes of primitives (free RAM at the stage select)
 M8K_INIT_CALL, M8K_INIT_FP = 0x800FF9C8, '926c3991090f'     # jal 0x800FB9C0 (stream file 0x72), a0 set in the delay slot
 M8K_RENDER_CALL, M8K_RENDER_FP = 0x800FF92C, 'd6e9aa9f4173' # jal 0x800F96C0 (render the rest)
@@ -3815,10 +4597,12 @@ void tk_frame(void)
     tw = sat ? @PX_SAT@ : @PX_PS@; vb = sat ? 8 : 0; P = tw + @GAP@; pos = (frames >> 1) % P;
     /* Clipped to the panel's row spans by the drawing area (E3 / E4 per row), the strip always drawn from u = 0:
        the earlier version clipped by starting at u = lo - xc, and real consoles garbled the ticker once its left
-       end reached the panel edge (emulators drew it correctly). Packets go to the head of entry +0x94, so the one
-       added first (the drawing area put back from the draw struct's own E3 / E4) is drawn last. */
+       end reached the panel edge (emulators drew it correctly). Packets go to the head of entry +0x90, so the one
+       added first (the drawing area put back from the draw struct's own E3 / E4) is drawn last. Entry +0x90 is empty
+       at the stage select and drawn after the screen's sprites and backgrounds (+0x70 to +0x8C) and before the fade
+       task's quads (+0x94), so the ticker and the hint stay behind the opening wipe. */
     p[0] = 2 << 24; p[1] = *(volatile u32 *)(DRAWSTRUCT + 0x20); p[2] = *(volatile u32 *)(DRAWSTRUCT + 0x24);
-    add_prim((void *)(DRAWSTRUCT + 0x94), p); p += 3;
+    add_prim((void *)(DRAWSTRUCT + 0x90), p); p += 3;
     y0 = (*(volatile u32 *)(DRAWSTRUCT + 0x20) >> 10) & 0x1FF;     /* this buffer's top row in VRAM */
     for (y = 0; y < 7; y++) {
       int l = tk_l[y], r = tk_r[y];
@@ -3836,41 +4620,26 @@ void tk_frame(void)
       }
       if (n == 2) continue;
       q[0] = n << 24;
-      add_prim((void *)(DRAWSTRUCT + 0x94), q); p += n + 1;
+      add_prim((void *)(DRAWSTRUCT + 0x90), q); p += n + 1;
     }
     if (blink < @BLINK_ON@) {
       p[0] = 4 << 24; p[1] = 0x65u << 24 | 0x808080;
       p[2] = @HINT_Y@ << 16 | @HINT_X@;
       p[3] = (u32)(272 << 6 | 976 >> 4) << 16 | 24 << 8 | 0;
       p[4] = @HINT_H@ << 16 | @HINT_PX@;
-      add_prim((void *)(DRAWSTRUCT + 0x94), p); p += 5;
+      add_prim((void *)(DRAWSTRUCT + 0x90), p); p += 5;
     }
     if (++blink >= @BLINK_ON@ + @BLINK_OFF@) blink = 0;
     frames++;
     p[0] = 1 << 24; p[1] = 0xE1u << 24 | 1 << 10 | 1 << 4 | 15;     /* draw mode: texture page x 960, y 256, 4 bpp */
-    add_prim((void *)(DRAWSTRUCT + 0x94), p);
+    add_prim((void *)(DRAWSTRUCT + 0x90), p);
   } else was = 0;
   render_rest();
 }
 """
-M8K_STUB_C = r"""
-extern char tk_vf[];                          /* linker symbol = virtual file number of the ticker overlay */
-extern void file_load(int idx, void *dst);    /* 0x800FB7A4 */
-extern int load_done(void);                   /* 0x800FC1E0 */
-extern void yield_(int n);                    /* 0x800F7ECC */
-extern void ss_wait(void);                    /* 0x8011C858: what the init's own wait loops call */
-extern void flush_cache(void);                /* 0x800D78EC: BIOS FlushCache */
-extern void stream_file(int f);               /* 0x800FB9C0 */
-void tk_load(int f)
-{
-  file_load((int)tk_vf, (void *)TK_BASE_);
-  while (!load_done()) { ss_wait(); yield_(1); }
-  flush_cache();
-  stream_file(f);                             /* the call this replaces (file 0x72) */
-}
-"""
-M8K_STUB_SYMS = dict(file_load=0x800FB7A4, load_done=0x800FC1E0, yield_=0x800F7ECC, ss_wait=0x8011C858,
-                     flush_cache=0x800D78EC, stream_file=0x800FB9C0)
+# DEMO.BIN grows past its 9-sector slot with the ticker inside it; it moves to a slot of this many sectors in the free
+# area, with room left for a test image's own additions.
+PSX_DEMO_SLOT_M8K = 12
 
 @_memo
 def m8k_images():
@@ -3882,8 +4651,8 @@ def m8k_images():
     h = m8k_hint(); hpx = len(h[0]); hhw = (hpx + 3) // 4
     return ps, wp, sa, ws, m8k_4bpp(h, hhw), hpx, hhw
 
-def m8k_overlay(ent_ps, ent_sat, workdir=None):
-    """The ticker overlay (bytes, symbols), linked at M8K_BASE; ent_ps / ent_sat = (LBA, size) of music 5's file."""
+def m8k_overlay(ent_ps, ent_sat, workdir=None, base=M8K_BASE):
+    """The ticker code (bytes, symbols), linked at `base`; ent_ps / ent_sat = (LBA, size) of music 5's file."""
     ps, wp, sa, ws, hint, hpx, hhw = m8k_images()
     src = M8K_C
     for k, v in dict(ENTRY_=f'{PSX_FILETAB + 12 * PSX_TENGU_FILE:#x}', PRIMS_=f'{M8K_PRIMS:#x}', HINT_HW_=str(hhw), HINT_H_=str(len(m8k_hint())),
@@ -3894,53 +4663,45 @@ def m8k_overlay(ent_ps, ent_sat, workdir=None):
                      HINT_X_=str(M8K_HINT_XY[0]), HINT_PX_=str(hpx)).items():
         src = src.replace('@' + k[:-1] + '@', v)
     assert '@' not in src
-    data, sy = m7_compile([('ticker.c', src)], 'ticker', M8K_BASE,
+    data, sy = m7_compile([('ticker.c', src)], 'ticker', base,
                           dict(render_rest=0x800F96C0, add_prim=0x800D313C, load_image=0x800D3E84, sound_centred=0x800FD100),
                           'tk_frame', workdir and os.path.join(workdir, 'm8k_ticker'))
-    assert sy['tk_frame'] == M8K_BASE and M8K_BASE + len(data) <= M8K_PRIMS, 'ticker overlay'
+    assert sy['tk_frame'] == base and base + len(data) <= M8K_PRIMS, 'ticker overlay'
     out = bytearray(data)
     def put(sym, words, fmt):
-        o = sy[sym] - M8K_BASE; b = struct.pack(f'<{len(words)}{fmt}', *words); out[o:o + len(b)] = b
+        o = sy[sym] - base; b = struct.pack(f'<{len(words)}{fmt}', *words); out[o:o + len(b)] = b
     put('ent_ps', ent_ps, 'I'); put('ent_sat', ent_sat, 'I')
     put('img_ps', ps, 'H'); put('img_sat', sa, 'H'); put('img_hint', hint, 'H')
     return bytes(out), sy
 
-def m8k_demo_tail(demo_len, lba, size, workdir=None):
-    """What M8t4 appends to DEMO.BIN (`demo_len` bytes so far): padding, the ticker overlay's virtual entry, tk_load.
-    Returns (bytes, info)."""
-    base = Psx.OVL_BASE; out = bytearray()
-    while (demo_len + len(out)) % 4: out.append(0)
-    while (base + demo_len + len(out) - PSX_FILETAB) % 12: out += bytes(4)
-    vf_off = demo_len + len(out); vf = (base + vf_off - PSX_FILETAB) // 12
-    out += struct.pack('<3I', lba, size, 5)
-    while (demo_len + len(out)) % 16: out.append(0)
-    code_base = base + demo_len + len(out)
-    data, sy = m7_compile([('tk_load.c', M8K_STUB_C.replace('TK_BASE_', f'{M8K_BASE:#x}'))], 'tkload', code_base,
-                          dict(M8K_STUB_SYMS, tk_vf=vf), 'tk_load', workdir and os.path.join(workdir, 'm8k_stub'))
-    assert sy['tk_load'] == code_base
-    out += data
-    return bytes(out), dict(tk_vf=vf, tk_vf_off=vf_off, tk_load=code_base)
+def m8k_demo_tail(demo_len, ent_ps, bank, workdir=None):
+    """What M8t4 appends to DEMO.BIN (`demo_len` bytes so far): padding, then the ticker code linked where it lands.
+    ent_ps / bank = (LBA, size) of music 5's file on the user's disc / of the converted bank. Returns (bytes, info)."""
+    out = bytes(-demo_len % 16)
+    base = Psx.OVL_BASE + demo_len + len(out)
+    ovl, sy = m8k_overlay(ent_ps, bank, workdir, base)
+    return out + ovl, dict(tk_frame=base, tk_ovl_size=len(ovl))
 
 def patch_m8_ticker(disc, lba, bank, workdir=None):
-    """M8t4: the ticker overlay into the free sectors at `lba` (bank = (LBA, size) of the converted Tengu Man bank),
-    tk_load appended to DEMO.BIN (after the M7 code; still in its slot), the two stage-select calls repointed."""
+    """M8t4: the ticker code appended to DEMO.BIN (after the M7 code; bank = (LBA, size) of the converted Tengu Man
+    bank), DEMO.BIN moved to a PSX_DEMO_SLOT_M8K-sector slot at the free sectors at `lba` (file-table entry 8 and its
+    ISO record), the stage-select render call repointed to tk_frame. The init's stream of file 0x72 stays the game's."""
     rd = lambda a: disc.exe_words(a, 1)[0]
     assert fp(rd(M8K_INIT_CALL)) == M8K_INIT_FP and fp(rd(M8K_RENDER_CALL)) == M8K_RENDER_FP, 'stage-select calls'
     e28 = disc.file_entry(PSX_TENGU_FILE)
-    ovl, sy = m8k_overlay(e28[:2], bank, workdir)
-    nsec = place_file(disc, lba, ovl)
     e = disc.file_entry(PSX_DEMO_FILE)
     demo = disc.read(e[0], e[1])
-    tail, info = m8k_demo_tail(len(demo), lba, len(ovl), workdir)
+    tail, info = m8k_demo_tail(len(demo), e28[:2], bank, workdir)
     demo = demo + tail
-    assert len(demo) <= PSX_DEMO_SLOT * 2048, f'DEMO.BIN grows to {len(demo):#x}'
-    disc.write(e[0], 0, demo + bytes(-len(demo) % 2048))
-    disc.set_file_entry(PSX_DEMO_FILE, e[0], len(demo))
+    slot = PSX_DEMO_SLOT_M8K * 2048
+    assert len(demo) <= slot, f'DEMO.BIN grows to {len(demo):#x}'
+    nsec = place_file(disc, lba, demo + bytes(slot - len(demo)))
+    disc.set_file_entry(PSX_DEMO_FILE, lba, len(demo))
     rl, ro, ext, sz = disc.iso_record('OVL/DEMO.BIN')
-    disc.write(rl, ro + 10, struct.pack('<I', len(demo)) + struct.pack('>I', len(demo)))
-    disc.exe_write_words(M8K_INIT_CALL, [3 << 26 | (info['tk_load'] >> 2) & 0x3FFFFFF])
-    disc.exe_write_words(M8K_RENDER_CALL, [3 << 26 | (M8K_BASE >> 2) & 0x3FFFFFF])
-    info.update(tk_lba=lba, tk_size=len(ovl), tk_sectors=nsec, tk_demo_size=len(demo))
+    assert ext == e[0]
+    disc.write(rl, ro + 2, struct.pack('<I', lba) + struct.pack('>I', lba) + struct.pack('<I', len(demo)) + struct.pack('>I', len(demo)))
+    disc.exe_write_words(M8K_RENDER_CALL, [3 << 26 | (info['tk_frame'] >> 2) & 0x3FFFFFF])
+    info.update(demo_lba=lba, tk_sectors=nsec, tk_demo_size=len(demo))
     return info
 
 def sat_ill_image(n):
@@ -4096,7 +4857,7 @@ def m7_compile(src_text, name, base, symbols, entry, workdir=None):
     return data, sy
 
 @_memo
-def build_m7_overlays(demo, workdir=None):
+def build_m7_overlays(demo, workdir=None, pairs=None):
     """M7a: (new DEMO.BIN, BONUS overlay, info). DEMO.BIN (the title overlay, resident while the title runs) gets
     marker + one virtual file entry (the bonus overlay; the caller fills in its LBA/size) + the title hook and
     bonus_enter; it must still fit its 9-sector slot. The bonus overlay is linked at M7_BONUS_BASE."""
@@ -4117,9 +4878,19 @@ def build_m7_overlays(demo, workdir=None):
     assert sy['title_hook'] == code_base
     out += data
     assert len(out) <= PSX_DEMO_SLOT * 2048, f'DEMO.BIN grows to {len(out):#x}'
-    bonus, binfo = build_m7b_bonus(workdir)            # M7b: the Saturn bonus menu, lifted
+    bonus, binfo = build_m7b_bonus(workdir, pairs)     # M7b: the Saturn bonus menu, lifted
     return out, bonus, dict(demo_size=len(out), vf=vf, vf_off=vf_off, title_hook=sy['title_hook'], title_confirm=sy['title_confirm'],
                             title_skip_load=sy['title_skip_load'], bonus_enter=sy['bonus_enter'], **binfo)
+
+def m8s_sttab(disc, pairs, sat):
+    """The pairs sound test's table: per entry (file-table entry address, LBA, size) of its version (PSX: the user's
+    disc; SAT: the placed bank; 0s for songs with one version)."""
+    out = b''
+    for i, m, v in m8s_names(pairs)['entries']:
+        if v == 2: out += bytes(12); continue
+        lba, size = disc.file_entry(0x17 + m)[:2] if v == 0 else sat[m]
+        out += struct.pack('<3I', PSX_FILETAB + 12 * (0x17 + m), lba, size)
+    return out
 
 def patch_title_menu(disc, title_hook, title_confirm):
     """EXE: the title menu gets BONUS MODE as a 4th item, laid out as on the Saturn (cursor positions and item records
@@ -4146,13 +4917,14 @@ def patch_title_menu(disc, title_hook, title_confirm):
     disc.exe_write(PSX_TITLE_GROUPS + 7, bytes([18]))   # group 3 (menu shown at once, e.g. back from Bonus Mode): 12..18
     return dict(title_cursor=cur, title_recs=recs)
 
-def patch_m7a(disc, lba, workdir=None, vf0=None, tengu=None):
+def patch_m7a(disc, lba, workdir=None, vf0=None, tengu=None, sat_music=None):
     """M7a: DEMO.BIN rebuilt in its own slot (file-table entry 8 + ISO record: new size), the bonus overlay written to
     the free sectors at `lba` (reached through the virtual entry in DEMO.BIN), title-menu EXE patches. Returns info."""
     e = disc.file_entry(PSX_DEMO_FILE)
     demo = disc.read(e[0], e[1])
-    new, bonus, info = build_m7_overlays(demo, workdir)
-    slabo = m7b_slabo_pac(); slabo_lba = lba + (len(bonus) + 2047) // 2048
+    pairs = tuple(sorted(sat_music)) if sat_music is not None else None
+    new, bonus, info = build_m7_overlays(demo, workdir, pairs)
+    slabo = m7b_slabo_pac(pairs); slabo_lba = lba + (len(bonus) + 2047) // 2048
     bonus = bytearray(bonus); bonus[info['slabo_vf_off']:info['slabo_vf_off'] + 12] = struct.pack('<3I', slabo_lba, len(slabo), 0x14)
     ill_lba0 = slabo_lba + (len(slabo) + 2047) // 2048; ill_sec = (M7C_ILL_BYTES + 2047) // 2048
     for n in range(M7C_ILL_COUNT):                  # M7c: ILL00-29 after SLABO (reached through the overlay's entries)
@@ -4172,6 +4944,7 @@ def patch_m7a(disc, lba, workdir=None, vf0=None, tengu=None):
     bonus[info['music_vf_off']:info['music_vf_off'] + 48] = o9
     if tengu is None: tengu = find_m8_tengu_bank(disc)       # M8t5: music 5's file entry, PSX then the Saturn bank
     bonus[info['e28_off']:info['e28_off'] + 16] = struct.pack('<4I', *disc.file_entry(PSX_TENGU_FILE)[:2], *tengu)
+    if pairs is not None: bonus[info['st_off']:info['st_off'] + 12 * info['st_entries']] = m8s_sttab(disc, pairs, {**sat_music, PSX_TENGU_MUSIC: tengu})
     bonus = bytes(bonus)
     new[info['vf_off']:info['vf_off'] + 12] = struct.pack('<3I', lba, len(bonus), 5)
     assert disc.read(e[0] + 0, PSX_DEMO_SLOT * 2048)[e[1]:] == bytes(PSX_DEMO_SLOT * 2048 - e[1])
@@ -4658,6 +5431,65 @@ void bonus_main(void)
   }
 }
 '''
+M8S_PAIRS_PLAYER = r'''/* The sound test with both versions of every song that has a Saturn bank: entry n plays the Saturn table's
+   entry st_sat[n]; before that, music st_mus[n]'s file-table entry is set to the entry's version (bonus_sttab: entry
+   address, LBA, size; address 0 = one version only) and a loaded copy of that music is marked unloaded. Every switched
+   entry is put back when Bonus Mode is left (bonus_main). */
+extern char bonus_sttab[];
+static const u8 st_sat[ST_N_] = ST_SAT_;
+static const u8 st_mus[ST_N_] = ST_MUS_;
+__attribute__((noinline, noipa)) u32 h_00209088(u32 n, u32 v, u32 c, u32 d)
+{
+  n &= 0xFF;
+  if (v == 0) {
+    const volatile u32 *t;
+    if (n >= ST_N_) n = 0;
+    t = (const volatile u32 *)bonus_sttab + 3 * n;
+    if (t[0] && !SND_BUSY) {
+      volatile u32 *e = (volatile u32 *)t[0];
+      if (e[0] != t[1]) { e[0] = t[1]; e[1] = t[2]; if (BANK_NUM == st_mus[n]) BANK_NUM = 0xFF; }
+    }
+    n = st_sat[n];
+  }
+  bonus_sndplay(n, v); return 0;
+}
+'''
+M8S_PAIRS_MAIN = r'''  {
+    /* the sound-test names play as steps of set 0xAD's animation 0 (the generated list replaces the EXE's while Bonus
+       Mode runs); every music file-table entry the sound test can switch is put back afterwards */
+    static u32 st_save[2 * ST_NSW_] __attribute__((section(".data"))) = {1};
+    static const u32 st_fe[ST_NSW_] = ST_FE_;
+    volatile u32 *anim = (volatile u32 *)ST_ANIM_PTR_;
+    u32 a0 = *anim, j;
+    for (j = 0; j < ST_NSW_; j++) { st_save[2 * j] = ((volatile u32 *)st_fe[j])[0]; st_save[2 * j + 1] = ((volatile u32 *)st_fe[j])[1]; }
+    *anim = (u32)st_anim;
+    bonus_menu(0);                             /* Saturn 0x27AAD0: runs until its state 5 (EXIT) */
+    *anim = a0;
+    for (j = 0; j < ST_NSW_; j++) {
+      volatile u32 *e = (volatile u32 *)st_fe[j];
+      if (e[0] != st_save[2 * j]) {
+        e[0] = st_save[2 * j]; e[1] = st_save[2 * j + 1];
+        if (BANK_NUM == (st_fe[j] - FILETAB_) / 12 - 0x17) BANK_NUM = 0xFF;
+      }
+    }
+  }
+}
+'''
+
+def m8s_glue_pairs(glue, sn):
+    """M7B_GLUE_C with the pairs player and bonus_main's save / restore of every switched music entry."""
+    a = glue.index('/* M8t5: the sound test has one more entry'); b = glue.index('/* Saturn CD-DA status', a)
+    glue = glue[:a] + M8S_PAIRS_PLAYER + glue[b:]
+    a = glue.index('  {\n    /* M8t5: the sound-test names'); b = glue.index('\n}\n', a) + 3
+    glue = glue[:a] + M8S_PAIRS_MAIN + glue[b:]
+    ents = sn['entries']; fes = sorted({m for i, m, v in ents if v < 2})
+    fe = lambda m: PSX_FILETAB + 12 * (0x17 + m)
+    for k, v in dict(ST_N_=str(len(ents)), ST_SAT_='{' + ','.join(str(i) for i, m, v in ents) + '}',
+                     ST_MUS_='{' + ','.join(str(m) for i, m, v in ents) + '}', ST_NSW_=str(len(fes)),
+                     ST_FE_='{' + ','.join(f'{fe(m):#x}' for m in fes) + '}', FILETAB_=f'{PSX_FILETAB:#x}').items():
+        glue = glue.replace(k, v)
+    return glue
+
 M7B_GLUE_SYMS = dict(psx_yield=0x800F7ECC, psx_stream=0x800FB9C0, psx_load_done=0x800FC1E0, psx_stop_bgm=0x800FCD84, psx_movie=0x800FD444, psx_flush_cache=0x800D78EC,
                      psx_file_load=0x800FB7A4, psx_load_image=0x800D3E84, psx_render_sprites=0x800F88FC,
                      psx_fade=0x80102E84, psx_add_prim=0x800D313C, psx_draw_sync=0x800D3C5C,
@@ -4777,8 +5609,9 @@ def m7b_data_bytes(sat, port):
     ptr_offs = [at(sat.u32(t + 4 * k)) for t, n in M7B_PTR_TABLES for k in range(n)]
     return bytes(d), ptr_offs
 
-def m7b_lift():
-    """Lift the bonus menu, spawner and P4 0x40/0x41 to C. Returns (C source, BonusPort)."""
+def m7b_lift(pairs=None):
+    """Lift the bonus menu, spawner and P4 0x40/0x41 to C. Returns (C source, BonusPort). pairs: the sound test with
+    both versions of every song (m8s_names)."""
     sat = Sat(); code = Code([(sat.BASE2, sat.p2), (sat.BASE1, sat.p1)])
     port = BonusPort(M7B_SPEC); bodies = []
     for name, entry, typ, tabkeys, words, stops in M7B_SPEC['handlers']:
@@ -4805,7 +5638,8 @@ def m7b_lift():
             .replace('LETTER_OFFS', '{' + ', '.join(f'{sp[0] << 24 | sp[1]:#x}' for sp in lspans) + '}').replace('LETTER_NFILES', str(len(lfiles)))
             .replace('BONUS_RAM_SIZE', str(port.ram_len)).replace('PAD_OFF', str(pad_off)).replace('VDP_OFF', str(vdp_off)).replace('ILL_CARDS', cards)
             .replace('PAD_MAP', '{' + ', '.join(f'{{{p:#x}, {s:#x}}}' for p, s in M7B_PAD_MAP) + '}'))
-    sn = m8s_names()                                # M8t5: sound test with both Tengu Man stage songs
+    sn = m8s_names(pairs)                           # M8t5: sound test with both Tengu Man stage songs
+    if pairs is not None: glue = m8s_glue_pairs(glue, sn)
     glue = (glue.replace('TENGU_ST_', str(sn['entry'])).replace('TENGU_FILE_ENTRY_', f'{PSX_FILETAB + 12 * PSX_TENGU_FILE:#x}')
             .replace('TENGU_MUSIC_', str(PSX_TENGU_MUSIC)).replace('ST_ANIM_PTR_', f"{sn['anim_ptr']:#x}"))
     glue += ('\nu32 st_anim[%d] __attribute__((section(".data"))) = {' % len(sn['steps'])) + ', '.join(f'{w:#x}' for w in sn['steps']) + '};\n'
@@ -4838,9 +5672,11 @@ M8S_GLYPHS = {'(': ('....77..', '...77...', '..77....', '..77....', '..77....', 
 M8S_WORD_GAP, M8S_STEP = 14, 8                      # piece x step between words / letters in the existing names
 
 @_memo
-def m8s_names():
+def m8s_names(pairs=None):
     """Sound-test layout facts read from the discs: Tengu Man's entry, the EXE's name animation (pointer slot and
-    steps) and the new 33-step list. Returns a dict."""
+    steps) and the new 33-step list. Returns a dict. pairs (music numbers with a converted Saturn bank; not in the
+    release build): every song with a Saturn version gets two entries, "(PSX)" and "(SAT)"."""
+    if pairs is not None: return m8s_names_pairs(tuple(pairs))
     sat, ps = Sat(), Psx()
     table = list(sat.raw(0x27CDAC, 32))
     entry = table.index(PSX_TENGU_MUSIC); assert table.count(PSX_TENGU_MUSIC) == 1
@@ -4858,6 +5694,71 @@ def m8s_names():
     new.insert(entry + 1, (new[entry] & ~0x7FFF) | M8S_FRAME_SAT)
     new[-1] |= 0x8000
     return dict(entry=entry, anim_ptr=anims, steps=new, music=table)
+
+M8S_PAIR_FRAME0 = 0x94                 # new frames of set 0xAD (the "(SAT)" names) after the 148 the set has
+
+@_memo
+def m8s_names_pairs(pairs):
+    """The sound test with both versions of every song that has a Saturn bank (music 5 always): entries
+    [(Saturn table index, music, version 0 PSX / 1 SAT / 2 one version)], the animation steps (the PSX entry keeps its
+    frame 0x74 + index, renamed "... (PSX)"; the SAT entry gets a new frame), frames {index: new frame}."""
+    sat, ps = Sat(), Psx()
+    table = list(sat.raw(0x27CDAC, 32))
+    anims = ps.exe.u32(0x8014FF74 + 4 * M8S_SET); a0 = ps.exe.u32(anims); steps = []
+    while True:
+        w = ps.exe.u32(a0 + 4 * len(steps)); steps.append(w)
+        if w & 0x8000: break
+    assert len(steps) == 32 and [w & 0x7FFF for w in steps] == list(range(M8S_FIRST_FRAME, M8S_FIRST_FRAME + 32))
+    both = set(pairs) | {PSX_TENGU_MUSIC}
+    entries, new, frames = [], [], {}
+    for i, m in enumerate(table):
+        w = steps[i] & ~0x8000
+        if m in both and m < PSX_BGM_FIRST_NEW:
+            f = M8S_PAIR_FRAME0 + len(frames); frames[i] = f
+            entries += [(i, m, 0), (i, m, 1)]; new += [w, (w & ~0x7FFF) | f]
+        else:
+            entries.append((i, m, 2)); new.append(w)
+    new[-1] |= 0x8000
+    return dict(entry=None, anim_ptr=anims, steps=new, music=table, entries=entries, frames=frames)
+
+def m8s_suffix_pieces(base, suffix):
+    """Pieces of a name frame `base` followed by a word gap and `suffix` (font letters, the tool's glyphs)."""
+    out = list(base); x = max(p[2] for p in base) + M8S_WORD_GAP; y = base[0][3]; b1 = base[0][1] & 0xFC
+    tiles = m8s_font_tiles()
+    for ch in suffix:
+        t = M8S_GLYPH_TILES[ch] if ch in M8S_GLYPH_TILES else tiles[ch]
+        out.append((t, b1 | t >> 8, x, y)); x += M8S_STEP
+    assert x - M8S_STEP < 128
+    return out
+
+def m8s_slabo_pairs(c5, c6, g, sn):
+    """The pairs variant of m8s_slabo_edit: set 0xAD's frame table is rebuilt at the end of chunk 5 with room for the
+    new frames (chunk 6 points at it); every frame's pieces are copied after it, the paired names get their suffixes."""
+    fo = struct.unpack_from('<I', c6, 4 * M8S_SET)[0]
+    fr = m8s_frames((bytes(c5), bytes(c6)))
+    assert len(fr) == M8S_PAIR_FRAME0
+    for ch, tl in M8S_GLYPH_TILES.items():
+        assert not any(psx_tile(g, tl))
+        rows = ['........'] * 5 + list(M8S_GLYPHS[ch])
+        img = bytearray(128)
+        for y, r in enumerate(rows):
+            for x, c in enumerate(r):
+                v = int(c) if c != '.' else 0
+                img[8 * y + x // 2] |= v << (4 * (x & 1))
+        psx_put_tile(g, tl, bytes(img))
+    for i, f in sn['frames'].items():
+        base = fr[M8S_FIRST_FRAME + i]
+        fr[M8S_FIRST_FRAME + i] = m8s_suffix_pieces(base, '(PSX)')
+        fr[f] = m8s_suffix_pieces(base, '(SAT)')
+    n = max(fr) + 1; assert sorted(fr) == list(range(n))
+    while len(c5) % 4: c5.append(0)
+    nfo = len(c5); tab = bytearray(4 * n); body = bytearray()
+    for f in range(n):
+        struct.pack_into('<HH', tab, 4 * f, len(fr[f]), 4 * n + len(body))
+        body += b''.join(bytes([t & 0xFF, b1, x & 0xFF, y & 0xFF]) for t, b1, x, y in fr[f])
+    assert 4 * n + len(body) < 0x10000
+    c5 += tab + body
+    struct.pack_into('<I', c6, 4 * M8S_SET, nfo)
 
 def m8s_name_pieces(base, text):
     """Pieces (tile, byte 1, x, y) of `text`: the existing 'TENGUMAN STAGE' pieces `base`, then the rest of `text` in the
@@ -4888,13 +5789,13 @@ def m8s_font_tiles():
     m.update(word(M8S_FIRST_FRAME + 3, 'OPENING STAGE 1'))
     return m
 
-def m8s_patch_st(csrc):
+def m8s_patch_st(csrc, last=0x1F + 1):
     """The lifted test screen 0x27B0F8: the sound test's last entry (the Saturn's r6 = 0x1F before the shared
-    up/down routine 0x27B2BE; the voice test's is 0x63) becomes 0x20."""
+    up/down routine 0x27B2BE; the voice test's is 0x63) becomes 0x20 (`last` with the pairs variant)."""
     s = csrc.index('void bonus_st(u32 obj)'); e = csrc.index('\nvoid ', s + 10)
     body = csrc[s:e]; old = 'L_27b1aa:\n  r6 = 0x1f;'
-    assert body.count(old) == 1 and body.count('r6 = 0x63;') == 1
-    return csrc[:s] + body.replace(old, 'L_27b1aa:\n  r6 = 0x%x;' % (0x1F + 1)) + csrc[e:]
+    assert body.count(old) == 1 and body.count('r6 = 0x63;') == 1 and last < 0x63
+    return csrc[:s] + body.replace(old, 'L_27b1aa:\n  r6 = 0x%x;' % last) + csrc[e:]
 
 def m8s_frames(c56):
     c5, c6 = c56; fo = struct.unpack_from('<I', c6, 4 * M8S_SET)[0]; out = {}
@@ -4995,9 +5896,9 @@ def unpac_dict_sat_slabo():
     return {t: b for t, o, b in unpac(os.path.join(SAT_FILES, 'SLABO.PAC'))}
 
 @_memo
-def m7b_slabo_pac():
+def m7b_slabo_pac(pairs=None):
     """SLABO.PAC (Saturn only: bonus backgrounds, fonts, cursors) converted to a PSX PAC, loaded like LABO.PAC; prompt
-    line with the PSX button (above)."""
+    line with the PSX button (above). pairs: the sound test's names for both versions of every song (m8s_names)."""
     ch = [(t, bytearray(front_pac_sat_to_psx(t, b))) for t, o, b in unpac(os.path.join(SAT_FILES, 'SLABO.PAC'))]
     d = dict(ch)
     c5, c6 = d[5], d[6]
@@ -5023,18 +5924,20 @@ def m7b_slabo_pac():
     assert not any(psx_tile(g, M7C_TRI_TILE))
     tri = lambda v: M7C_TRI_MAP.get(v, v)
     psx_put_tile(g, M7C_TRI_TILE, bytes(tri(b & 15) | tri(b >> 4) << 4 for b in psx_tile(g, M7C_TRI_SRC)))
-    m8s_slabo_edit(c5, c6, g)                      # M8t5: both Tengu Man stage songs in the sound test
+    if pairs is None: m8s_slabo_edit(c5, c6, g)    # M8t5: both Tengu Man stage songs in the sound test
+    else: m8s_slabo_pairs(c5, c6, g, m8s_names(pairs))
     return pac_build([(t, bytes(b)) for t, b in ch])
 
-def build_m7b_bonus(workdir=None):
+def build_m7b_bonus(workdir=None, pairs=None):
     """Bonus overlay (linked at M7_BONUS_BASE, entry bonus_main): glue + lifted menu, then marker and one virtual file
     entry for the converted SLABO.PAC (the caller fills in LBA/size). Two passes: the entry's file number is a linker
     symbol and its address follows the code."""
     import tempfile
     wd = workdir and os.path.join(workdir, 'm7b_bonus') or tempfile.mkdtemp(prefix='mm8m7b_')
     os.makedirs(wd, exist_ok=True)
-    csrc, port = m7b_lift()
-    csrc = m8s_patch_st(csrc)                          # M8t5: 33 sound-test entries
+    csrc, port = m7b_lift(pairs)
+    nst = len(m8s_names(pairs)['entries']) if pairs is not None else 0
+    csrc = m8s_patch_st(csrc) if pairs is None else m8s_patch_st(csrc, nst - 1)   # M8t5: 33 sound-test entries
     nletter = len(m7d_letter()[0])
     syms = dict(helper_symbols(), **M7B_GLUE_SYMS, **{f'h_{k:08x}': v for k, v in M7B_FRONTEND_HELPERS.items()})
     for k in M7B_CUSTOM: syms.pop(f'h_{k:08x}', None)  # defined in the glue
@@ -5043,7 +5946,8 @@ def build_m7b_bonus(workdir=None):
         mvf = M7_BONUS_BASE + 12 * (vf + 1 + M7C_ILL_COUNT + nletter) - (M7_BONUS_BASE - PSX_FILETAB) if vf else 0
         data, sy = m7_compile([('m7b_bonus.c', csrc)], 'bonus', M7_BONUS_BASE, dict(syms, bonus_slabo_vf=vf, bonus_ill_vf=vf + 1,
                                                                                     bonus_letter_vf=vf + 1 + M7C_ILL_COUNT,
-                                                                                    bonus_music_vf=mvf, bonus_e28=mvf + 48 if vf else 0),
+                                                                                    bonus_music_vf=mvf, bonus_e28=mvf + 48 if vf else 0,
+                                                                                    **({'bonus_sttab': mvf + 64 if vf else 0} if pairs is not None else {})),
                               'bonus_main', wd)
         assert sy['bonus_main'] == M7_BONUS_BASE
         out = bytearray(data)
@@ -5054,13 +5958,14 @@ def build_m7b_bonus(workdir=None):
         out += bytes(12 * (1 + M7C_ILL_COUNT + nletter))   # SLABO, then ILL00-29 (M7c), then the LETTER files (M7d)
         music_off = len(out); out += bytes(12 * 4)          # M7e: copies of the music 0x46-0x49 entries (bonus_main moves them)
         e28_off = len(out); out += bytes(16)                # M8t5: music 5's file entry, PSX (LBA, size) then the Saturn bank's
+        st_off = len(out); out += bytes(12 * nst)           # pairs: (file entry address, LBA, size) per sound-test entry
         if new_vf == vf: break
         vf = new_vf
     assert vf == new_vf and M7_BONUS_BASE + len(out) <= M7B_BONUS_LIMIT, hex(M7_BONUS_BASE + len(out))
     assert M7_BONUS_BASE + music_off == mvf and M7_BONUS_BASE >= M7E_MUSIC_VF + 48
     return bytes(out), dict(slabo_vf=vf, slabo_vf_off=vf_off, ill_vf=vf + 1, ill_vf_off=vf_off + 12, bonus_size=len(out),
                             letter_vf=vf + 1 + M7C_ILL_COUNT, letter_vf_off=vf_off + 12 * (1 + M7C_ILL_COUNT), letter_files=nletter,
-                            music_vf_off=music_off, e28_off=e28_off,
+                            music_vf_off=music_off, e28_off=e28_off, st_off=st_off, st_entries=nst,
                             csrc=os.path.join(wd, 'm7b_bonus.c'), bonus_menu=sy['bonus_menu'], bonus_ill=sy['bonus_ill'],
                             sat_data=sy['sat_data'], bonus_ram=sy['bonus_ram'])
 
