@@ -80,8 +80,8 @@ The builder includes GCC and GNU Binutils (free software under the GNU GPL). The
 
 This repository holds only original work:
 
-- `mm8tool.py`: the builder that ports the Saturn content and builds the PSX image from your discs (usage in its docstring)
-- `helper_map.txt`: the Saturn → PSX function map the builder reads
+- `tools/mm8tool.py`: the builder that ports the Saturn content and builds the PSX image from your discs (usage in its docstring)
+- `tools/helper_map.txt`: the Saturn → PSX function map the builder reads
 
 It contains no copyrighted material: no game data, no game code and no patches. The builder reads everything it needs from your own discs (US PlayStation and US Saturn; the Japanese option will need the Japanese discs) and builds the PSX image on your machine. Don't share the images it makes.
 

@@ -4,9 +4,10 @@
 *
 !.gitignore
 !README.md
-!mm8tool.py
-!helper_map.txt
-# Screenshots of the patched game (PNG, plus GIF for animations).
+# The builder and the function map it reads, in tools/ (the other tool files there stay untracked).
+!tools/
+!tools/mm8tool.py
+!tools/helper_map.txt
+# Screenshots of the patched game (any format).
 !screenshots/
-!screenshots/*.png
-!screenshots/*.gif
+!screenshots/*
