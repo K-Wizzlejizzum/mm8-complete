@@ -14,30 +14,29 @@ A fan project that turns **Mega Man 8 (USA, PlayStation, SLUS-00453)** into the 
 6. Add Tengu Man's Saturn Track, with ability to switch between both versions - **100% Complete**
 7. Update attract mode to use the Saturn's demos (placements and recorded input) - **100% Complete**
 8. Port Saturn's water effects - **100% Complete**
-9. Review the sound effects and voice lines that differ between the Saturn and PSX versions and port the Saturn's where appropriate - **Not Started**
-10. Assess feasibility of porting all Saturn versions of music - **Not Started**
-11. Reassess the remaining color differences between the Saturn and PSX versions once all other Saturn porting is complete - **Not Started**
+9. Review the sound effects and voice lines that differ between the Saturn and PSX versions and port the Saturn's where appropriate - **100% Complete**
+10. Port all Saturn versions of music - **100% Complete**
+11. Add ways to toggle all versions of Saturn music in game - **In Progress**
+12. Reassess the remaining color differences between the Saturn and PSX versions once all other Saturn porting is complete - **Not Started**
 
 ### Post-Release (Japanese Content Added)
 
-12. Add the Battle & Chase and Super Adventure Rockman adverts that were present in the Japanese PSX version - **Not Started**
-13. Assess feasibility to choose between Japanese intro, logo, and audio (with subtitles) and English intro, logo, and audio, effectively creating an "Undub" - **Not Started**
-14. Assess feasibility to include a choice between standard subtitles and SDH for the undub - **Not Started**
+13. Add the Battle & Chase and Super Adventure Rockman adverts that were present in the Japanese PSX version - **Not Started**
+14. Assess feasibility to choose between Japanese intro, logo, and audio (with subtitles) and English intro, logo, and audio, effectively creating an "Undub" - **Not Started**
+15. Assess feasibility to include a choice between standard subtitles and SDH for the undub - **Not Started**
 
 ### Post-Release (Quality of Life Changes)
 
-15. Review HUD transparency - **Not Started**
-16. Overhaul the bolt/shop system to allow for all items to be purchased in a single playthrough - **Not Started**
-17. Assess the need for a full re-translation - **Not Started**
-18. Fix any grammatical issues with the dialogue - **Not Started**
+16. Review HUD transparency - **Not Started**
+17. Overhaul the bolt/shop system to allow for all items to be purchased in a single playthrough - **Not Started**
+18. Assess the need for a full re-translation - **Not Started**
+19. Fix any grammatical issues with the dialogue - **Not Started**
 
 ### Post-Release (Cleanup & Optimizations)
 
-19. Assess feasibility of improving selection response time, screen transition time, and load time - **Not Started**
-20. Optimize code to improve build time - **Not Started**
-21. Test on real PlayStation hardware - **Not Started**
-22. Assess feasibility of Mac and Linux versions of the builder - **Not Started**
-23. Add a license so others can fork and modify the builder - **Not Started**
+20. Assess feasibility of improving selection response time, screen transition time, and load time - **Not Started**
+21. Assess feasibility of Mac and Linux versions of the builder - **Not Started**
+22. Add a license so others can fork and modify the builder - **Not Started**
 
 ## How to use
 
@@ -63,7 +62,7 @@ Track 1 of each disc must match, and a missing or extra track stops the builder.
 
 1. Unzip the whole folder somewhere you can write to (e.g. Desktop or Documents, not "Program Files").
 2. Copy your two disc folders into `discs` and rename them `psx` (the PlayStation disc) and `sat` (the Saturn disc).
-3. Double-click `Build Mega Man 8 - Complete.bat`. It checks both discs, then builds (usually under a minute).
+3. Double-click `Build Mega Man 8 - Complete.bat`. It checks both discs, then builds (usually one to two minutes).
 4. When it says "Done", the game is in `output`: `Mega Man 8 - Complete.cue` and its three `.bin` files. Keep them together and open the .cue in your emulator (DuckStation is recommended). "(matches the tested build)" after the printed MD5 means your image is byte-identical to the tested one.
 
 `HOW TO BUILD.txt` in the zip has the same steps and a troubleshooting list.
@@ -85,7 +84,7 @@ This repository holds only original work:
 
 It contains no copyrighted material: no game data, no game code and no patches. The builder reads everything it needs from your own discs (US PlayStation and US Saturn; the Japanese option will need the Japanese discs) and builds the PSX image on your machine. Don't share the images it makes.
 
-Commit messages start with `[built]` (built and checked headlessly), `[verified]` (tested in an emulator) or `[docs]`. A `[verified]` commit marks each tested milestone.
+Commit messages start with `[built]` (built and checked headlessly), `[verified]` (tested in an emulator or on real hardware) or `[docs]`. A `[verified]` commit marks each tested milestone.
 
 ## Disclaimer
 
