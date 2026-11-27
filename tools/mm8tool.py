@@ -2446,7 +2446,12 @@ def sat_music_numbers():
 def sat_music_banks():
     """{PSX music number: converted bank} for every Saturn bank of sat_music_numbers, the PSX stage sounds kept
     (psx_sfx). Music 5 (the shipped Tengu Man bank) and 0x46-0x49 are placed by their own build steps."""
-    return {n: build_music_bank(f, psx_sfx=True)[0] for n, f in sorted(sat_music_numbers().items())}
+    items = sorted(sat_music_numbers().items()); out = {}
+    for i, (n, f) in enumerate(items):
+        progress('music', i, len(items), f'Saturn music {i}/{len(items)}')
+        out[n] = build_music_bank(f, psx_sfx=True)[0]
+    progress('music', len(items), len(items), f'Saturn music {len(items)}/{len(items)}')
+    return out
 
 def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=None):
     """The current patch on a raw PSX track 1 (all in place, sector EDC/ECC fixed):
@@ -2489,6 +2494,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=N
     extend_track1(disc, ext)
     assert disc.file_entry(PSX_STAGE08_FILE) == PSX_STAGE08_ENTRY, 'unexpected STAGE08 table entry (already patched?)'
     nxt = disc.free[0]
+    progress('build', 0, 6, 'Building the image')
     pbgm46, binfo = build_boss_intro_bank('WOOD1.PAC')
     pbgm47, finfo = build_music_bank('WOOD2.PAC')
     new, info = build_m2_overlay(disc.read(*PSX_STAGE08_ENTRY[:2]), workdir, 2)
@@ -2501,6 +2507,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=N
     info.update(pbgm47_lba=lba47, pbgm47_size=len(pbgm47), pbgm47_sectors=place_file(disc, lba47, pbgm47),
                 **{'bank47_' + k: v for k, v in finfo.items() if k not in ('layers', 'sfx')})
     nxt = lba47 + info['pbgm47_sectors']
+    progress('build', 1, 6, 'Building the image')
     # ---- M4: Cut Man (STAGE09)
     e09 = disc.file_entry(PSX_STAGE09_FILE)
     ovl09 = disc.read(e09[0], e09[1])
@@ -2522,12 +2529,14 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=N
     info.update({k if k.startswith('pac09') else 'm4_' + k: v for k, v in m4.items()})
     m8t = patch_m8_tengu_bank(disc, nxt); nxt += m8t['tengu_sectors']               # M8t3: the Saturn Tengu Man bank
     info.update(m8t)
+    progress('build', 2, 6, 'Building the image')
     sat = {}                                                                        # every converted Saturn bank
     for m in sorted(saturn_music):
         sat[m] = (nxt, len(saturn_music[m])); nxt += place_file(disc, nxt, saturn_music[m])
     info['sat_music_sectors'] = sum(sectors(v[1]) for v in sat.values())
     m7 = patch_m7a(disc, nxt, workdir, info['vf0'], (m8t['tengu_lba'], m8t['tengu_size']), sat); nxt += m7['m7_sectors']          # M7a/M7b: title BONUS MODE, bonus overlay, SLABO
     info.update({'m7_' + k: v for k, v in m7.items()})
+    progress('build', 3, 6, 'Building the image')
     patch_music_hook(disc, info['vf0'])
     patch_sound_guard(disc)
     info.update(patch_music_noise_off(disc))
@@ -2540,6 +2549,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=N
     info.update(patch_m8_hud_head(disc))
     info.update(patch_m8_demos(disc))
     info.update(patch_m8_caustics(disc))                                        # item 8: the intro's caustic backdrop
+    progress('build', 4, 6, 'Building the image')
     m8k = patch_m8_ticker(disc, nxt, (m8t['tengu_lba'], m8t['tengu_size']), workdir); nxt += m8k['tk_sectors']   # M8t4
     info.update({'m8k_' + k: v for k, v in m8k.items()})
     m8w = patch_m8_water(disc, nxt, workdir); nxt += m8w['m8w_sectors']                # item 8: water effects
@@ -2547,6 +2557,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=N
     info.update({'m8w_' + k if not k.startswith('m8w') else k: v for k, v in m8w.items()})
     info.update(patch_music_spu_low(disc))
     info.update(patch_music_seq_room(disc))
+    progress('build', 5, 6, 'Building the image')
     for m, b in saturn_music.items():
         ch = {t: c for t, o, c in unpac_bytes(b)}
         assert len(ch[1]) <= info['seq_room'] and len(ch[0x201]) <= SPU_MUSIC_BODY_MAX_LOW, (hex(m), len(ch[1]), len(ch[0x201]))
@@ -2555,6 +2566,7 @@ def build_image(src_bin, out_bin, workdir=None, extra_patches=(), saturn_music=N
     for f in extra_patches:
         used, more = f(disc, nxt, workdir); nxt += used; info.update(more)
     disc.save(out_bin)
+    progress('build', 6, 6, 'Building the image')
     info.update(sectors_changed=len(disc.touched), free_lba=nxt, free_sectors_left=disc.free[1] - nxt)
     return info
 
@@ -6785,6 +6797,56 @@ def check_audio_tracks(cue, tr, expect):
                                      '(one .bin per track, or one .bin for the whole disc).']))
     return notes
 
+# ----------------------------------------------------------------- console progress bar (release build only)
+class ProgressBar:
+    """The release build's progress: one console line such as `[2/4] [############------------]  52%  Saturn music
+    34/66  0:41`, redrawn in place when the work moves on and once a second (the clock), so a long step never looks
+    stuck. The % comes from each phase's share of the build time (PHASES: step, start %, share %) and the work counted
+    inside the phase; it never goes back. Without a console (output to a file or a pipe) it prints a plain line at
+    every new step and every 10 %."""
+    PHASES = {'read': (1, 0, 4), 'music': (2, 4, 72), 'build': (2, 76, 17), 'check': (3, 93, 5), 'write': (4, 98, 2)}
+    WIDTH = 24
+    def __init__(self, out=None):
+        import threading, time
+        self.time, self.out = time.time, out or sys.stdout
+        self.tty = bool(getattr(self.out, 'isatty', lambda: False)())
+        self.t0, self.step, self.pct, self.note, self.shown, self.plain = self.time(), 0, 0.0, '', 0, None
+        self.lock, self.stop = threading.Lock(), threading.Event()
+        self.th = threading.Thread(target=self._tick, daemon=True) if self.tty else None
+        if self.th: self.th.start()
+    def _tick(self):
+        while not self.stop.wait(1.0):
+            with self.lock:
+                if self.step: self._draw()
+    def update(self, phase, done=0, total=1, note=''):
+        step, start, share = self.PHASES[phase]
+        with self.lock:
+            self.step, self.note = step, note
+            self.pct = min(100.0, max(self.pct, start + share * min(done, total) / max(total, 1)))
+            self._draw()
+    def _draw(self):
+        p = int(self.pct)
+        if not self.tty:
+            if (self.step, p // 10) != self.plain:
+                self.plain = (self.step, p // 10)
+                print(f'[{self.step}/4] {p:3d}%  {self.note}', file=self.out, flush=True)
+            return
+        s, n = int(self.time() - self.t0), int(self.WIDTH * self.pct / 100)
+        line = f'[{self.step}/4] [{"#" * n}{"-" * (self.WIDTH - n)}] {p:3d}%  {self.note}  {s // 60}:{s % 60:02d}'
+        self.out.write('\r' + line + ' ' * max(0, self.shown - len(line))); self.out.flush()
+        self.shown = len(line)
+    def close(self):
+        self.stop.set()
+        if self.th: self.th.join()
+        with self.lock:
+            if self.shown: self.out.write('\n'); self.out.flush(); self.shown = 0
+
+PROGRESS = None                        # the ProgressBar while release_build runs
+
+def progress(phase, done=0, total=1, note=''):
+    """Moves the release build's progress bar (does nothing outside release_build)."""
+    if PROGRESS is not None: PROGRESS.update(phase, done, total, note)
+
 def release_build(discs, out_dir, keep_work=False):
     """The release build (no debug options): extracts the user's discs into $MM8_WORK, builds the patched PSX
     Track 1, checks it (check_build) and writes a complete bin/cue (Track 1 new, Tracks 2-3 copied) into out_dir."""
@@ -6795,14 +6857,16 @@ def release_build(discs, out_dir, keep_work=False):
             raise SystemExit(f'{pcue}: Track {t["no"]} ("{os.path.basename(t["file"])}") is missing; the PlayStation disc needs every track')
     os.makedirs(out_dir, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix='mm8rel_', dir=WORK if os.path.isdir(WORK) else None)
+    global PROGRESS
+    PROGRESS = ProgressBar()
     try:
         def track1(tr, name):              # Track 1 as its own file (a whole-disc .bin is cut at Track 2)
             t = tr[0]
             if t['start'] == 0 and t['end'] == os.path.getsize(t['file']): return t['file']
             p = os.path.join(tmp, name); _copy_range(t['file'], t['start'], t['end'], p); return p
         psx_t1, sat_t1 = track1(ptr, 'psx_track1.bin'), track1(st, 'sat_track1.bin')
-        print('[1/4] Reading the discs ...', flush=True)
-        for side, src in (('sat', sat_t1), ('psx', psx_t1)):
+        for i, (side, src) in enumerate((('sat', sat_t1), ('psx', psx_t1))):
+            progress('read', i, 2, 'Reading the discs')
             d = os.path.join(WORK, side); os.makedirs(d, exist_ok=True)
             iso = os.path.join(d, 'track1.iso')
             raw_to_iso(src, iso)
@@ -6816,29 +6880,31 @@ def release_build(discs, out_dir, keep_work=False):
                             with open(os.path.join(od, f'{t:03x}.bin'), 'wb') as fo: fo.write(b)
             os.remove(iso)
         _file.cache_clear()
-        print('[2/4] Porting the Saturn content and building the PlayStation image ...', flush=True)
         t1_name = f'{RELEASE_NAME} (Track 1).bin'
         out_t1 = os.path.join(out_dir, t1_name)
         tempfile.tempdir = tmp             # the compiler's scratch folders go into tmp and are removed with it
         with build_cache():
             banks = sat_music_banks()
             build_image(psx_t1, out_t1, saturn_music=banks)
-            print('[3/4] Checking the new image ...', flush=True)
+            progress('check', 0, 1, 'Checking the new image')
             check_build(psx_t1, out_t1, saturn_music=banks)
-        print('[4/4] Writing the other tracks and the .cue ...', flush=True)
+        progress('write', 0, len(ptr), 'Writing the tracks')
         lines = [f'FILE "{t1_name}" BINARY', f'  TRACK 01 {ptr[0]["mode"]}', '    INDEX 01 00:00:00']
         tf = lambda b: '%02d:%02d:%02d' % (b // 2352 // 75 // 60, b // 2352 // 75 % 60, b // 2352 % 75)
         for t in ptr[1:]:
             name = f'{RELEASE_NAME} (Track {t["no"]}).bin'
             _copy_range(t['file'], t['start'], t['end'], os.path.join(out_dir, name))
+            progress('write', t['no'] - 1, len(ptr), 'Writing the tracks')
             lines += [f'FILE "{name}" BINARY', f'  TRACK {t["no"]:02d} {t["mode"]}']
             for i, b in sorted(t['idx'].items()): lines.append(f'    INDEX {i:02d} {tf(b - t["start"])}')
         with open(os.path.join(out_dir, f'{RELEASE_NAME}.cue'), 'w', newline='\r\n') as f: f.write('\n'.join(lines) + '\n')
         with open(out_t1, 'rb') as f:
             h = hashlib.md5()
             for b in iter(lambda: f.read(1 << 22), b''): h.update(b)
+        progress('write', len(ptr), len(ptr), 'Writing the tracks')
         return h.hexdigest()
     finally:
+        PROGRESS.close(); PROGRESS = None
         tempfile.tempdir = None
         shutil.rmtree(tmp, ignore_errors=True)
         if not keep_work:
